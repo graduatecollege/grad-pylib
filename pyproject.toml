@@ -1,0 +1,56 @@
+[project]
+name = "grad-pylib"
+version = "0.1.0"
+description = "Internal core helpers and wrappers for FastAPI backends"
+authors = [
+    { name = "Graduate College", email = "grad@illinois.edu" },
+]
+dependencies = [
+    "fastapi==0.136.3",
+    "uvicorn[standard]>=0.48.0",
+    "sqlalchemy==2.0.50",
+    "fastapi-azure-auth==5.2.0",
+    "pydantic-settings==2.14.1",
+    "pyodbc>=5.3.0",
+    "httptools>=0.8.0",
+    "structlog>=26.1.0"
+]
+requires-python = ">=3.14,<3.15"
+readme = "README.md"
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[tool.ruff.lint]
+select = [
+    "FAST",
+    "ANN001",
+    "ANN002",
+    "ASYNC",
+    "SIM",
+    "UP"
+]
+[tool.pdm]
+distribution = true
+
+[tool.pdm.scripts]
+checks.composite = ["ruff check .", "ty check .", "pytest -q"]
+checks.keep_going = true
+
+[tool.pdm.dev-dependencies]
+test = [
+    "pytest==9.0.3",
+    "pytest-xdist==3.8.0",
+    "httpx2>=2.3.0",
+    "testcontainers[mssql]==4.14.2",
+    "pymssql==2.3.13",
+    "pytest-cov>=7.1.0"
+]
+tool = [
+    "sqlacodegen==4.0.3",
+    "testcontainers[mssql]==4.14.2",
+    "pymssql==2.3.13",
+    "ty>=0.0.44",
+    "ruff>=0.15.16"
+]

@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pdm-python
+build/
+dist/
+appsettings.*.json
+*.private.env.json
+spec.zip
+.idea/
+.vs/
+bin/
+obj/
+.junie/memory/
+Thumbs.db
+Desktop.ini
+.DS_Store
+.env
+
+# Not using uv directly
+uv.lock
