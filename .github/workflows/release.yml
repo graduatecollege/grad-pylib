@@ -38,7 +38,7 @@ jobs:
           cache-dependency-glob: "uv.lock"
 
       - name: Install Dependencies
-        run: uv sync --frozen --no-sources --group test
+        run: uv sync --frozen --group test
 
       - name: Run tests
         run: |
@@ -65,7 +65,7 @@ jobs:
           cache-dependency-glob: "uv.lock"
 
       - name: Install Dependencies
-        run: uv sync --frozen --no-sources --group test
+        run: uv sync --frozen --group test
 
       - name: Build package
         run: uv build
