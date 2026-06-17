@@ -10,7 +10,8 @@ EXCLUDE_PATTERNS = [
     "test_*.py",  # Any test files in the root
     "**/test_*.py",  # Any test files in subdirectories
     "tools/*.py",
-    "testing/*.py"
+    "testing/*.py",
+    "testclient.py"
 ]
 
 
