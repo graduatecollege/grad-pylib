@@ -37,13 +37,12 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
-      - name: Install dev dependencies
-        run: |
-          pdm sync --dev
+      - name: Install Dependencies
+        run: uv sync --frozen --no-sources --group test
 
       - name: Run tests
         run: |
-          pdm run pytest
+          uv run pytest
 
       - name: Build package
         run: uv build
@@ -67,6 +66,9 @@ jobs:
 
       - name: Install Dependencies
         run: uv sync --frozen --no-sources --group test
+
+      - name: Build package
+        run: uv build
 
       - name: Publish package distributions to PyPI
         run: uv publish
