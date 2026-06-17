@@ -63,7 +63,7 @@ def _parse_filter_key(key: str) -> tuple[str, str]:
     return field, operator or "eq"
 
 
-def apply_filters[T: tuple[Any]](stmt: Select[T], spec: QuerySpec, filters: Mapping[str, Any] | None) -> Select[T]:
+def apply_filters[T: tuple[Any, ...]](stmt: Select[T], spec: QuerySpec, filters: Mapping[str, Any] | None) -> Select[T]:
     """Apply ``WHERE`` clauses for the supplied filters.
 
     Filter keys use a ``field`` or ``field__operator`` convention. Values that
@@ -104,7 +104,7 @@ def _parse_sort(sort: str | Sequence[str]) -> list[tuple[str, bool]]:
     return parsed
 
 
-def apply_sort[T: tuple[Any]](stmt: Select[T], spec: QuerySpec, sort: str | Sequence[str] | None) -> Select[T]:
+def apply_sort[T: tuple[Any, ...]](stmt: Select[T], spec: QuerySpec, sort: str | Sequence[str] | None) -> Select[T]:
     """Apply ``ORDER BY`` clauses for the requested sort expression.
 
     Falls back to ``spec.default_sort`` when ``sort`` is empty. Unknown fields
@@ -244,7 +244,7 @@ def _coerce_int(name: str, value: int | str | None) -> int | None:
         raise BadRequestError(f"'{name}' must be an integer.") from exc
 
 
-def apply_pagination[T: tuple[Any]](
+def apply_pagination[T: tuple[Any, ...]](
         stmt: Select[T],
         *,
         limit: int | str | None = None,
@@ -269,7 +269,7 @@ def apply_pagination[T: tuple[Any]](
     return stmt
 
 
-def apply_query[T: tuple[Any]](
+def apply_query[T: tuple[Any, ...]](
         stmt: Select[T],
         spec: QuerySpec,
         *,

@@ -15,7 +15,7 @@ _logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
-class CurrentUser:
+class BaseUser:
     """
     Represents the current authenticated user.
 
@@ -64,7 +64,7 @@ class AuthConfiguration:
 
 type ClaimsToUser = Callable[[dict[str, Any]], Any]
 type OverrideLoader = Callable[[Any, Session], Any]
-type ApiKeyUserBuilder = Callable[[str | None, Request], CurrentUser]
+type ApiKeyUserBuilder = Callable[[str | None, Request], Any]
 type SettingsProvider = Callable[[], BaseAppSettings]
 type SessionProvider = Callable[[], Any]
 
@@ -134,7 +134,7 @@ def claim_list(claims: dict[str, Any], name: str) -> list[str]:
     return [str(item) for item in value]
 
 
-def default_claims_to_user(claims: dict[str, Any], valid_roles: tuple[str, ...]) -> CurrentUser:
+def default_claims_to_user(claims: dict[str, Any], valid_roles: tuple[str, ...]) -> BaseUser:
     """
     Converts Azure AD claims to a CurrentUser object.
 
@@ -148,12 +148,12 @@ def default_claims_to_user(claims: dict[str, Any], valid_roles: tuple[str, ...])
             filter and assign to the user.
 
     Returns:
-        CurrentUser: An instance representing the user with extracted details.
+        BaseUser: An instance representing the user with extracted details.
     """
     email = claims.get("upn")
     if not isinstance(email, str) or not email:
         raise ValueError("Azure AD user must have a UPN (email) claim.")
-    return CurrentUser(
+    return BaseUser(
         email=email,
         first_name=claims.get("given_name") or claims.get("name") or "",
         last_name=claims.get("family_name") or "",
@@ -165,7 +165,7 @@ def azure_user_to_current_user(
         user: AzureUser,
         *,
         claims_to_user: ClaimsToUser,
-) -> CurrentUser:
+) -> BaseUser:
     claims = dict(user.claims)
     return claims_to_user(claims)
 

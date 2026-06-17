@@ -1,7 +1,7 @@
 # 🚨 AUTO-GENERATED BARREL FILE. DO NOT EDIT MANUALLY.
 # Run `pdm run barrel` to regenerate.
 
-from grad_pylib.core.auth import CurrentUser, AuthConfiguration, build_azure_scheme, normalize_role, parse_roles, claim_list, default_claims_to_user, azure_user_to_current_user, require_policy
+from grad_pylib.core.auth import BaseUser, AuthConfiguration, build_azure_scheme, normalize_role, parse_roles, claim_list, default_claims_to_user, azure_user_to_current_user, require_policy
 from grad_pylib.core.config import BaseAppSettings, configure_settings_factory, get_settings
 from grad_pylib.core.db import build_mssql_url, resolve_database_url, get_engine
 from grad_pylib.core.exceptions import ApiError, BadRequestError, ForbiddenError, NotFoundError, ConflictError, api_error_handler, register_exception_handlers
@@ -15,8 +15,8 @@ __all__ = [
     "AuthConfiguration",
     "BadRequestError",
     "BaseAppSettings",
+    "BaseUser",
     "ConflictError",
-    "CurrentUser",
     "DataResponse",
     "ForbiddenError",
     "JsonResponse",
