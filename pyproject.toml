@@ -39,12 +39,9 @@ only-include = ["src/grad_pylib"]
 [tool.hatch.version]
 source = "vcs"
 
-[tool.hatch.build.hooks.vcs]
-version-file = "src/grad_pylib/_version.txt"
-
 [tool.hatch.version.raw-options]
 # Instead of tag_filter/tag_regex variables, explicitly tell Git how to search tags:
-git_describe_command = "git describe --dirty --tags --long --match v*"
+git_describe_command = "git describe --dirty --tags --long --match 'v*'"
 
 [dependency-groups]
 test = [
