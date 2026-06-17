@@ -24,32 +24,29 @@ requires-python = ">=3.14,<3.15"
 readme = "README.md"
 
 [project.urls]
-Source = "https://github.com/graduatecollege/grad_pylib"
+Source = "https://github.com/graduatecollege/grad-pylib"
 
 [build-system]
-requires = ["pdm-backend"]
-build-backend = "pdm.backend"
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
 
-[tool.pdm.build]
-package-dir = "src"
-includes = ["src/grad_pylib"]
+[tool.hatch.build.targets.wheel]
+only-include = ["src/grad_pylib"]
 
-[tool.pdm.version]
-source = "scm"
-version_format = "version_format:format_version"
-tag_filter = "v*"
-tag_regex = '^v(?P<version>\d+\.\d+\.\d+)$'
-write_to = "grad_pylib/_version.txt"
+[tool.hatch.build.targets.wheel.sources]
+"src" = ""
 
-[tool.pdm]
-distribution = true
+[tool.hatch.version]
+source = "vcs"
 
-[tool.pdm.scripts]
-checks.composite = ["ruff check .", "ty check .", "pytest -q"]
-checks.keep_going = true
-barrel = "python scripts/generate_barrel.py"
+[tool.hatch.build.hooks.vcs]
+version-file = "src/grad_pylib/_version.txt"
 
-[tool.pdm.dev-dependencies]
+[tool.hatch.version.raw-options]
+# Instead of tag_filter/tag_regex variables, explicitly tell Git how to search tags:
+git_describe_command = "git describe --dirty --tags --long --match v*"
+
+[dependency-groups]
 test = [
     "pytest==9.0.3",
     "pytest-xdist==3.8.0",

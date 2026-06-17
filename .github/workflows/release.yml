@@ -31,8 +31,11 @@ jobs:
         with:
           python-version: '3.14'
 
-      - name: Setup PDM
-        uses: pdm-project/setup-pdm@94a823180e06fcde4ad29308721954a521c96ed0 # ratchet:pdm-project/setup-pdm@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
 
       - name: Install dev dependencies
         run: |
@@ -43,7 +46,7 @@ jobs:
           pdm run pytest
 
       - name: Build package
-        run: pdm build
+        run: uv build
   publish:
     name: Upload release to PyPI
     needs: build
@@ -56,15 +59,17 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # ratchet:actions/checkout@v6
 
-      - name: Setup PDM
-        uses: pdm-project/setup-pdm@94a823180e06fcde4ad29308721954a521c96ed0 # ratchet:pdm-project/setup-pdm@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
 
-      - name: Install build dependencies
-        run: |
-          pdm install
+      - name: Install Dependencies
+        run: uv sync --frozen --no-sources --group test
 
       - name: Publish package distributions to PyPI
-        run: pdm publish
+        run: uv publish
 
   create-release:
     name: Create GitHub Release
