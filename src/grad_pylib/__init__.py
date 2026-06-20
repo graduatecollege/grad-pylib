@@ -8,7 +8,6 @@ from grad_pylib.core.exceptions import ApiError, BadRequestError, ForbiddenError
 from grad_pylib.core.logging import REQUEST_ID_HEADER, REQUEST_ID_FIELD, configure_logging, bind_request_id_context
 from grad_pylib.core.querying import QuerySpec, apply_filters, apply_sort, build_where_clause, build_order_by_clause, apply_pagination, apply_query
 from grad_pylib.core.schemas import DataResponse
-from grad_pylib.core.testclient import JsonResponse, JsonTestClient
 
 __all__ = [
     "ApiError",
@@ -19,8 +18,6 @@ __all__ = [
     "ConflictError",
     "DataResponse",
     "ForbiddenError",
-    "JsonResponse",
-    "JsonTestClient",
     "NotFoundError",
     "QuerySpec",
     "REQUEST_ID_FIELD",
