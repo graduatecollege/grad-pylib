@@ -130,12 +130,15 @@ def _is_transient_conflict(exc: BaseException) -> bool:
 
     error = parse_mssql_error(exc)
 
+    if error.error_type == SqlServerErrorType.DUPLICATE_KEY:
+        # ONLY retry if the duplicate error happened on our specific high-race critical table
+        return error.is_idempotency_hit
+
     # Retrying both isolation locks AND concurrent race states
     return error.error_type in {
         SqlServerErrorType.DEADLOCK,
         SqlServerErrorType.LOCK_TIMEOUT,
-        SqlServerErrorType.RCSI_CONFLICT,
-        SqlServerErrorType.DUPLICATE_KEY
+        SqlServerErrorType.RCSI_CONFLICT
     }
 
 
@@ -162,42 +165,40 @@ retry_on_transient_conflict = retry(
     reraise=True,
 )
 
-ModelT = TypeVar("ModelT", bound=DeclarativeBase)
-
-
 def orm_upsert[ModelT: DeclarativeBase](
         db: Session,
         model_cls: type[ModelT],
-        data_source: dict | BaseModel | DeclarativeBase
+        data_source: dict[str, Any] | BaseModel | DeclarativeBase
 ) -> None:
     """
     Universal, concurrency-safe ORM upsert for SQL Server under RCSI.
     Accepts raw dicts, Pydantic models, or sqlacodegen DeclarativeBase instances.
     """
-    # 1. Inspect the core database model to find its primary keys
+    # Inspect the core database model to find its primary keys
     mapper = inspect(model_cls)
     pk_names = [col.name for col in mapper.primary_key]
     all_columns = [col.name for col in mapper.columns]
 
     data: dict[str, Any]
-    # 2. Extract a clean data dictionary regardless of the input type
-    if isinstance(data_source, dict):
-        # we can't typecheck the dict[str, Any] completely, so ignore the type error
-        data = data_source  # ty:ignore[invalid-assignment]
-    elif isinstance(data_source, BaseModel):
+    # Extract a clean data dictionary regardless of the input type
+    if isinstance(data_source, BaseModel):
         data = data_source.model_dump(exclude_unset=True)
     elif isinstance(data_source, DeclarativeBase):
         # Extract fields directly from the sqlacodegen instance, ignoring internal state
         data = {k: v for k, v in data_source.__dict__.items() if k in all_columns}
+    elif isinstance(data_source, dict):
+        data = data_source
     else:
         raise TypeError("data_source must be a dict, Pydantic model, or DeclarativeBase instance")
 
-    # 3. Build the strict lookup filter criteria
+    # Drop unexpected keys to avoid setting non-mapped attributes
+    data = {k: v for k, v in data.items() if k in all_columns}
+    # Build the strict lookup filter criteria
     filter_criteria = {pk: data[pk] for pk in pk_names if pk in data}
     if len(filter_criteria) != len(pk_names):
         raise ValueError(f"Provided data missing primary key values for {model_cls.__name__}")
 
-    # 4. Roundtrip 1: Query with hints to secure the lock and bypass snapshots
+    # Roundtrip 1: Query with hints to secure the lock and bypass snapshots
     record = (
         db.query(model_cls)
         .with_hint(model_cls, "WITH (UPDLOCK, HOLDLOCK)")
@@ -215,5 +216,5 @@ def orm_upsert[ModelT: DeclarativeBase](
         record = model_cls(**data)
         db.add(record)
 
-    # 5. Roundtrip 2: Commit changes securely
-    db.commit()
+    # Roundtrip 2: Commit changes securely
+    db.flush()
