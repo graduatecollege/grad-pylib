@@ -29,6 +29,7 @@ migrate = "grad_pylib.tools.migrate:main"
 openapi = "grad_pylib.tools.export_openapi:main"
 generate-models = "grad_pylib.tools.generate_models:main"
 rebuild-models = "grad_pylib.tools.rebuild_models:main"
+extract-codebook = "grad_pylib.tools.extract_codebook:main"
 
 [project.urls]
 Source = "https://github.com/graduatecollege/grad-pylib"
