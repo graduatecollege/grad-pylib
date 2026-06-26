@@ -1,3 +1,5 @@
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from typing import TypeVar, Any
 import re
 import threading
@@ -6,10 +8,10 @@ from enum import Enum
 
 from grad_pylib.core.config import BaseAppSettings, get_settings
 from pydantic import BaseModel
-from sqlalchemy import URL, create_engine, inspect
+from sqlalchemy import URL, create_engine, inspect, Table, Select, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.orm import Session, DeclarativeBase
+from sqlalchemy.orm import Session, DeclarativeBase, load_only, sessionmaker
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_incrementing, RetryCallState
 
 
@@ -34,8 +36,69 @@ def resolve_database_url(settings: BaseAppSettings | None = None) -> str:
     raise ValueError("DATABASE_URL must be set.")
 
 
-_engine: Engine | None = None
-_engine_lock = threading.Lock()
+class DatabaseRuntime:
+    def __init__(
+            self,
+            database_url_resolver: Callable[[], str],
+            *,
+            pool_pre_ping: bool = True,
+            pool_size: int = 5,
+            max_overflow: int = 20,
+    ) -> None:
+        self._database_url_resolver = database_url_resolver
+        self._pool_pre_ping = pool_pre_ping
+        self._pool_size = pool_size
+        self._max_overflow = max_overflow
+        self._engine: Engine | None = None
+        self._engine_lock = threading.Lock()
+        self._session_factory: sessionmaker[Session] | None = None
+        self._session_factory_lock = threading.Lock()
+
+    def get_engine(self) -> Engine:
+        if self._engine is None:
+            with self._engine_lock:
+                if self._engine is None:
+                    engine = create_engine(
+                        self._database_url_resolver(),
+                        pool_pre_ping=self._pool_pre_ping,
+                        pool_size=self._pool_size,
+                        max_overflow=self._max_overflow,
+                    )
+                    self._engine = engine
+                    return engine
+        return self._engine
+
+    def get_session_factory(self) -> sessionmaker[Session]:
+        if self._session_factory is None:
+            with self._session_factory_lock:
+                if self._session_factory is None:
+                    factory = sessionmaker(
+                        bind=self.get_engine(),
+                        autoflush=False,
+                        autocommit=False,
+                        expire_on_commit=False,
+                    )
+                    self._session_factory = factory
+                    return factory
+        return self._session_factory
+
+    def session(self) -> Generator[Session]:
+        session = self.get_session_factory()()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    @contextmanager
+    def background_session(self) -> Generator[Session]:
+        session = self.get_session_factory()()
+        try:
+            yield session
+        finally:
+            session.close()
+
+
+_default_runtime = DatabaseRuntime(resolve_database_url)
 
 
 def get_engine() -> Engine:
@@ -46,20 +109,7 @@ def get_engine() -> Engine:
     multiple calls. It uses a lock to prevent race conditions when multiple threads
     might try to create the engine simultaneously.
     """
-    global _engine
-    if _engine is None:
-        with _engine_lock:
-            if _engine is None:
-                # this assignment keeps the type system happy
-                eng = create_engine(
-                    resolve_database_url(),
-                    pool_pre_ping=True,
-                    pool_size=5,
-                    max_overflow=20
-                )
-                _engine = eng
-                return eng
-    return _engine
+    return _default_runtime.get_engine()
 
 
 class SqlServerErrorType(Enum):
@@ -165,34 +215,64 @@ retry_on_transient_conflict = retry(
     reraise=True,
 )
 
+
+def _coerce_model_data(
+        model_cls: type[DeclarativeBase],
+        data_source: dict[str, Any] | BaseModel | DeclarativeBase,
+        *,
+        all_columns: list[str],
+        parameter_name: str,
+) -> dict[str, Any]:
+    if isinstance(data_source, BaseModel):
+        data = data_source.model_dump(exclude_unset=True)
+    elif isinstance(data_source, DeclarativeBase):
+        data = {key: value for key, value in data_source.__dict__.items() if key in all_columns}
+    elif isinstance(data_source, dict):
+        data = data_source
+    else:
+        raise TypeError(f"{parameter_name} must be a dict, Pydantic model, or DeclarativeBase instance")
+
+    return {key: value for key, value in data.items() if key in all_columns}
+
+
 def orm_upsert[ModelT: DeclarativeBase](
         db: Session,
         model_cls: type[ModelT],
-        data_source: dict[str, Any] | BaseModel | DeclarativeBase
-) -> None:
+        data_source: dict[str, Any] | BaseModel | DeclarativeBase,
+        *,
+        insert_only: dict[str, Any] | BaseModel | DeclarativeBase | None = None,
+) -> ModelT:
     """
     Universal, concurrency-safe ORM upsert for SQL Server under RCSI.
     Accepts raw dicts, Pydantic models, or sqlacodegen DeclarativeBase instances.
+    `insert_only` fields are applied only when creating a new row.
     """
     # Inspect the core database model to find its primary keys
     mapper = inspect(model_cls)
     pk_names = [col.name for col in mapper.primary_key]
     all_columns = [col.name for col in mapper.columns]
 
-    data: dict[str, Any]
-    # Extract a clean data dictionary regardless of the input type
-    if isinstance(data_source, BaseModel):
-        data = data_source.model_dump(exclude_unset=True)
-    elif isinstance(data_source, DeclarativeBase):
-        # Extract fields directly from the sqlacodegen instance, ignoring internal state
-        data = {k: v for k, v in data_source.__dict__.items() if k in all_columns}
-    elif isinstance(data_source, dict):
-        data = data_source
-    else:
-        raise TypeError("data_source must be a dict, Pydantic model, or DeclarativeBase instance")
+    data = _coerce_model_data(
+        model_cls,
+        data_source,
+        all_columns=all_columns,
+        parameter_name="data_source",
+    )
+    insert_only_data = (
+        {}
+        if insert_only is None
+        else _coerce_model_data(
+            model_cls,
+            insert_only,
+            all_columns=all_columns,
+            parameter_name="insert_only",
+        )
+    )
+    duplicate_keys = data.keys() & insert_only_data.keys()
+    if duplicate_keys:
+        columns = ", ".join(sorted(duplicate_keys))
+        raise ValueError(f"Duplicate keys provided in data_source and insert_only for {model_cls.__name__}: {columns}")
 
-    # Drop unexpected keys to avoid setting non-mapped attributes
-    data = {k: v for k, v in data.items() if k in all_columns}
     # Build the strict lookup filter criteria
     filter_criteria = {pk: data[pk] for pk in pk_names if pk in data}
     if len(filter_criteria) != len(pk_names):
@@ -213,8 +293,40 @@ def orm_upsert[ModelT: DeclarativeBase](
                 setattr(record, key, value)
     else:
         # Insert path: Pass the cleaned dictionary straight into the model constructor
-        record = model_cls(**data)
+        record = model_cls(**data, **insert_only_data)
         db.add(record)
 
     # Roundtrip 2: Commit changes securely
     db.flush()
+    return record
+
+
+def select_exclude[BaseT: DeclarativeBase | Table](
+        model_or_table: type[BaseT] | Table,
+        exclude: set[str]
+) -> Select:
+    """
+    Constructs a select statement excluding specific columns.
+    Works seamlessly with both SQLAlchemy ORM Models and Core Tables.
+    """
+    # 1. Handle Core Table Objects
+    if isinstance(model_or_table, Table):
+        columns_to_select = [
+            col for col in model_or_table.c
+            if col.name not in exclude
+        ]
+        return select(*columns_to_select)
+
+    # 2. Handle ORM Model Classes
+    all_columns = model_or_table.__mapper__.column_attrs
+    include_attrs = [
+        getattr(model_or_table, col.key)
+        for col in all_columns
+        if col.key not in exclude
+    ]
+
+    return (
+        select(model_or_table)
+        .options(load_only(*include_attrs))
+        .execution_options(raise_on_sql_errors=True)
+    )
