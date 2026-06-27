@@ -1,16 +1,54 @@
+from datetime import date, datetime
+from decimal import Decimal
 import types
 from typing import Any, Union, get_origin, get_args
 
-from pydantic import BaseModel
-from sqlalchemy.types import String, Integer, DateTime, Boolean
+from pydantic import AliasChoices, AliasPath, BaseModel
+from sqlalchemy.types import Boolean, Date, DateTime, Integer, Numeric, String
 
-# Map SQLAlchemy column types to Python native types
-SQLA_TYPE_MAP = {
-    Integer: int,
-    String: str,
-    Boolean: bool,
-    DateTime: str,
-}
+SQLA_TYPE_MAP = (
+    (Integer, int),
+    (String, str),
+    (Boolean, bool),
+    (DateTime, datetime),
+    (Date, date),
+    (Numeric, Decimal),
+)
+
+
+def _alias_names(alias: Any) -> list[str]:
+    if alias is None:
+        return []
+    if isinstance(alias, str):
+        return [alias]
+    if isinstance(alias, AliasChoices):
+        names: list[str] = []
+        for choice in alias.choices:
+            names.extend(_alias_names(choice))
+        return names
+    if isinstance(alias, AliasPath):
+        return []
+    return []
+
+
+def _field_lookup_keys(name: str, field: Any) -> list[str]:
+    keys = [name]
+    for alias in (
+            field.alias,
+            field.validation_alias,
+            field.serialization_alias,
+    ):
+        for candidate in _alias_names(alias):
+            if candidate not in keys:
+                keys.append(candidate)
+    return keys
+
+
+def _expected_python_type(column: Any) -> type[Any] | None:
+    for sql_type, python_type in SQLA_TYPE_MAP:
+        if isinstance(column.type, sql_type):
+            return python_type
+    return None
 
 
 def assert_models_align(
@@ -29,15 +67,18 @@ def assert_models_align(
 
     db_columns = db_model.__table__.columns
 
-    # 1. Extract Pydantic API fields and handle aliases
+    # 1. Extract Pydantic API fields and match explicit DB aliases when needed
     api_fields: dict[str, Any] = {}
     for name, field in api_model.model_fields.items():
-        field_key = field.validation_alias if field.validation_alias else name
+        field_key = next(
+        (key for key in _field_lookup_keys(name, field) if key in db_columns),
+            name,
+        )
         api_fields[field_key] = field.annotation
 
     # 2. Filter out explicitly ignored database fields
     active_db_keys = set(db_columns.keys()) - ignore_fields
-    api_keys = set(api_fields.keys())
+    api_keys = set(api_fields.keys()) - ignore_fields
 
     # 3. Check for structural drift (Missing or Extra fields)
     missing_in_api = active_db_keys - api_keys
@@ -50,9 +91,7 @@ def assert_models_align(
     type_mismatches = []
     for field_key in active_db_keys:
         column = db_columns[field_key]
-        sqla_type = type(column.type)
-
-        expected_python_type = SQLA_TYPE_MAP.get(sqla_type)
+        expected_python_type = _expected_python_type(column)
         actual_pydantic_type = api_fields[field_key]
 
         # Safely unwrap Union/Optional types to isolate the base type (e.g., str | None -> str)
