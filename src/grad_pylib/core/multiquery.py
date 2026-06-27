@@ -4,7 +4,7 @@ from sqlalchemy import Table
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import DeclarativeBase
 
-type _RowSection = tuple[str, ...] | DeclarativeBase | Table
+type _RowSection = tuple[str, ...] | type[DeclarativeBase] | DeclarativeBase | Table
 
 def qualified_columns(alias: str, section: _RowSection) -> str:
     # Column names come from model/table metadata (never user input), so direct

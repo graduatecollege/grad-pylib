@@ -8,4 +8,5 @@ def utc_now() -> datetime:
 
 def utc_from_millis(millis: int) -> datetime:
     """Naive UTC from epoch milliseconds (client idempotency timestamps)."""
-    return datetime.fromtimestamp(millis / 1000, UTC).replace(tzinfo=None)
+    seconds, ms = divmod(millis, 1000)
+    return datetime.fromtimestamp(seconds, UTC).replace(microsecond=ms * 1000, tzinfo=None)

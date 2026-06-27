@@ -1,9 +1,7 @@
 from collections.abc import Callable
 from threading import Lock
-from typing import ParamSpec, TypeVar, cast
+from typing import cast
 
-P = ParamSpec("P")
-ValueT = TypeVar("ValueT")
 _UNSET = object()
 
 

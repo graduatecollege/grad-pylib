@@ -325,8 +325,4 @@ def select_exclude[BaseT: DeclarativeBase | Table](
         if col.key not in exclude
     ]
 
-    return (
-        select(model_or_table)
-        .options(load_only(*include_attrs))
-        .execution_options(raise_on_sql_errors=True)
-    )
+    return select(model_or_table).options(load_only(*include_attrs))
