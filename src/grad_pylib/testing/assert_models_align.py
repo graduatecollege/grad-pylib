@@ -4,6 +4,7 @@ import types
 from typing import Any, Union, get_origin, get_args
 
 from pydantic import AliasChoices, AliasPath, BaseModel
+from sqlalchemy import Table
 from sqlalchemy.types import Boolean, Date, DateTime, Integer, Numeric, String
 
 SQLA_TYPE_MAP = (
@@ -62,10 +63,13 @@ def assert_models_align(
     """
     ignore_fields = ignore_fields or set()
 
-    if not hasattr(db_model, "__table__"):
-        raise TypeError(f"{db_model.__name__} is not a valid SQLAlchemy model.")
-
-    db_columns = db_model.__table__.columns
+    if isinstance(db_model, Table):
+        db_columns = db_model.columns
+    elif hasattr(db_model, "__table__"):
+        db_columns = db_model.__table__.columns
+    else:
+        model_name = getattr(db_model, "__name__", type(db_model).__name__)
+        raise TypeError(f"{model_name} is not a valid SQLAlchemy model or Table.")
 
     # 1. Extract Pydantic API fields and match explicit DB aliases when needed
     api_fields: dict[str, Any] = {}

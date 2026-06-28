@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import Numeric
+from sqlalchemy import MetaData, Numeric, Table
 from sqlalchemy.dialects.mssql import DATETIME2, TINYINT
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -53,9 +53,16 @@ class ValidationAliasExampleDto(BaseModel):
     amount_due: Decimal
 
 
+table_only_example = Table.to_metadata(ValidationAliasExample.__table__, MetaData())
+
+
 def test_assert_models_align_accepts_camel_case_alias_generator() -> None:
     assert_models_align(CamelCaseExample, CamelCaseExampleDto)
 
 
 def test_assert_models_align_matches_explicit_validation_aliases() -> None:
     assert_models_align(ValidationAliasExample, ValidationAliasExampleDto)
+
+
+def test_assert_models_align_accepts_table_objects() -> None:
+    assert_models_align(table_only_example, ValidationAliasExampleDto)
