@@ -258,6 +258,8 @@ def require_policy(
             dev_api_key = settings.dev_api_key
             if dev_api_key and secrets.compare_digest(api_key, dev_api_key) and api_key_user_builder:
                 user = api_key_user_builder(request.headers.get(config.api_role_header), request)
+                if override_loader:
+                    user = override_loader(user, session)
                 result = _evaluate_policy(user, policy, required_roles, forbidden_error_factory)
                 _logger.warning("Using development API key for policy: %s", policy)
                 return result
