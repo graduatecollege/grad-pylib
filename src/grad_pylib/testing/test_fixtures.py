@@ -1,0 +1,342 @@
+from functools import lru_cache
+from contextlib import asynccontextmanager, contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from collections.abc import Iterator
+from typing import Annotated, Any
+
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.engine import make_url
+from sqlalchemy.orm import Session
+
+from grad_pylib.testing.fixtures import (
+    E2eServerConfig,
+    ManagedE2eDatabases,
+    SessionDependencyOverride,
+    build_test_app,
+    ensure_sql_server_database,
+    provision_sql_server_database_from_file,
+    run_e2e_server,
+    split_go_batches,
+)
+
+
+class _FakeSettings:
+    model_config: dict[str, object] = {"env_file": ".env"}
+
+    def __init__(self) -> None:
+        self.env_file = type(self).model_config["env_file"]
+
+
+@lru_cache(maxsize=1)
+def _get_settings() -> _FakeSettings:
+    return _FakeSettings()
+
+
+def _get_app_session() -> Session:
+    raise AssertionError("app session should be overridden")
+
+
+def _get_codebook_session() -> Session:
+    raise AssertionError("codebook session should be overridden")
+
+
+def test_build_test_app_disables_env_file_overrides_sessions_and_skips_lifespan(tmp_path: Path) -> None:
+    original_env_file = _FakeSettings.model_config["env_file"]
+    startup_calls = 0
+
+    _get_settings.cache_clear()
+    _get_settings()
+
+    def create_app() -> FastAPI:
+        @asynccontextmanager
+        async def _lifespan(_: FastAPI):
+            nonlocal startup_calls
+            startup_calls += 1
+            yield
+
+        app = FastAPI(lifespan=_lifespan)
+        app.state.env_file = _get_settings().env_file
+
+        @app.get("/sessions")
+        def read_sessions(
+                app_session: Annotated[Session, Depends(_get_app_session)],
+                codebook_session: Annotated[Session, Depends(_get_codebook_session)],
+        ) -> dict[str, str | None]:
+            return {
+                "app": app_session.bind.url.database,
+                "codebook": codebook_session.bind.url.database,
+            }
+
+        return app
+
+    try:
+        app_engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'app-test.db'}")
+        codebook_engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'codebook-test.db'}")
+        app = build_test_app(
+            create_app=create_app,
+            settings_type=_FakeSettings,
+            get_settings=_get_settings,
+            session_overrides=[
+                SessionDependencyOverride(_get_app_session, app_engine),
+                SessionDependencyOverride(_get_codebook_session, codebook_engine),
+            ],
+        )
+
+        assert app.state.env_file is None
+
+        with TestClient(app) as client:
+            response = client.get("/sessions")
+
+        payload = response.json()
+        assert payload["app"].endswith("app-test.db")
+        assert payload["codebook"].endswith("codebook-test.db")
+        assert startup_calls == 0
+    finally:
+        app_engine.dispose()
+        codebook_engine.dispose()
+        _FakeSettings.model_config["env_file"] = original_env_file
+        _get_settings.cache_clear()
+
+
+def test_managed_e2e_databases_reuses_named_engines(tmp_path: Path) -> None:
+    app_engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'app.db'}")
+    databases = ManagedE2eDatabases(admin_url="sqlite+pysqlite:///master.db", app_engine=app_engine)
+
+    try:
+        codebook_engine = databases.engine_for(str(tmp_path / "codebook.db"))
+        same_codebook_engine = databases.engine_for(str(tmp_path / "codebook.db"))
+        audit_engine = databases.engine_for(str(tmp_path / "audit.db"))
+
+        assert codebook_engine is same_codebook_engine
+        assert codebook_engine is not audit_engine
+        assert str(codebook_engine.url).endswith("codebook.db")
+        assert str(audit_engine.url).endswith("audit.db")
+    finally:
+        databases.dispose()
+
+
+def test_split_go_batches_splits_sql_server_batches() -> None:
+    batches = split_go_batches("SELECT 1\nGO\n\nSELECT 2\n go \nSELECT 3")
+
+    assert batches == ["SELECT 1", "SELECT 2", "SELECT 3"]
+
+
+def test_provision_sql_server_database_from_file_runs_batches_once(
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sql_file = tmp_path / "seed.sql"
+    sql_file.write_text("CREATE DATABASE [Codebook]\nGO\nINSERT INTO foo VALUES (1)\n", encoding="utf-8")
+    recorded: list[str] = []
+
+    class _ScalarResult:
+        def __init__(self, value: object) -> None:
+            self.value = value
+
+        def scalar(self) -> object:
+            return self.value
+
+    class _FakeConnection:
+        def __enter__(self) -> _FakeConnection:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def exec_driver_sql(self, sql: str) -> _ScalarResult:
+            recorded.append(sql.strip())
+            if "sp_getapplock" in sql:
+                return _ScalarResult(1)
+            if "SELECT DB_ID" in sql:
+                return _ScalarResult(None)
+            return _ScalarResult(None)
+
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.connection = _FakeConnection()
+            self.disposed = False
+
+        def connect(self) -> _FakeConnection:
+            return self.connection
+
+        def dispose(self) -> None:
+            self.disposed = True
+
+    fake_engine = _FakeEngine()
+    monkeypatch.setattr("grad_pylib.testing.fixtures.create_engine", lambda *_args, **_kwargs: fake_engine)
+
+    provision_sql_server_database_from_file(
+        "mssql+pyodbc://localhost/master?driver=ODBC+Driver+18+for+SQL+Server",
+        database_name="Codebook",
+        sql_file=sql_file,
+        lock_name="codebook-lock",
+    )
+
+    assert "sp_getapplock" in recorded[0]
+    assert recorded[1] == "SELECT DB_ID(N'Codebook')"
+    assert recorded[2:] == ["CREATE DATABASE [Codebook]", "INSERT INTO foo VALUES (1)"]
+    assert fake_engine.disposed is True
+
+
+def test_ensure_sql_server_database_targets_master(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    recorded: dict[str, Any] = {}
+
+    def fake_provision(
+            admin_url: str,
+            *,
+            database_name: str,
+            sql_file: Path,
+            lock_name: str,
+    ) -> None:
+        recorded["call"] = {
+            "admin_url": admin_url,
+            "database_name": database_name,
+            "sql_file": sql_file,
+            "lock_name": lock_name,
+        }
+
+    monkeypatch.setattr("grad_pylib.testing.fixtures.provision_sql_server_database_from_file", fake_provision)
+    engine = SimpleNamespace(
+        url=make_url(
+            "mssql+pyodbc://sa:Password%21@localhost/app?driver=ODBC+Driver+18+for+SQL+Server"
+        )
+    )
+    sql_file = tmp_path / "codebook.sql"
+
+    ensure_sql_server_database(
+        engine,
+        database_name="Codebook",
+        sql_file=sql_file,
+        lock_name="codebook-lock",
+    )
+
+    assert recorded["call"] == {
+        "admin_url": (
+            "mssql+pyodbc://sa:Password%21@localhost/master?driver=ODBC+Driver+18+for+SQL+Server"
+        ),
+        "database_name": "Codebook",
+        "sql_file": sql_file,
+        "lock_name": "codebook-lock",
+    }
+
+
+def test_run_e2e_server_configures_environment_and_runs_with_optional_codebook(
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app_engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'app.db'}")
+    codebook_engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'codebook.db'}")
+    databases = ManagedE2eDatabases(admin_url="sqlite+pysqlite:///master.db", app_engine=app_engine)
+    databases._named_engines["Codebook"] = codebook_engine
+    recorded: dict[str, object] = {}
+    app = FastAPI()
+
+    @contextmanager
+    def fake_bundle(*_args: object, **_kwargs: object) -> Iterator[ManagedE2eDatabases]:
+        try:
+            yield databases
+        finally:
+            databases.dispose()
+
+    def migration_runner(engine: object) -> None:
+        recorded["migrated"] = engine
+
+    def provision_codebook_database(engine: object) -> None:
+        recorded["provisioned"] = engine
+
+    def seed_dataset(session: Session) -> None:
+        recorded["seeded_database"] = session.bind.url.database
+
+    def build_app(app_db_engine: object, maybe_codebook_engine: object) -> FastAPI:
+        recorded["build_app"] = (app_db_engine, maybe_codebook_engine)
+        return app
+
+    def fake_uvicorn_run(server_app: object, *, host: str, port: int, access_log: bool) -> None:
+        recorded["uvicorn"] = (server_app, host, port, access_log)
+
+    monkeypatch.setattr("grad_pylib.testing.fixtures.create_e2e_database_bundle", fake_bundle)
+    monkeypatch.setattr("grad_pylib.testing.fixtures.uvicorn.run", fake_uvicorn_run)
+    monkeypatch.setenv("E2E_HOST", "127.0.0.1")
+    monkeypatch.setenv("E2E_PORT", "9001")
+    monkeypatch.delenv("ALLOWED_ORIGINS", raising=False)
+
+    fixture_config = SimpleNamespace(migration_runner=migration_runner)
+    run_e2e_server(
+        fixture_config,
+        E2eServerConfig(
+            dev_api_key="dev-key",
+            seed_dataset=seed_dataset,
+            build_app=build_app,
+            codebook_database_name="Codebook",
+            provision_codebook_database=provision_codebook_database,
+        ),
+    )
+
+    assert recorded["migrated"] is app_engine
+    assert recorded["provisioned"] is app_engine
+    assert recorded["seeded_database"].endswith("app.db")
+    assert recorded["build_app"] == (app_engine, codebook_engine)
+    assert recorded["uvicorn"] == (app, "127.0.0.1", 9001, True)
+    assert _get_env("ENVIRONMENT") == "test"
+    assert _get_env("ENABLE_DEV_API_KEY") == "true"
+    assert _get_env("DEV_API_KEY") == "dev-key"
+    assert _get_env("AZURE_AD_CLIENT_ID") == "e2e-client-id"
+    assert _get_env("AZURE_AD_TENANT_ID") == "e2e-tenant-id"
+    assert _get_env("ALLOWED_ORIGINS") == (
+        '["http://localhost:5173", "http://localhost:3000", '
+        '"http://127.0.0.1:5173", "http://127.0.0.1:3000"]'
+    )
+
+
+def test_run_e2e_server_skips_codebook_when_not_configured(
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app_engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'app.db'}")
+    databases = ManagedE2eDatabases(admin_url="sqlite+pysqlite:///master.db", app_engine=app_engine)
+    recorded: dict[str, object] = {}
+
+    @contextmanager
+    def fake_bundle(*_args: object, **_kwargs: object) -> Iterator[ManagedE2eDatabases]:
+        try:
+            yield databases
+        finally:
+            databases.dispose()
+
+    def migration_runner(_engine: object) -> None:
+        recorded["migrated"] = True
+
+    def seed_dataset(_session: Session) -> None:
+        recorded["seeded"] = True
+
+    def build_app(_app_engine: object, maybe_codebook_engine: object) -> FastAPI:
+        recorded["codebook_engine"] = maybe_codebook_engine
+        return FastAPI()
+
+    monkeypatch.setattr("grad_pylib.testing.fixtures.create_e2e_database_bundle", fake_bundle)
+    monkeypatch.setattr("grad_pylib.testing.fixtures.uvicorn.run", lambda *_args, **_kwargs: None)
+    monkeypatch.delenv("ALLOWED_ORIGINS", raising=False)
+
+    fixture_config = SimpleNamespace(migration_runner=migration_runner)
+    run_e2e_server(
+        fixture_config,
+        E2eServerConfig(
+            dev_api_key="dev-key",
+            seed_dataset=seed_dataset,
+            build_app=build_app,
+        ),
+    )
+
+    assert recorded["migrated"] is True
+    assert recorded["seeded"] is True
+    assert recorded["codebook_engine"] is None
+
+
+def _get_env(name: str) -> str:
+    import os
+
+    return os.environ[name]
