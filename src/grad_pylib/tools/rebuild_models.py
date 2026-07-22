@@ -7,13 +7,13 @@ from unicodedata import bidirectional
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine, make_url
 
+from grad_pylib.sqlserver_container import DEFAULT_SQL_SERVER_IMAGE, build_sql_server_container_kwargs
 from grad_pylib.tools.generate_models import (
     default_generated_models_path,
     generate_models,
 )
 from grad_pylib.tools.migrate import run_migrations
 
-DEFAULT_SQL_SERVER_IMAGE = "mcr.microsoft.com/mssql/server:2022-CU12-ubuntu-22.04"
 DEFAULT_DATABASE_NAME = "App"
 _VALID_DATABASE_NAME = re.compile(r"^[A-Za-z0-9_]+$")
 
@@ -52,7 +52,14 @@ def rebuild_models(
         password: str | None = None,
 ) -> Path:
     container_class = sqlserver_container_class()
-    with container_class(image=image, **{"password": password}, dbname="tempdb", dialect="mssql+pymssql") as container:
+    with container_class(
+            **build_sql_server_container_kwargs(
+                image=image,
+                password=password,
+                dbname="tempdb",
+                dialect="mssql+pymssql",
+            )
+    ) as container:
         admin_database_url = container.get_connection_url()
         database_url = create_database(admin_database_url, database_name)
         engine: Engine = create_engine(database_url, future=True, pool_pre_ping=True)

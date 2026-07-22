@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import signal
+import threading
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, Protocol
@@ -8,13 +10,14 @@ from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, field
 from fastapi import FastAPI
 import uvicorn
+from uvicorn.server import HANDLED_SIGNALS, Server
 from sqlalchemy import create_engine, text, Engine
 from sqlalchemy.orm import sessionmaker, Session
 import pytest
 from _pytest.config import Config
 from xdist.workermanage import WorkerController
 
-from grad_pylib.tools.rebuild_models import DEFAULT_SQL_SERVER_IMAGE
+from grad_pylib.sqlserver_container import DEFAULT_SQL_SERVER_IMAGE, build_sql_server_container_kwargs
 
 CODEBOOK_DATABASE_NAME = "Codebook"
 
@@ -93,6 +96,21 @@ class ManagedE2eDatabases:
         self.app_engine.dispose()
 
 
+class CleanupFriendlyUvicornServer(Server):
+    @contextmanager
+    def capture_signals(self) -> Generator[None]:
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+
+        original_handlers = {sig: signal.signal(sig, self.handle_exit) for sig in HANDLED_SIGNALS}
+        try:
+            yield
+        finally:
+            for sig, handler in original_handlers.items():
+                signal.signal(sig, handler)
+
+
 def is_xdist_controller(config: Config) -> bool:
     num_processes = getattr(config.option, "numprocesses", None)
     return not hasattr(config, "workerinput") and bool(num_processes)
@@ -115,11 +133,11 @@ def start_controller_container(state: SharedSqlServerState, fixture_config: SqlS
     from testcontainers.mssql import SqlServerContainer
 
     # Keep default dialect here so testcontainers can safely check health natively via pymssql internally
-    container = SqlServerContainer(
+    container = SqlServerContainer(**build_sql_server_container_kwargs(
         image=fixture_config.image,
         password=fixture_config.password,
         dbname="master",
-    )
+    ))
 
     # Start the container FIRST before requesting network/port strings
     container.start()
@@ -172,11 +190,11 @@ def create_mssql_engine(request: pytest.FixtureRequest, fixture_config: SqlServe
     # Mode B: Running sequentially without xdist (Master mode)
     from testcontainers.mssql import SqlServerContainer
 
-    with SqlServerContainer(
+    with SqlServerContainer(**build_sql_server_container_kwargs(
             image=fixture_config.image,
             password=fixture_config.password,
             dbname="master",
-    ) as container:
+    )) as container:
         # Enforce pyodbc connection engine mapping here as well
         admin_url = _build_pyodbc_url(container.get_connection_url())
         database_name = f"{fixture_config.database_prefix}_{worker_id}"
@@ -320,11 +338,11 @@ def create_e2e_database_bundle(
     from testcontainers.mssql import SqlServerContainer
 
     database_name = app_database_name or f"{fixture_config.database_prefix}_e2e"
-    with SqlServerContainer(
+    with SqlServerContainer(**build_sql_server_container_kwargs(
             image=fixture_config.image,
             password=fixture_config.password,
             dbname="master",
-    ) as container:
+    )) as container:
         admin_url = _build_pyodbc_url(container.get_connection_url())
         app_database_url = create_database(admin_url, database_name)
         app_engine = create_engine(app_database_url, future=True, pool_pre_ping=True)
@@ -361,7 +379,14 @@ def run_e2e_server(
         app = config.build_app(app_engine, codebook_engine)
 
         print(f"E2E server ready at http://{host}:{port} (docs at /docs).", flush=True)
-        uvicorn.run(app, host=host, port=port, access_log=True)
+        run_managed_uvicorn_server(app, host=host, port=port, access_log=True)
+
+
+def run_managed_uvicorn_server(app: FastAPI, *, host: str, port: int, access_log: bool) -> None:
+    server = CleanupFriendlyUvicornServer(
+        uvicorn.Config(app, host=host, port=port, access_log=access_log),
+    )
+    server.run()
 
 
 def build_test_app(

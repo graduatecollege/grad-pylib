@@ -1,4 +1,5 @@
 from functools import lru_cache
+import signal
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,11 +9,14 @@ from typing import Annotated, Any
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 import pytest
+import uvicorn
 from sqlalchemy import create_engine
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
+from uvicorn.server import HANDLED_SIGNALS
 
 from grad_pylib.testing.fixtures import (
+    CleanupFriendlyUvicornServer,
     E2eServerConfig,
     ManagedE2eDatabases,
     SessionDependencyOverride,
@@ -255,11 +259,14 @@ def test_run_e2e_server_configures_environment_and_runs_with_optional_codebook(
         recorded["build_app"] = (app_db_engine, maybe_codebook_engine)
         return app
 
-    def fake_uvicorn_run(server_app: object, *, host: str, port: int, access_log: bool) -> None:
+    def fake_run_managed_uvicorn_server(server_app: object, *, host: str, port: int, access_log: bool) -> None:
         recorded["uvicorn"] = (server_app, host, port, access_log)
 
     monkeypatch.setattr("grad_pylib.testing.fixtures.create_e2e_database_bundle", fake_bundle)
-    monkeypatch.setattr("grad_pylib.testing.fixtures.uvicorn.run", fake_uvicorn_run)
+    monkeypatch.setattr(
+        "grad_pylib.testing.fixtures.run_managed_uvicorn_server",
+        fake_run_managed_uvicorn_server,
+    )
     monkeypatch.setenv("E2E_HOST", "127.0.0.1")
     monkeypatch.setenv("E2E_PORT", "9001")
     monkeypatch.delenv("ALLOWED_ORIGINS", raising=False)
@@ -318,7 +325,10 @@ def test_run_e2e_server_skips_codebook_when_not_configured(
         return FastAPI()
 
     monkeypatch.setattr("grad_pylib.testing.fixtures.create_e2e_database_bundle", fake_bundle)
-    monkeypatch.setattr("grad_pylib.testing.fixtures.uvicorn.run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "grad_pylib.testing.fixtures.run_managed_uvicorn_server",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.delenv("ALLOWED_ORIGINS", raising=False)
 
     fixture_config = SimpleNamespace(migration_runner=migration_runner)
@@ -334,6 +344,30 @@ def test_run_e2e_server_skips_codebook_when_not_configured(
     assert recorded["migrated"] is True
     assert recorded["seeded"] is True
     assert recorded["codebook_engine"] is None
+
+
+def test_cleanup_friendly_uvicorn_server_does_not_reraise_captured_signals(
+        monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded_signals: list[tuple[signal.Signals, object]] = []
+    restored_handlers = {sig: object() for sig in HANDLED_SIGNALS}
+    raised_signals: list[int] = []
+
+    server = CleanupFriendlyUvicornServer(uvicorn.Config(FastAPI()))
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        recorded_signals.append((sig, handler))
+        return restored_handlers.setdefault(sig, object())
+
+    monkeypatch.setattr("grad_pylib.testing.fixtures.signal.signal", fake_signal)
+    monkeypatch.setattr("grad_pylib.testing.fixtures.signal.raise_signal", raised_signals.append)
+
+    with server.capture_signals():
+        server.handle_exit(signal.SIGTERM, None)
+
+    assert server.should_exit is True
+    assert raised_signals == []
+    assert len(recorded_signals) == len(HANDLED_SIGNALS) * 2
 
 
 def _get_env(name: str) -> str:
