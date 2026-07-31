@@ -1,0 +1,51 @@
+name: Dependabot Tests
+
+on:
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # ratchet:actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # ratchet:actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # ratchet:astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python system dependencies
+        shell: bash
+        run: |-
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends unixodbc-dev
+
+      - name: Install SQL Server ODBC driver
+        shell: bash
+        run: |-
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg unixodbc
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /usr/share/keyrings/microsoft-prod.gpg > /dev/null
+          . /etc/os-release
+          curl -fsSL "https://packages.microsoft.com/config/ubuntu/${VERSION_ID}/prod.list" | sudo tee /etc/apt/sources.list.d/microsoft-prod.list > /dev/null
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18
+
+      - name: Install Python dependencies
+        shell: bash
+        run: uv sync --locked
+
+      - name: Test backend
+        shell: bash
+        run: make test

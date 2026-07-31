@@ -1,0 +1,13 @@
+version: 2
+
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      patch-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - "patch"
