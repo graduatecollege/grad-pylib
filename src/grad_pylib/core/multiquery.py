@@ -1,7 +1,7 @@
 from typing import Any, get_origin, Union, get_args
 
 from pydantic import BaseModel
-from sqlalchemy import Table
+from sqlalchemy import Table, Result
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.engine import Row
 from sqlalchemy.orm import DeclarativeBase
@@ -46,7 +46,9 @@ def split_row_sections(
     return tuple(results)
 
 
-def read_all_result_sets(result: CursorResult[Any]) -> list[list[dict[str, Any]]]:
+def read_all_result_sets(result: CursorResult[Any] | Result[Any]) -> list[list[dict[str, Any]]]:
+    # SQLAlchemy returns a Result type object, but it's actually a CursorResult
+    # noinspection unresolved-references
     cursor = result.cursor
     try:
         result_sets = [cursor_rows_to_dicts(cursor)]
