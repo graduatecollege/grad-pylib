@@ -1,11 +1,14 @@
 import asyncio
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from fastapi_azure_auth import SingleTenantAzureAuthorizationCodeBearer
 from pydantic import ValidationError
 from starlette.requests import Request
 
+from grad_pylib.core import auth as auth_module
 from grad_pylib.core.auth import (
     AuthConfiguration,
     AuthRuntimeConfig,
@@ -53,6 +56,15 @@ def _request(
     })
 
 
+def _azure_scheme() -> SingleTenantAzureAuthorizationCodeBearer:
+    return SingleTenantAzureAuthorizationCodeBearer(
+        app_client_id="client-id",
+        tenant_id="tenant-id",
+        auto_error=False,
+        scopes={},
+    )
+
+
 def _override_loader(seen_session: list[object]):
     def loader(user: BaseUser, active_session: object) -> BaseUser:
         seen_session.append(active_session)
@@ -70,7 +82,7 @@ def _dependency(
     return require_policy(
         policy,
         config=_CONFIG,
-        azure_scheme=lambda: None,
+        azure_scheme=_azure_scheme(),
         get_settings=lambda: resolved,
         get_session=lambda: None,
         forbidden_error_factory=PermissionError,
@@ -82,6 +94,17 @@ def _dependency(
             roles=("Department",),
         ),
     )
+
+
+class _AuditRecorder:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, dict[str, object]]] = []
+
+    def warning(self, event: str, /, **fields: object) -> None:
+        self.events.append(("warning", event, fields))
+
+    def info(self, event: str, /, **fields: object) -> None:
+        self.events.append(("info", event, fields))
 
 
 def test_base_user_netid_is_shared() -> None:
@@ -248,6 +271,135 @@ def test_default_claims_to_user_accepts_institutional_upn() -> None:
 
     assert user.netid == "abc123"
     assert user.roles == ("Auditor",)
+
+
+def test_default_claims_to_user_ignores_malformed_role_claims() -> None:
+    user = default_claims_to_user(
+        {"upn": "abc123@illinois.edu", "roles": {"Auditor": True}, "role": 7},
+        ("Auditor",),
+    )
+
+    assert user.roles == ()
+
+
+def test_require_policy_denies_insufficient_roles_and_audits_the_denial(
+        monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audit = _AuditRecorder()
+    monkeypatch.setattr(auth_module, "_audit_logger", audit)
+    dependency = require_policy(
+        "Auditor",
+        config=_CONFIG,
+        azure_scheme=_azure_scheme(),
+        get_settings=_settings,
+        get_session=lambda: None,
+        forbidden_error_factory=PermissionError,
+        claims_to_user=lambda claims: default_claims_to_user(claims, _CONFIG.valid_roles),
+    )
+    request = _request(api_key=None, api_role=None)
+
+    with pytest.raises(PermissionError, match="do not have permission"):
+        dependency(
+            request=request,
+            session=object(),
+            azure_user=SimpleNamespace(claims={"upn": "abc123@illinois.edu", "roles": ["Department"]}),
+        )
+
+    assert isinstance(request.state.user, BaseUser)
+    assert request.state.user.roles == ("Department",)
+    assert audit.events[-1] == (
+        "info",
+        "auth.access.denied",
+        {
+            "policy": "Auditor",
+            "mechanism": "azure_ad",
+            "subject": "abc123",
+            "roles": ["Department"],
+            "client_host": "127.0.0.1",
+            "http_method": "GET",
+            "http_path": "/things",
+        },
+    )
+
+
+def test_override_loader_can_replace_identity_and_audits_the_override(
+        monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audit = _AuditRecorder()
+    monkeypatch.setattr(auth_module, "_audit_logger", audit)
+    dependency = require_policy(
+        "Auditor",
+        config=_CONFIG,
+        azure_scheme=_azure_scheme(),
+        get_settings=_settings,
+        get_session=lambda: None,
+        forbidden_error_factory=PermissionError,
+        claims_to_user=lambda claims: default_claims_to_user(claims, _CONFIG.valid_roles),
+        override_loader=lambda _user, _session: BaseUser(
+            email="override@illinois.edu",
+            roles=("Auditor",),
+        ),
+    )
+    request = _request(api_key=None, api_role=None)
+
+    user = dependency(
+        request=request,
+        session=object(),
+        azure_user=SimpleNamespace(claims={"upn": "abc123@illinois.edu", "roles": ["Department"]}),
+    )
+
+    assert user.email == "override@illinois.edu"
+    assert request.state.user is user
+    assert audit.events[0] == (
+        "warning",
+        "auth.roles.overridden",
+        {
+            "policy": "Auditor",
+            "mechanism": "azure_ad",
+            "subject": "override",
+            "original_roles": ["Department"],
+            "effective_roles": ["Auditor"],
+            "client_host": "127.0.0.1",
+            "http_method": "GET",
+            "http_path": "/things",
+        },
+    )
+
+
+def test_auth_audit_logs_exclude_raw_claims_and_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    audit = _AuditRecorder()
+    monkeypatch.setattr(auth_module, "_audit_logger", audit)
+    dependency = require_policy(
+        "Auditor",
+        config=_CONFIG,
+        azure_scheme=_azure_scheme(),
+        get_settings=_settings,
+        get_session=lambda: None,
+        forbidden_error_factory=PermissionError,
+        claims_to_user=lambda claims: default_claims_to_user(claims, _CONFIG.valid_roles),
+    )
+
+    dependency(
+        request=_request(api_key=None, api_role=None),
+        session=object(),
+        azure_user=SimpleNamespace(claims={
+            "upn": "abc123@illinois.edu",
+            "roles": ["Auditor"],
+            "access_token": "live-bearer-token",
+            "id_token": "raw-id-token",
+        }),
+    )
+
+    assert audit.events[-1][0] == "info"
+    assert audit.events[-1][1] == "auth.access.granted"
+    assert audit.events[-1][2]["subject"] == "abc123"
+    assert audit.events[-1][2]["roles"] == ["Auditor"]
+    for _, _, fields in audit.events:
+        assert "access_token" not in fields
+        assert "id_token" not in fields
+        assert "claims" not in fields
+        assert "authorization" not in fields
+        assert "headers" not in fields
 
 
 def test_build_auth_runtime_supports_placeholder_scheme_and_dev_api_key() -> None:

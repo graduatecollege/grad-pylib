@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from grad_pylib.core.config import BaseAppSettings, configure_settings_factory, get_settings
 
@@ -57,3 +58,12 @@ def test_dotenv_is_ignored_outside_development(tmp_path: Path, monkeypatch: pyte
 
     assert settings.app_name != "From Dotenv"
     assert settings.dev_api_key is None
+
+
+def test_dev_api_key_bypass_settings_are_rejected_outside_development() -> None:
+    with pytest.raises(ValidationError, match="enable_dev_api_key must not be enabled outside a development"):
+        BaseAppSettings(
+            environment="production",
+            enable_dev_api_key=True,
+            dev_api_key="secret",
+        )

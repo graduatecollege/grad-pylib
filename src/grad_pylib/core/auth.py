@@ -327,7 +327,13 @@ def claim_list(claims: dict[str, Any], name: str) -> list[str]:
     value = claims.get(name) or []
     if isinstance(value, str):
         return [value]
-    return [str(item) for item in value]
+    if isinstance(value, Mapping | bytes | bytearray):
+        return []
+    try:
+        iterator = iter(value)
+    except TypeError:
+        return []
+    return [str(item) for item in iterator]
 
 
 def claim_value(claims: dict[str, Any], *names: str) -> str:
