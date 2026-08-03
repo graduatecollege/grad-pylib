@@ -66,82 +66,80 @@ the application, with `parse_roles()` and `parse_distinct_strings()`. Users are 
 
 A policy grants access when the user holds *any* of its roles.
 
-## Schema helpers
+## Pytest SQL Server integration bootstrap
 
-`grad_pylib.core.schemas` also includes a small set of reusable helpers for common Pydantic
-normalization patterns:
+`grad_pylib.testing` now includes a higher-level bootstrap object for the repeated SQL Server
+integration-test wiring that application `conftest.py` files were hand-rolling around:
 
-* `parse_comma_separated_strings()` parses either a comma-separated string or an existing list,
-  strips whitespace, drops blanks, and can optionally deduplicate or sort.
-* `parse_validated_comma_separated_strings()` builds on that parser and applies an app-local
-  validator to each item.
-* `parse_json_blob()` parses JSON when a field arrives as a string and can optionally turn invalid
-  JSON into `None`.
-* `normalize_email_list()` trims, lowercases, removes blanks, and can require at least one email
-  after normalization.
+* shared `SharedSqlServerState`
+* `pytest_configure`, `pytest_configure_node`, and `pytest_unconfigure` hooks
+* session-scoped `mssql_engine`
+* optional session-scoped `codebook_engine`
+* per-test `db` fixture cleanup, with optional before/after hooks
 
-These helpers are intentionally generic. Business rules such as “department codes must be four
-digits” should still live in the consuming app.
-
-### Before
+### Simple app
 
 ```python
-@field_validator("department_codes", mode="before")
-@classmethod
-def _parse_department_codes(cls, value: object) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        items = value.split(",")
-    else:
-        items = value
+from pathlib import Path
 
-    parsed: list[str] = []
-    for item in items:
-        code = str(item).strip()
-        if not code:
-            continue
-        if not DEPARTMENT_CODE_PATTERN.fullmatch(code):
-            raise ValueError(f"Invalid department code: {code}")
-        if code not in parsed:
-            parsed.append(code)
-    return sorted(parsed)
-```
+from grad_pylib.testing import (
+    SqlServerBootstrapConfig,
+    SqlServerFixtureConfig,
+    SqlServerTestBootstrap,
+)
 
-### After
+FIXTURE_CONFIG = SqlServerFixtureConfig(
+    migration_runner=run_migrations,
+    tables_to_clean=("example_table",),
+)
+CODEBOOK_SQL = Path(__file__).parent / "data" / "codebook_minimal.sql"
 
-```python
-from grad_pylib.core.schemas import parse_validated_comma_separated_strings
-
-
-def _department_code(value: str) -> str:
-    if not DEPARTMENT_CODE_PATTERN.fullmatch(value):
-        raise ValueError(f"Invalid department code: {value}")
-    return value
-
-
-@field_validator("department_codes", mode="before")
-@classmethod
-def _parse_department_codes(cls, value: object) -> list[str]:
-    return parse_validated_comma_separated_strings(
-        value,
-        validator=_department_code,
-        dedupe=True,
-        sort=True,
+BOOTSTRAP = SqlServerTestBootstrap(
+    SqlServerBootstrapConfig(
+        fixture_config=FIXTURE_CONFIG,
+        codebook_sql_path=CODEBOOK_SQL,
+        include_codebook_engine=True,
     )
+)
+
+pytest_configure = BOOTSTRAP.pytest_configure
+pytest_configure_node = BOOTSTRAP.pytest_configure_node
+pytest_unconfigure = BOOTSTRAP.pytest_unconfigure
+
+mssql_engine = BOOTSTRAP.mssql_engine_fixture()
+codebook_engine = BOOTSTRAP.codebook_engine_fixture()
+db = BOOTSTRAP.db_fixture()
 ```
 
-The same pattern works for smaller field validators:
+### App with cache invalidation hooks
 
 ```python
-@field_validator("emails", mode="before")
-@classmethod
-def _normalize_emails(cls, value: object) -> list[str]:
-    return normalize_email_list(value, dedupe=True, require_non_empty=True)
+from grad_pylib.testing import SqlServerBootstrapConfig, SqlServerTestBootstrap
 
 
-@field_validator("metadata", mode="before")
-@classmethod
-def _parse_metadata(cls, value: object) -> dict[str, object] | None:
-    return parse_json_blob(value, invalid_to_none=True)
+def clear_test_caches() -> None:
+    cache.clear()
+
+
+BOOTSTRAP = SqlServerTestBootstrap(
+    SqlServerBootstrapConfig(
+        fixture_config=FIXTURE_CONFIG,
+        codebook_sql_path=CODEBOOK_SQL,
+        include_codebook_engine=True,
+        before_db_test=clear_test_caches,
+        after_db_test=clear_test_caches,
+    )
+)
+
+pytest_configure = BOOTSTRAP.pytest_configure
+pytest_configure_node = BOOTSTRAP.pytest_configure_node
+pytest_unconfigure = BOOTSTRAP.pytest_unconfigure
+
+mssql_engine = BOOTSTRAP.mssql_engine_fixture()
+codebook_engine = BOOTSTRAP.codebook_engine_fixture()
+db = BOOTSTRAP.db_fixture()
 ```
+
+If a service only needs the application engine and `db` fixture, leave
+`include_codebook_engine=False` and omit the `codebook_engine` binding. The bootstrap still keeps
+Codebook provisioning explicit through `codebook_sql_path`.
