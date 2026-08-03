@@ -10,15 +10,21 @@ e.g. ``status=submitted`` (equality) or ``requested_amount__gte=100``.
 
 Sorting parameters are a comma separated list of fields, where a leading ``-``
 denotes descending order, e.g. ``sort=-submitted_at,department_code``.
+
+For raw ``text(...)`` queries, :func:`build_where_clause` can also compose
+developer-supplied fixed predicates with request-driven filters while keeping
+values parameterized and reporting any ``IN`` parameters that should be bound as
+SQLAlchemy expanding parameters.
 """
 
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import Select
+from sqlalchemy import Select, bindparam
 from sqlalchemy.orm import InstrumentedAttribute
-from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.elements import ColumnElement, TextClause
 
 from grad_pylib.core.exceptions import BadRequestError
 
@@ -56,6 +62,25 @@ class QuerySpec:
         self.filterable: dict[str, Column] = dict(filterable or {})
         self.sortable: dict[str, Column] = dict(sortable or {})
         self.default_sort = default_sort
+
+
+@dataclass(frozen=True, slots=True)
+class RawWhereClause:
+    """A raw SQL ``WHERE`` clause with its bind parameters.
+
+    ``build_where_clause()`` returns this object so raw SQL callers can access
+    ``sql``, ``params``, and any list-valued ``expanding_params`` directly. The
+    object also preserves the previous convenience of unpacking into
+    ``(sql, params)``.
+    """
+
+    sql: str
+    params: dict[str, Any]
+    expanding_params: tuple[str, ...] = ()
+
+    def __iter__(self) -> Iterator[Any]:
+        yield self.sql
+        yield self.params
 
 
 def _parse_filter_key(key: str) -> tuple[str, str]:
@@ -149,10 +174,32 @@ def _raw_column_name(field: str, column: Column) -> str:
     return name
 
 
-def build_where_clause(spec: QuerySpec, filters: Mapping[str, Any] | None) -> tuple[str, dict[str, Any]]:
-    """Build a raw SQL ``WHERE`` clause and bind parameters from ``filters``."""
-    if not filters:
-        return "", {}
+def bind_expanding_params(query: TextClause, param_names: Sequence[str]) -> TextClause:
+    """Bind ``param_names`` on ``query`` as SQLAlchemy expanding parameters."""
+    for param_name in param_names:
+        query = query.bindparams(bindparam(param_name, expanding=True))
+    return query
+
+
+def build_where_clause(
+        spec: QuerySpec,
+        filters: Mapping[str, Any] | None,
+        *,
+        extra_clauses: Sequence[str] = (),
+        expanding_in: bool = False,
+) -> RawWhereClause:
+    """Build a raw SQL ``WHERE`` clause and bind parameters.
+
+    ``extra_clauses`` lets callers prepend fixed, developer-authored predicates
+    (for example, ``"term = :term"``) without manually re-joining all ``WHERE``
+    fragments. When ``expanding_in`` is true, ``IN`` filters use a single bind
+    parameter and record its name in ``expanding_params`` for
+    :func:`bind_expanding_params`.
+    """
+    filters = filters or {}
+    clauses = [clause.strip() for clause in extra_clauses if clause.strip()]
+    if not filters and not clauses:
+        return RawWhereClause("", {})
 
     requested_fields = {_parse_filter_key(key)[0] for key, value in filters.items() if value is not None}
     if len(requested_fields) > len(spec.filterable):
@@ -161,7 +208,7 @@ def build_where_clause(spec: QuerySpec, filters: Mapping[str, Any] | None) -> tu
         )
 
     params: dict[str, Any] = {}
-    clauses: list[str] = []
+    expanding_params: list[str] = []
     for index, (key, value) in enumerate(filters.items(), start=1):
         if value is None:
             continue
@@ -193,6 +240,12 @@ def build_where_clause(spec: QuerySpec, filters: Mapping[str, Any] | None) -> tu
             values = list(values)
             if not values:
                 raise BadRequestError("Filter operator 'in' requires at least one value.")
+            if expanding_in:
+                param_name = f"{field}_{index}"
+                clauses.append(f"{column_name} IN :{param_name}")
+                params[param_name] = values
+                expanding_params.append(param_name)
+                continue
             placeholders: list[str] = []
             for item_index, item in enumerate(values, start=1):
                 param_name = f"{field}_{index}_{item_index}"
@@ -204,8 +257,8 @@ def build_where_clause(spec: QuerySpec, filters: Mapping[str, Any] | None) -> tu
         raise BadRequestError(f"Filter operator '{operator}' is not supported.")
 
     if not clauses:
-        return "", {}
-    return f"WHERE {' AND '.join(clauses)}", params
+        return RawWhereClause("", {})
+    return RawWhereClause(f"WHERE {' AND '.join(clauses)}", params, tuple(expanding_params))
 
 
 def build_order_by_clause(spec: QuerySpec, sort: str | Sequence[str] | None) -> str:

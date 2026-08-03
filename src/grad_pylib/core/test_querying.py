@@ -1,13 +1,12 @@
-import pytest
 from typing import Any
 
 import pytest
-from sqlalchemy import Select, select
+from sqlalchemy import Select, select, text
 
 from grad_pylib.core.querying import (
     apply_pagination,
     apply_query,
-    apply_sort, apply_filters,
+    apply_sort, apply_filters, bind_expanding_params,
 )
 
 from grad_pylib.core.exceptions import BadRequestError
@@ -174,6 +173,48 @@ def test_build_where_clause_in_operator():
     where, params = build_where_clause(SPEC, {"department_code__in": ["1227", "1234"]})
     assert where == "WHERE department_code IN (:department_code_1_1, :department_code_1_2)"
     assert params == {"department_code_1_1": "1227", "department_code_1_2": "1234"}
+
+
+def test_build_where_clause_composes_extra_clauses():
+    clause = build_where_clause(
+        SPEC,
+        {"department_code": "1227"},
+        extra_clauses=("term_code = :term_code", "status = :status"),
+    )
+    assert clause.sql == (
+        "WHERE term_code = :term_code AND status = :status AND department_code = :department_code_1"
+    )
+    assert clause.params == {"department_code_1": "1227"}
+    assert clause.expanding_params == ()
+
+
+def test_build_where_clause_supports_extra_clauses_without_filters():
+    clause = build_where_clause(SPEC, None, extra_clauses=("term_code = :term_code",))
+    assert clause.sql == "WHERE term_code = :term_code"
+    assert clause.params == {}
+    assert clause.expanding_params == ()
+
+
+def test_build_where_clause_in_operator_with_expanding_param():
+    clause = build_where_clause(SPEC, {"department_code__in": ["1227", "1234"]}, expanding_in=True)
+    assert clause.sql == "WHERE department_code IN :department_code_1"
+    assert clause.params == {"department_code_1": ["1227", "1234"]}
+    assert clause.expanding_params == ("department_code_1",)
+
+
+def test_bind_expanding_params_marks_text_clause_for_postcompile_expansion():
+    clause = build_where_clause(SPEC, {"department_code__in": ["1227", "1234"]}, expanding_in=True)
+    stmt = bind_expanding_params(
+        text(f"SELECT department_code FROM foo_nominations {clause.sql}"),
+        clause.expanding_params,
+    ).params(**clause.params)
+    assert "__[POSTCOMPILE_department_code_1]" in str(stmt)
+    assert stmt.compile().params == {"department_code_1": ["1227", "1234"]}
+
+
+def test_build_where_clause_rejects_empty_in_values():
+    with pytest.raises(BadRequestError, match="requires at least one value"):
+        build_where_clause(SPEC, {"department_code__in": []})
 
 
 def test_build_where_clause_unknown_field_raises():
