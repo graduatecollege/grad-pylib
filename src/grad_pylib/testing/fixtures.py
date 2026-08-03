@@ -20,6 +20,7 @@ from xdist.workermanage import WorkerController
 from grad_pylib.sqlserver_container import DEFAULT_SQL_SERVER_IMAGE, build_sql_server_container_kwargs
 
 CODEBOOK_DATABASE_NAME = "Codebook"
+DbSessionHook = Callable[[], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +42,20 @@ class SettingsFactory(Protocol):
 class SessionDependencyOverride:
     dependency: Callable[..., object]
     engine: Engine
+
+
+@dataclass(frozen=True, slots=True)
+class SqlServerBootstrapConfig:
+    fixture_config: SqlServerFixtureConfig
+    codebook_sql_path: Path | None = None
+    include_codebook_engine: bool = False
+    before_db_test: DbSessionHook | None = None
+    after_db_test: DbSessionHook | None = None
+    codebook_lock_name: str = "grad-pylib-test-codebook"
+
+    def __post_init__(self) -> None:
+        if self.include_codebook_engine and self.codebook_sql_path is None:
+            raise ValueError("codebook_sql_path is required when include_codebook_engine is true.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +86,67 @@ class SharedSqlServerState:
     def __init__(self) -> None:
         self.container: Any | None = None
         self.admin_url: str | None = None
+
+
+@dataclass(slots=True)
+class SqlServerTestBootstrap:
+    config: SqlServerBootstrapConfig
+    state: SharedSqlServerState = field(default_factory=SharedSqlServerState)
+
+    def pytest_configure(self, config: Config) -> None:
+        if not is_xdist_controller(config):
+            return
+
+        admin_url = start_controller_container(self.state, self.config.fixture_config)
+        self._provision_codebook_database(admin_url)
+
+    def pytest_configure_node(self, node: WorkerController) -> None:
+        configure_worker_node(node, state=self.state, fixture_config=self.config.fixture_config)
+
+    def pytest_unconfigure(self, config: Config) -> None:
+        if is_xdist_controller(config):
+            stop_controller_container(self.state)
+
+    def mssql_engine(self, request: pytest.FixtureRequest) -> Generator[Engine]:
+        for engine in create_mssql_engine(request, self.config.fixture_config):
+            if self.config.codebook_sql_path is not None and not hasattr(request.config, "workerinput"):
+                ensure_codebook_database(
+                    engine,
+                    sql_file=self.config.codebook_sql_path,
+                    lock_name=self.config.codebook_lock_name,
+                )
+            yield engine
+
+    def mssql_engine_fixture(self) -> object:
+        return pytest.fixture(scope="session", name="mssql_engine")(self.mssql_engine)
+
+    def codebook_engine(self, mssql_engine: Engine) -> Generator[Engine]:
+        if not self.config.include_codebook_engine:
+            raise RuntimeError("include_codebook_engine must be true to use the codebook_engine fixture.")
+        yield from create_codebook_engine(mssql_engine)
+
+    def codebook_engine_fixture(self) -> object:
+        return pytest.fixture(scope="session", name="codebook_engine")(self.codebook_engine)
+
+    def db(self, mssql_engine: Engine) -> Generator[Session]:
+        yield from create_db_session_fixture(
+            mssql_engine,
+            self.config.fixture_config,
+            before_test=self.config.before_db_test,
+            after_test=self.config.after_db_test,
+        )
+
+    def db_fixture(self) -> object:
+        return pytest.fixture(name="db")(self.db)
+
+    def _provision_codebook_database(self, admin_url: str) -> None:
+        if self.config.codebook_sql_path is None:
+            return
+        provision_codebook_database(
+            admin_url,
+            sql_file=self.config.codebook_sql_path,
+            lock_name=self.config.codebook_lock_name,
+        )
 
 
 @dataclass(slots=True)
@@ -208,11 +284,31 @@ def create_mssql_engine(request: pytest.FixtureRequest, fixture_config: SqlServe
             engine.dispose()
 
 
-def create_db_session_fixture(mssql_engine: Engine, fixture_config: SqlServerFixtureConfig) -> Generator[Session]:
+def create_codebook_engine(mssql_engine: Engine) -> Generator[Engine]:
+    codebook_engine = create_engine(
+        mssql_engine.url.set(database=CODEBOOK_DATABASE_NAME),
+        future=True,
+        pool_pre_ping=True,
+    )
+    try:
+        yield codebook_engine
+    finally:
+        codebook_engine.dispose()
+
+
+def create_db_session_fixture(
+        mssql_engine: Engine,
+        fixture_config: SqlServerFixtureConfig,
+        *,
+        before_test: DbSessionHook | None = None,
+        after_test: DbSessionHook | None = None,
+) -> Generator[Session]:
     SessionLocal = sessionmaker(bind=mssql_engine, autoflush=False, autocommit=False, expire_on_commit=False)
     session = SessionLocal()
 
     try:
+        if before_test is not None:
+            before_test()
         yield session
     finally:
         # Close the connection and abort outstanding uncommitted changes first
@@ -223,6 +319,9 @@ def create_db_session_fixture(mssql_engine: Engine, fixture_config: SqlServerFix
         with mssql_engine.begin() as conn:
             for table in fixture_config.tables_to_clean:
                 conn.execute(text(f"DELETE FROM [{table}]"))
+
+        if after_test is not None:
+            after_test()
 
 
 def create_database(admin_url: str, db_name: str) -> str:
