@@ -1,8 +1,16 @@
+import os
 from collections.abc import Callable
 from functools import lru_cache
 
 from pydantic import model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+
+ENVIRONMENT_ENV_VAR = "ENVIRONMENT"
+DEVELOPMENT_ENVIRONMENTS = frozenset({"development", "local", "test"})
+
+
+def is_development_environment(environment: str | None) -> bool:
+    return (environment or "").strip().lower() in DEVELOPMENT_ENVIRONMENTS
 
 
 class BaseAppSettings(BaseSettings):
@@ -30,9 +38,29 @@ class BaseAppSettings(BaseSettings):
     database_url: str | None = None
     log_level: str = "INFO"
 
+    @classmethod
+    def settings_customise_sources(
+            cls,
+            settings_cls: type[BaseSettings],
+            init_settings: PydanticBaseSettingsSource,
+            env_settings: PydanticBaseSettingsSource,
+            dotenv_settings: PydanticBaseSettingsSource,
+            file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """
+        Drops the ``.env`` source outside development environments.
+
+        Dotenv files are resolved relative to the process working directory, so a stray
+        ``.env`` shipped in (or mounted into) a container could otherwise silently override
+        production configuration, including the authentication settings.
+        """
+        if is_development_environment(os.environ.get(ENVIRONMENT_ENV_VAR, cls.model_fields["environment"].default)):
+            return init_settings, env_settings, dotenv_settings, file_secret_settings
+        return init_settings, env_settings, file_secret_settings
+
     @property
     def is_development(self) -> bool:
-        return self.environment.lower() in {"development", "local", "test"}
+        return is_development_environment(self.environment)
 
     @model_validator(mode="after")
     def _guard_dev_api_key(self) -> BaseAppSettings:

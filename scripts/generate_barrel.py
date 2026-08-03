@@ -80,7 +80,7 @@ def build_barrel():
     init_file = pkg_root / "__init__.py"
     with open(init_file, "w", encoding="utf-8") as f:
         f.write("# 🚨 AUTO-GENERATED BARREL FILE. DO NOT EDIT MANUALLY.\n")
-        f.write("# Run `pdm run barrel` to regenerate.\n\n")
+        f.write("# Run `make barrel` to regenerate.\n\n")
 
         # Write the absolute imports
         f.write("\n".join(sorted(import_lines)))

@@ -1,3 +1,7 @@
+from pathlib import Path
+
+import pytest
+
 from grad_pylib.core.config import BaseAppSettings, configure_settings_factory, get_settings
 
 
@@ -27,3 +31,29 @@ def test_base_settings_azure_scope_helpers() -> None:
     assert settings.azure_ad_scopes == {
         "api://client-id/user_impersonation": "user_impersonation",
     }
+
+
+def _isolate_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment: str) -> None:
+    (tmp_path / ".env").write_text("APP_NAME=From Dotenv\nDEV_API_KEY=from-dotenv\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    for name in ("APP_NAME", "DEV_API_KEY", "ENABLE_DEV_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ENVIRONMENT", environment)
+
+
+def test_dotenv_is_used_in_development(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _isolate_environment(tmp_path, monkeypatch, "development")
+
+    settings = BaseAppSettings()
+
+    assert settings.app_name == "From Dotenv"
+    assert settings.dev_api_key == "from-dotenv"
+
+
+def test_dotenv_is_ignored_outside_development(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _isolate_environment(tmp_path, monkeypatch, "production")
+
+    settings = BaseAppSettings()
+
+    assert settings.app_name != "From Dotenv"
+    assert settings.dev_api_key is None
