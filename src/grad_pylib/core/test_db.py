@@ -1,12 +1,15 @@
 from collections.abc import Generator
+from typing import get_args, get_origin
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from sqlalchemy import Integer, String, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from grad_pylib.core.config import BaseAppSettings
 from grad_pylib.core import db as db_module
-from grad_pylib.core.db import DatabaseRuntime, build_mssql_url, orm_upsert, resolve_database_url
+from grad_pylib.core.db import DatabaseRuntime, NamedDatabases, build_mssql_url, orm_upsert, resolve_database_url
 
 
 class Base(DeclarativeBase):
@@ -163,3 +166,140 @@ def test_database_runtime_background_session_closes_session(monkeypatch: pytest.
         assert not session_obj.closed
 
     assert session_obj.closed
+
+
+def test_named_databases_registers_and_looks_up_runtimes(monkeypatch: pytest.MonkeyPatch) -> None:
+    create_engine_calls: list[str] = []
+
+    def fake_create_engine(url: str, **_kwargs: object) -> object:
+        create_engine_calls.append(url)
+        return object()
+
+    monkeypatch.setattr(db_module, "create_engine", fake_create_engine)
+
+    databases = NamedDatabases.from_settings(
+        lambda: type(
+            "Settings",
+            (),
+            {
+                "database_url": "Driver={ODBC Driver 18 for SQL Server};Server=app",
+                "codebook_database_url": "Driver={ODBC Driver 18 for SQL Server};Server=codebook",
+            },
+        )(),
+        {"app": "database_url", "codebook": "codebook_database_url"},
+        pool_size=7,
+        max_overflow=11,
+    )
+
+    assert databases.names == ("app", "codebook")
+    assert databases["app"] is databases.database("app")
+    assert isinstance(databases.get_runtime("app"), DatabaseRuntime)
+
+    app_engine = databases["app"].get_engine()
+    codebook_engine = databases["codebook"].get_engine()
+
+    assert app_engine is databases["app"].get_engine()
+    assert codebook_engine is databases["codebook"].get_engine()
+    assert create_engine_calls == [
+        build_mssql_url("Driver={ODBC Driver 18 for SQL Server};Server=app"),
+        build_mssql_url("Driver={ODBC Driver 18 for SQL Server};Server=codebook"),
+    ]
+
+    with pytest.raises(KeyError, match="Unknown database: 'missing'"):
+        databases.database("missing")
+
+
+def test_named_databases_get_session_closes_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions: list[DummySession] = []
+
+    monkeypatch.setattr(db_module, "create_engine", lambda *_args, **_kwargs: object())
+
+    def fake_sessionmaker(**_kwargs: object):
+        def factory() -> DummySession:
+            session = DummySession()
+            sessions.append(session)
+            return session
+
+        return factory
+
+    monkeypatch.setattr(db_module, "sessionmaker", fake_sessionmaker)
+
+    app_db = NamedDatabases({"app": lambda: "mssql+pyodbc://example"})["app"]
+    generator = app_db.get_session()
+    session_obj = next(generator)
+
+    assert session_obj is sessions[0]
+    assert not session_obj.closed
+
+    with pytest.raises(StopIteration):
+        next(generator)
+
+    assert session_obj.closed
+
+
+def test_named_databases_get_background_session_closes_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions: list[DummySession] = []
+
+    monkeypatch.setattr(db_module, "create_engine", lambda *_args, **_kwargs: object())
+
+    def fake_sessionmaker(**_kwargs: object):
+        def factory() -> DummySession:
+            session = DummySession()
+            sessions.append(session)
+            return session
+
+        return factory
+
+    monkeypatch.setattr(db_module, "sessionmaker", fake_sessionmaker)
+
+    app_db = NamedDatabases({"app": lambda: "mssql+pyodbc://example"})["app"]
+    with app_db.get_background_session() as session_obj:
+        assert session_obj is sessions[0]
+        assert not session_obj.closed
+
+    assert session_obj.closed
+
+
+def test_named_databases_session_dependency_builds_fastapi_annotation() -> None:
+    app_db = NamedDatabases({"app": lambda: "mssql+pyodbc://example"})["app"]
+
+    annotation = app_db.session_dependency()
+    session_type, dependency = get_args(annotation)
+    dependency_callable = dependency.dependency
+
+    assert get_origin(annotation) is not None
+    assert session_type is Session
+    assert dependency_callable is not None
+    assert dependency_callable.__self__ is app_db
+    assert dependency_callable.__func__ is app_db.get_session.__func__
+
+
+def test_named_databases_session_dependency_works_with_fastapi(monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions: list[DummySession] = []
+
+    monkeypatch.setattr(db_module, "create_engine", lambda *_args, **_kwargs: object())
+
+    def fake_sessionmaker(**_kwargs: object):
+        def factory() -> DummySession:
+            session = DummySession()
+            sessions.append(session)
+            return session
+
+        return factory
+
+    monkeypatch.setattr(db_module, "sessionmaker", fake_sessionmaker)
+
+    app_db = NamedDatabases({"app": lambda: "mssql+pyodbc://example"})["app"]
+    DbSession = app_db.session_dependency()
+    app = FastAPI()
+
+    @app.get("/")
+    def read_root(session: DbSession) -> dict[str, bool]:
+        return {"is_dummy_session": isinstance(session, DummySession)}
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.json() == {"is_dummy_session": True}
+    assert sessions[0].closed
