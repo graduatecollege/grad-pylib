@@ -39,9 +39,9 @@ router = APIRouter()
 
 @router.get("/terms/{term_code}/records/{unique_hash}")
 def read_record(
-        term_code: TermCodePath,
-        unique_hash: UniqueHashPath,
-        department_code: DepartmentCodeQuery | None = None,
+    term_code: TermCodePath,
+    unique_hash: UniqueHashPath,
+    department_code: DepartmentCodeQuery | None = None,
 ) -> dict[str, str | None]:
     return {
         "term_code": term_code,
