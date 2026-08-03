@@ -1,15 +1,18 @@
 import asyncio
 import dataclasses
 from types import SimpleNamespace
+from typing import Annotated, get_args
 
 import pytest
 from fastapi import HTTPException
+from fastapi.params import Depends as DependsParameter
 from fastapi_azure_auth import SingleTenantAzureAuthorizationCodeBearer
 from pydantic import ValidationError
 from starlette.requests import Request
 
 from grad_pylib.core import auth as auth_module
 from grad_pylib.core.auth import (
+    AuthAppFactory,
     AuthConfiguration,
     AuthRuntimeConfig,
     AuthUser,
@@ -93,6 +96,29 @@ def _dependency(
             email="user@illinois.edu",
             roles=("Department",),
         ),
+    )
+
+
+def _auth_factory(
+        settings: BaseAppSettings | None = None,
+        *,
+        claims_to_user: auth_module.ClaimsToUser | None = None,
+        override_loader: auth_module.OverrideLoader | None = None,
+) -> AuthAppFactory:
+    resolved = settings or _settings()
+    return AuthAppFactory.configure(
+        config=_CONFIG,
+        get_settings=lambda: resolved,
+        get_session=lambda: None,
+        forbidden_error_factory=PermissionError,
+        claims_to_user=claims_to_user or (lambda claims: BaseUser(email=str(claims.get("upn") or ""))),
+        override_loader=override_loader,
+        dev_api_key_enabled=lambda _settings: True,
+        api_key_user_builder=lambda _role, _request: BaseUser(
+            email="user@illinois.edu",
+            roles=("Department",),
+        ),
+        allow_dev_placeholder_ids=True,
     )
 
 
@@ -429,3 +455,64 @@ def test_build_auth_runtime_supports_placeholder_scheme_and_dev_api_key() -> Non
     assert user.effective_roles == ("Auditor",)
     assert seen_session == [session]
     asyncio.run(auth.load_azure_openid_config())
+
+
+def test_auth_app_factory_builds_runtime_and_simple_consumer_dependency_helper() -> None:
+    seen_session: list[object] = []
+    session = object()
+    auth = _auth_factory(override_loader=_override_loader(seen_session)).runtime()
+
+    user = auth.require_policy("Auditor")(request=_request(), session=session, azure_user=None)
+
+    assert isinstance(auth.azure_scheme, SingleTenantAzureAuthorizationCodeBearer)
+    assert user.effective_roles == ("Auditor",)
+    assert seen_session == [session]
+    asyncio.run(auth.load_azure_openid_config())
+
+    user_policy = Annotated[BaseUser, auth.depends_on("Auditor")]
+    policy_dependency = get_args(user_policy)[1]
+
+    assert isinstance(policy_dependency, DependsParameter)
+    assert policy_dependency.dependency is not None
+
+
+def test_auth_app_factory_policy_dependency_resolves_through_wrapper_api() -> None:
+    auth = _auth_factory(
+        claims_to_user=lambda claims: default_claims_to_user(claims, _CONFIG.valid_roles),
+    ).runtime()
+    policy_dependency = auth.depends_on("Auditor")
+
+    assert policy_dependency.dependency is not None
+
+    user = policy_dependency.dependency(
+        request=_request(api_key=None, api_role=None),
+        session=object(),
+        azure_user=SimpleNamespace(claims={"upn": "abc123@illinois.edu", "roles": ["Auditor"]}),
+    )
+
+    assert user.roles == ("Auditor",)
+
+
+def test_auth_app_factory_supports_override_aware_and_override_free_runtimes() -> None:
+    seen_session: list[object] = []
+    factory = _auth_factory()
+    auth_without_override = factory.without_overrides()
+    auth_with_override = factory.with_overrides(_override_loader(seen_session))
+    azure_user = SimpleNamespace(claims={"upn": "abc123@illinois.edu", "roles": ["Department"]})
+
+    with pytest.raises(PermissionError, match="do not have permission"):
+        auth_without_override.require_policy("Auditor")(
+            request=_request(api_key=None, api_role=None),
+            session=object(),
+            azure_user=azure_user,
+        )
+
+    session = object()
+    user = auth_with_override.require_policy("Auditor")(
+        request=_request(api_key=None, api_role=None),
+        session=session,
+        azure_user=azure_user,
+    )
+
+    assert user.effective_roles == ("Auditor",)
+    assert seen_session == [session]

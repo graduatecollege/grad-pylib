@@ -187,9 +187,65 @@ class AuthRuntimeConfig:
 
 @dataclass(frozen=True, slots=True)
 class AuthRuntime:
+    """Ready-to-export auth helpers for a FastAPI application."""
+
     azure_scheme: SingleTenantAzureAuthorizationCodeBearer
-    require_policy: Callable[[str], Any]
+    _build_policy: Callable[[str], Any]
     load_azure_openid_config: Callable[[], Awaitable[None]]
+
+    def require_policy(self, policy: str) -> Any:
+        return self._build_policy(policy)
+
+    def depends_on(self, policy: str) -> Any:
+        return Depends(self.require_policy(policy))
+
+
+@dataclass(frozen=True, slots=True)
+class AuthAppFactory:
+    """Builds one or more auth runtimes from a shared application auth configuration."""
+
+    runtime_config: AuthRuntimeConfig
+
+    @classmethod
+    def configure(
+            cls,
+            *,
+            config: AuthConfiguration,
+            get_settings: SettingsProvider,
+            get_session: SessionProvider,
+            forbidden_error_factory: Callable[[str], Exception],
+            claims_to_user: ClaimsToUser,
+            override_loader: OverrideLoader | None = None,
+            dev_api_key_enabled: Callable[[Any], bool] | None = None,
+            api_key_user_builder: ApiKeyUserBuilder | None = None,
+            allow_dev_placeholder_ids: bool = False,
+            development_client_id: str = "development-client-id",
+            development_tenant_id: str = "development-tenant-id",
+    ) -> Self:
+        return cls(
+            AuthRuntimeConfig(
+                config=config,
+                get_settings=get_settings,
+                get_session=get_session,
+                forbidden_error_factory=forbidden_error_factory,
+                claims_to_user=claims_to_user,
+                override_loader=override_loader,
+                dev_api_key_enabled=dev_api_key_enabled,
+                api_key_user_builder=api_key_user_builder,
+                allow_dev_placeholder_ids=allow_dev_placeholder_ids,
+                development_client_id=development_client_id,
+                development_tenant_id=development_tenant_id,
+            )
+        )
+
+    def runtime(self) -> AuthRuntime:
+        return build_auth_runtime(self.runtime_config)
+
+    def with_overrides(self, override_loader: OverrideLoader) -> AuthRuntime:
+        return build_auth_runtime(replace(self.runtime_config, override_loader=override_loader))
+
+    def without_overrides(self) -> AuthRuntime:
+        return build_auth_runtime(replace(self.runtime_config, override_loader=None))
 
 
 def netid_from_email(email: str) -> str | None:
@@ -670,7 +726,7 @@ def build_auth_runtime(runtime_config: AuthRuntimeConfig) -> AuthRuntime:
 
     return AuthRuntime(
         azure_scheme=azure_scheme,
-        require_policy=build_policy,
+        _build_policy=build_policy,
         load_azure_openid_config=load_openid_config,
     )
 
