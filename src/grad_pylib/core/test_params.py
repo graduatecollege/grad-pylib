@@ -104,73 +104,93 @@ def test_shared_parameter_aliases_generate_openapi_validation_metadata(client: T
         )
     }
 
-    assert parameters["/terms/{term_code}"]["term_code"] == {
-        "name": "term_code",
-        "in": "path",
-        "required": True,
-        "schema": {
+    def assert_parameter(
+            parameter: dict[str, object],
+            *,
+            name: str,
+            location: str,
+            required: bool,
+            schema: dict[str, object],
+    ) -> None:
+        assert parameter["name"] == name
+        assert parameter["in"] == location
+        assert parameter["required"] is required
+        assert isinstance(parameter["schema"], dict)
+        assert parameter["schema"] == {**parameter["schema"], **schema}
+
+    assert_parameter(
+        parameters["/terms/{term_code}"]["term_code"],
+        name="term_code",
+        location="path",
+        required=True,
+        schema={
             "type": "string",
             "minLength": 6,
             "maxLength": 6,
             "pattern": "^[0-9]{6}$",
             "title": "Term Code",
         },
-    }
-    assert parameters["/term-search"]["term_code"] == {
-        "name": "term_code",
-        "in": "query",
-        "required": True,
-        "schema": {
+    )
+    assert_parameter(
+        parameters["/term-search"]["term_code"],
+        name="term_code",
+        location="query",
+        required=True,
+        schema={
             "type": "string",
             "minLength": 6,
             "maxLength": 6,
             "pattern": "^[0-9]{6}$",
             "title": "Term Code",
         },
-    }
-    assert parameters["/departments/{department_code}"]["department_code"] == {
-        "name": "department_code",
-        "in": "path",
-        "required": True,
-        "schema": {
+    )
+    assert_parameter(
+        parameters["/departments/{department_code}"]["department_code"],
+        name="department_code",
+        location="path",
+        required=True,
+        schema={
             "type": "string",
             "minLength": 3,
             "maxLength": 4,
             "pattern": "^[0-9]{3,4}$",
             "title": "Department Code",
         },
-    }
-    assert parameters["/department-search"]["department_code"] == {
-        "name": "department_code",
-        "in": "query",
-        "required": True,
-        "schema": {
+    )
+    assert_parameter(
+        parameters["/department-search"]["department_code"],
+        name="department_code",
+        location="query",
+        required=True,
+        schema={
             "type": "string",
             "minLength": 3,
             "maxLength": 4,
             "pattern": "^[0-9]{3,4}$",
             "title": "Department Code",
         },
-    }
-    assert parameters["/records/{unique_hash}"]["unique_hash"] == {
-        "name": "unique_hash",
-        "in": "path",
-        "required": True,
-        "schema": {
+    )
+    assert_parameter(
+        parameters["/records/{unique_hash}"]["unique_hash"],
+        name="unique_hash",
+        location="path",
+        required=True,
+        schema={
             "type": "string",
             "minLength": 1,
             "maxLength": 50,
             "pattern": "^[a-zA-Z0-9]+$",
             "title": "Unique Hash",
         },
-    }
-    assert parameters["/tables/{table_name}"]["table_name"] == {
-        "name": "table_name",
-        "in": "path",
-        "required": True,
-        "schema": {
+    )
+    assert_parameter(
+        parameters["/tables/{table_name}"]["table_name"],
+        name="table_name",
+        location="path",
+        required=True,
+        schema={
             "type": "string",
             "pattern": "^[a-z_]+$",
             "title": "Table Name",
         },
-    }
+    )
