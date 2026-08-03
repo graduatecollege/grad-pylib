@@ -1,6 +1,6 @@
 import logging
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from typing import Annotated, Any
 
@@ -38,6 +38,10 @@ class BaseUser:
     def effective_roles(self) -> list[str]:
         return self.roles_override or self.roles
 
+    @property
+    def netid(self) -> str:
+        return netid_from_email(self.email)
+
 
 @dataclass(frozen=True, slots=True)
 class AuthConfiguration:
@@ -69,6 +73,67 @@ type SettingsProvider = Callable[[], BaseAppSettings]
 type SessionProvider = Callable[[], Any]
 
 
+@dataclass(frozen=True, slots=True)
+class AuthRuntimeConfig:
+    config: AuthConfiguration
+    get_settings: SettingsProvider
+    get_session: SessionProvider
+    forbidden_error_factory: Callable[[str], Exception]
+    claims_to_user: ClaimsToUser
+    override_loader: OverrideLoader | None = None
+    dev_api_key_enabled: Callable[[Any], bool] | None = None
+    api_key_user_builder: ApiKeyUserBuilder | None = None
+    allow_dev_placeholder_ids: bool = False
+    development_client_id: str = "development-client-id"
+    development_tenant_id: str = "development-tenant-id"
+
+
+@dataclass(frozen=True, slots=True)
+class AuthRuntime:
+    azure_scheme: SingleTenantAzureAuthorizationCodeBearer
+    require_policy: Callable[[str], Any]
+    load_azure_openid_config: Callable[[], Awaitable[None]]
+
+
+def netid_from_email(email: str) -> str:
+    normalized = email.strip().lower()
+    if "@" not in normalized:
+        return ""
+    netid, domain = normalized.split("@", 1)
+    if domain not in {"illinois.edu", "uillinois.edu"}:
+        return ""
+    return netid
+
+
+def azure_ad_configured(settings: BaseAppSettings) -> bool:
+    return bool(settings.azure_ad_client_id and settings.azure_ad_tenant_id)
+
+
+def warn_if_azure_ad_missing(settings: BaseAppSettings) -> None:
+    if settings.is_development or azure_ad_configured(settings):
+        return
+
+    _logger.warning(
+        "Azure AD is not configured (client_id or tenant_id missing). "
+        "Authentication will reject all requests in non-development environments."
+    )
+
+
+def with_azure_development_placeholders[SettingsT: BaseAppSettings](
+        settings: SettingsT,
+        *,
+        development_client_id: str = "development-client-id",
+        development_tenant_id: str = "development-tenant-id",
+) -> SettingsT:
+    if azure_ad_configured(settings) or not settings.is_development:
+        return settings
+
+    return settings.model_copy(update={
+        "azure_ad_client_id": settings.azure_ad_client_id or development_client_id,
+        "azure_ad_tenant_id": settings.azure_ad_tenant_id or development_tenant_id,
+    })
+
+
 def build_azure_scheme(settings: BaseAppSettings) -> SingleTenantAzureAuthorizationCodeBearer:
     """
     Builds and returns an Azure authorization scheme configured for single-tenant authentication.
@@ -87,6 +152,16 @@ def build_azure_scheme(settings: BaseAppSettings) -> SingleTenantAzureAuthorizat
         auto_error=not settings.is_development,
         scopes=settings.azure_ad_scopes,
     )
+
+
+async def load_azure_openid_config(
+        azure_scheme: SingleTenantAzureAuthorizationCodeBearer,
+        *,
+        get_settings: SettingsProvider,
+) -> None:
+    if not azure_ad_configured(get_settings()):
+        return
+    await azure_scheme.openid_config.load_config()
 
 
 def normalize_role(value: str, valid_roles: tuple[str, ...]) -> str | None:
@@ -127,11 +202,33 @@ def parse_roles(values: list[str], valid_roles: tuple[str, ...]) -> list[str]:
     return parsed
 
 
+def parse_distinct_strings(
+        values: Collection[str],
+) -> list[str]:
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = value.strip()
+        if not normalized or normalized in seen:
+            continue
+        parsed.append(normalized)
+        seen.add(normalized)
+    return parsed
+
+
 def claim_list(claims: dict[str, Any], name: str) -> list[str]:
     value = claims.get(name) or []
     if isinstance(value, str):
         return [value]
     return [str(item) for item in value]
+
+
+def claim_value(claims: dict[str, Any], *names: str) -> str:
+    for name in names:
+        value = claims.get(name)
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 def default_claims_to_user(claims: dict[str, Any], valid_roles: tuple[str, ...]) -> BaseUser:
@@ -150,13 +247,13 @@ def default_claims_to_user(claims: dict[str, Any], valid_roles: tuple[str, ...])
     Returns:
         BaseUser: An instance representing the user with extracted details.
     """
-    email = claims.get("upn")
-    if not isinstance(email, str) or not email:
+    email = claim_value(claims, "upn")
+    if not email:
         raise ValueError("Azure AD user must have a UPN (email) claim.")
     return BaseUser(
         email=email,
-        first_name=claims.get("given_name") or claims.get("name") or "",
-        last_name=claims.get("family_name") or "",
+        first_name=claim_value(claims, "given_name", "name"),
+        last_name=claim_value(claims, "family_name"),
         roles=parse_roles(claim_list(claims, "roles") or claim_list(claims, "role"), valid_roles),
     )
 
@@ -279,6 +376,55 @@ def require_policy(
         return result
 
     return dependency
+
+
+def build_auth_runtime(runtime_config: AuthRuntimeConfig) -> AuthRuntime:
+    settings = runtime_config.get_settings()
+    warn_if_azure_ad_missing(settings)
+    azure_settings = settings
+    if runtime_config.allow_dev_placeholder_ids:
+        azure_settings = with_azure_development_placeholders(
+            settings,
+            development_client_id=runtime_config.development_client_id,
+            development_tenant_id=runtime_config.development_tenant_id,
+        )
+    azure_scheme = build_azure_scheme(azure_settings)
+
+    async def load_openid_config() -> None:
+        await load_azure_openid_config(azure_scheme, get_settings=runtime_config.get_settings)
+
+    def build_policy(policy: str) -> Any:
+        return require_policy(
+            policy,
+            config=runtime_config.config,
+            azure_scheme=azure_scheme,
+            get_settings=runtime_config.get_settings,
+            get_session=runtime_config.get_session,
+            forbidden_error_factory=runtime_config.forbidden_error_factory,
+            claims_to_user=runtime_config.claims_to_user,
+            override_loader=runtime_config.override_loader,
+            dev_api_key_enabled=runtime_config.dev_api_key_enabled,
+            api_key_user_builder=runtime_config.api_key_user_builder,
+        )
+
+    return AuthRuntime(
+        azure_scheme=azure_scheme,
+        require_policy=build_policy,
+        load_azure_openid_config=load_openid_config,
+    )
+
+
+def dev_api_key_enabled_for(
+        settings: BaseAppSettings,
+        *,
+        allowed_environments: Collection[str],
+) -> bool:
+    environment = (settings.environment or "").lower()
+    return bool(
+        settings.enable_dev_api_key
+        and settings.dev_api_key
+        and environment in {item.lower() for item in allowed_environments}
+    )
 
 
 def _evaluate_policy(
