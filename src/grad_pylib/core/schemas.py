@@ -36,7 +36,7 @@ def parse_comma_separated_strings(
 
     if isinstance(value, str):
         raw_items = value.split(",")
-    elif isinstance(value, Iterable) and not isinstance(value, Mapping | bytes | bytearray):
+    elif isinstance(value, Iterable) and not isinstance(value, (Mapping, bytes, bytearray)):
         raw_items = value
     else:
         raise ValueError("Expected a comma-separated string, an iterable of values, or None.")
