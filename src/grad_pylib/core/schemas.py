@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -49,9 +49,15 @@ def build_status_response(
     status: str = "ok",
     timestamp: datetime | None = None,
 ) -> StatusResponse:
+    if timestamp is None:
+        ts = utc_now()
+    elif timestamp.tzinfo is not None:
+        ts = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+    else:
+        ts = timestamp
     return StatusResponse(
         status=status,
         app_name=app_name,
         version=version,
-        timestamp=timestamp or utc_now(),
+        timestamp=ts,
     )
