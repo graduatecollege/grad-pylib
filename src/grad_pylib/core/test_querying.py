@@ -3,15 +3,14 @@ from typing import Any
 import pytest
 from sqlalchemy import Select, select, text
 
-from grad_pylib.core.querying import (
-    apply_pagination,
-    apply_query,
-    apply_sort, apply_filters, bind_expanding_params,
-)
-
 from grad_pylib.core.exceptions import BadRequestError
 from grad_pylib.core.querying import (
     QuerySpec,
+    apply_filters,
+    apply_pagination,
+    apply_query,
+    apply_sort,
+    bind_expanding_params,
     build_order_by_clause,
     build_where_clause,
 )
