@@ -1,5 +1,5 @@
 from collections.abc import Callable, Generator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from typing import Annotated, Any, Self
 import re
 import threading
@@ -128,7 +128,7 @@ class NamedDatabase:
     def get_session(self) -> Generator[Session]:
         yield from self.runtime.session()
 
-    def get_background_session(self) -> Generator[Session]:
+    def get_background_session(self) -> AbstractContextManager[Session]:
         return self.runtime.background_session()
 
     def session_dependency(self) -> Any:
@@ -219,7 +219,7 @@ class NamedDatabases:
 
     def database(self, name: str) -> NamedDatabase:
         try:
-            return self._databases[name]
+            return self._databases[name.strip()]
         except KeyError as exc:
             raise KeyError(f"Unknown database: {name!r}") from exc
 
