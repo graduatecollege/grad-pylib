@@ -9,7 +9,7 @@ from grad_pylib.core.decimal import OptionalStringDecimal, OptionalNumberDecimal
 from grad_pylib.core.exceptions import ApiError, BadRequestError, ForbiddenError, NotFoundError, ConflictError, api_error_handler, register_exception_handlers
 from grad_pylib.core.logging import REQUEST_ID_HEADER, REQUEST_ID_FIELD, configure_logging, bind_request_id_context
 from grad_pylib.core.multiquery import qualified_columns, section_columns, split_row_sections, read_all_result_sets, cursor_rows_to_dicts, map_row_to_pydantic
-from grad_pylib.core.params import TermCodePath, TermCodeQuery, DepartmentCodePath, DepartmentCodeQuery, UniqueHashPath, SnakeCaseNamePath, TermCodeBody, DepartmentCodeBody, UniqueHashBody, SnakeCaseNameBody
+from grad_pylib.core.params import TermCodePath, TermCodeQuery, DepartmentCodePath, DepartmentCodeQuery, UniqueHashPath, SnakeCaseNamePath, TermCode, DepartmentCode, UniqueHash, SnakeCaseName
 from grad_pylib.core.querying import QuerySpec, apply_filters, apply_sort, build_where_clause, build_order_by_clause, apply_pagination, apply_query
 from grad_pylib.core.schemas import to_camel, CamelModel, DataResponse, ItemResponse, ListResponse, MetaResponse, StatusResponse, build_status_response
 from grad_pylib.core.time import utc_now, utc_from_millis
@@ -34,10 +34,10 @@ __all__ = [
     "DEVELOPMENT_ENVIRONMENTS",
     "DataResponse",
     "DatabaseRuntime",
-    "DepartmentCodeBody",
+    "DepartmentCode",
     "DepartmentCodePath",
     "DepartmentCodeQuery",
-    "SnakeCaseNameBody",
+    "SnakeCaseName",
     "ENVIRONMENT_ENV_VAR",
     "ForbiddenError",
     "INSTITUTIONAL_EMAIL_DOMAINS",
@@ -64,10 +64,10 @@ __all__ = [
     "SqlServerErrorType",
     "StatusResponse",
     "StringDecimal",
-    "TermCodeBody",
+    "TermCode",
     "TermCodePath",
     "TermCodeQuery",
-    "UniqueHashBody",
+    "UniqueHash",
     "UniqueHashPath",
     "api_error_handler",
     "apply_filters",

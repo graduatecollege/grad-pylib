@@ -2,62 +2,6 @@
 
 Graduate College Python common library for web application APIs and other related projects.
 
-## Reusable FastAPI parameter aliases
-
-`grad_pylib` provides a small set of shared validated FastAPI parameter aliases for common route
-signatures:
-
-* `TermCodePath`
-* `TermCodeQuery`
-* `DepartmentCodePath`
-* `DepartmentCodeQuery`
-* `UniqueHashPath`
-* `SnakeCaseNamePath`
-
-These aliases replace repeated inline validation such as:
-
-```python
-from typing import Annotated
-
-from fastapi import Path, Query
-
-term_code: Annotated[str, Path(min_length=6, max_length=6, pattern=r"^[0-9]{6}$")]
-department_code: Annotated[str, Query(min_length=3, max_length=4, pattern=r"^[0-9]{3,4}$")]
-unique_hash: Annotated[str, Path(min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9]+$")]
-table_name: Annotated[str, Path(pattern=r"^[a-z_]+$")]
-```
-
-Applications can instead use clearer shared aliases:
-
-```python
-from fastapi import APIRouter
-
-from grad_pylib import DepartmentCodeQuery, SnakeCaseNamePath, TermCodePath, UniqueHashPath
-
-router = APIRouter()
-
-
-@router.get("/terms/{term_code}/records/{unique_hash}")
-def read_record(
-    term_code: TermCodePath,
-    unique_hash: UniqueHashPath,
-    department_code: DepartmentCodeQuery | None = None,
-) -> dict[str, str | None]:
-    return {
-        "term_code": term_code,
-        "unique_hash": unique_hash,
-        "department_code": department_code,
-    }
-
-
-@router.get("/tables/{table_name}")
-def read_table(table_name: SnakeCaseNamePath) -> dict[str, str]:
-    return {"table_name": table_name}
-```
-
-Keep other identifiers local to the consuming application when they are only used by one service or
-carry service-specific business rules.
-
 ## Authentication
 
 Applications authenticate with Azure AD through `grad_pylib.core.auth`. A few things are worth

@@ -1,8 +1,9 @@
-"""Reusable validated FastAPI parameter aliases."""
+"""Reusable validated FastAPI parameter aliases and Pydantic field types."""
 
 from typing import Annotated
 
-from fastapi import Body, Path, Query
+from fastapi import Path, Query
+from pydantic import StringConstraints
 
 _TERM_CODE_PATTERN = r"^[0-9]{6}$"
 _DEPARTMENT_CODE_PATTERN = r"^[0-9]{3,4}$"
@@ -39,22 +40,22 @@ SnakeCaseNamePath = Annotated[
     Path(pattern=_SNAKE_CASE_NAME_PATTERN),
 ]
 
-TermCodeBody = Annotated[
+TermCode = Annotated[
     str,
-    Body(min_length=6, max_length=6, pattern=_TERM_CODE_PATTERN),
+    StringConstraints(min_length=6, max_length=6, pattern=_TERM_CODE_PATTERN),
 ]
 
-DepartmentCodeBody = Annotated[
+DepartmentCode = Annotated[
     str,
-    Body(min_length=3, max_length=4, pattern=_DEPARTMENT_CODE_PATTERN),
+    StringConstraints(min_length=3, max_length=4, pattern=_DEPARTMENT_CODE_PATTERN),
 ]
 
-UniqueHashBody = Annotated[
+UniqueHash = Annotated[
     str,
-    Body(min_length=1, max_length=50, pattern=_UNIQUE_HASH_PATTERN),
+    StringConstraints(min_length=1, max_length=50, pattern=_UNIQUE_HASH_PATTERN),
 ]
 
-SnakeCaseNameBody = Annotated[
+SnakeCaseName = Annotated[
     str,
-    Body(pattern=_SNAKE_CASE_NAME_PATTERN),
+    StringConstraints(pattern=_SNAKE_CASE_NAME_PATTERN),
 ]

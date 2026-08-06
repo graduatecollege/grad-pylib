@@ -1,15 +1,21 @@
 from collections.abc import Iterator
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 import pytest
 
 from grad_pylib.core.params import (
+    DepartmentCode,
     DepartmentCodePath,
     DepartmentCodeQuery,
+    SnakeCaseName,
     SnakeCaseNamePath,
+    TermCode,
     TermCodePath,
     TermCodeQuery,
+    UniqueHash,
     UniqueHashPath,
 )
 
@@ -196,35 +202,40 @@ def test_shared_parameter_aliases_generate_openapi_validation_metadata(client: T
     )
 
 
-# ---- Body alias tests ----
-
-from grad_pylib.core.params import (
-    DepartmentCodeBody,
-    SnakeCaseNameBody,
-    TermCodeBody,
-    UniqueHashBody,
-)
+# ---- Pydantic field type tests ----
 
 
 @pytest.fixture
 def body_client() -> Iterator[TestClient]:
     app = FastAPI()
 
+    class TermRequest(BaseModel):
+        term_code: TermCode
+
+    class DepartmentRequest(BaseModel):
+        department_code: DepartmentCode
+
+    class RecordRequest(BaseModel):
+        unique_hash: UniqueHash
+
+    class TableRequest(BaseModel):
+        table_name: SnakeCaseName
+
     @app.post("/terms")
-    def create_term(term_code: TermCodeBody) -> dict[str, str]:
-        return {"term_code": term_code}
+    def create_term(payload: TermRequest) -> dict[str, str]:
+        return {"term_code": payload.term_code}
 
     @app.post("/departments")
-    def create_department(department_code: DepartmentCodeBody) -> dict[str, str]:
-        return {"department_code": department_code}
+    def create_department(payload: DepartmentRequest) -> dict[str, str]:
+        return {"department_code": payload.department_code}
 
     @app.post("/records")
-    def create_record(unique_hash: UniqueHashBody) -> dict[str, str]:
-        return {"unique_hash": unique_hash}
+    def create_record(payload: RecordRequest) -> dict[str, str]:
+        return {"unique_hash": payload.unique_hash}
 
     @app.post("/tables")
-    def create_table(table_name: SnakeCaseNameBody) -> dict[str, str]:
-        return {"table_name": table_name}
+    def create_table(payload: TableRequest) -> dict[str, str]:
+        return {"table_name": payload.table_name}
 
     with TestClient(app) as test_client:
         yield test_client
@@ -239,8 +250,16 @@ def body_client() -> Iterator[TestClient]:
         ("/tables", "degree_audit"),
     ],
 )
-def test_body_aliases_accept_valid_values(body_client: TestClient, path: str, body: str) -> None:
-    response = body_client.post(path, json=body)
+def test_pydantic_field_types_accept_valid_values(body_client: TestClient, path: str, body: str) -> None:
+    response = body_client.post(
+        path,
+        json={
+            "term_code": body,
+            "department_code": body,
+            "unique_hash": body,
+            "table_name": body,
+        },
+    )
 
     assert response.status_code == 200
 
@@ -258,32 +277,75 @@ def test_body_aliases_accept_valid_values(body_client: TestClient, path: str, bo
         ("/tables", "Degree_Audit"),
     ],
 )
-def test_body_aliases_reject_invalid_values(body_client: TestClient, path: str, body: str) -> None:
-    response = body_client.post(path, json=body)
+def test_pydantic_field_types_reject_invalid_values(body_client: TestClient, path: str, body: str) -> None:
+    response = body_client.post(
+        path,
+        json={
+            "term_code": body,
+            "department_code": body,
+            "unique_hash": body,
+            "table_name": body,
+        },
+    )
 
     assert response.status_code == 422
 
 
-def test_body_aliases_generate_openapi_validation_metadata(body_client: TestClient) -> None:
-    openapi = body_client.app.openapi()
+def test_pydantic_field_types_generate_openapi_validation_metadata(body_client: TestClient) -> None:
+    openapi: dict[str, Any] = body_client.app.openapi()
 
-    def get_body_schema(path: str) -> dict[str, object]:
-        return openapi["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+    def get_body_schema(path: str) -> dict[str, Any]:
+        schema = openapi["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+        assert isinstance(schema, dict)
+        ref = schema["$ref"]
+        assert isinstance(ref, str)
+        schema_name = ref.rsplit("/", maxsplit=1)[-1]
+        component_schema = openapi["components"]["schemas"][schema_name]
+        assert isinstance(component_schema, dict)
+        return component_schema
+
+    def get_body_property_schema(path: str, field_name: str) -> dict[str, Any]:
+        body_schema = get_body_schema(path)
+        properties = body_schema["properties"]
+        assert isinstance(properties, dict)
+        property_schema = properties[field_name]
+        assert isinstance(property_schema, dict)
+        return property_schema
 
     term_schema = get_body_schema("/terms")
-    assert term_schema.get("minLength") == 6
-    assert term_schema.get("maxLength") == 6
-    assert term_schema.get("pattern") == "^[0-9]{6}$"
+    assert get_body_property_schema("/terms", "term_code") == {
+        "type": "string",
+        "minLength": 6,
+        "maxLength": 6,
+        "pattern": "^[0-9]{6}$",
+        "title": "Term Code",
+    }
 
     dept_schema = get_body_schema("/departments")
-    assert dept_schema.get("minLength") == 3
-    assert dept_schema.get("maxLength") == 4
-    assert dept_schema.get("pattern") == "^[0-9]{3,4}$"
+    assert term_schema["required"] == ["term_code"]
+    assert get_body_property_schema("/departments", "department_code") == {
+        "type": "string",
+        "minLength": 3,
+        "maxLength": 4,
+        "pattern": "^[0-9]{3,4}$",
+        "title": "Department Code",
+    }
 
     hash_schema = get_body_schema("/records")
-    assert hash_schema.get("minLength") == 1
-    assert hash_schema.get("maxLength") == 50
-    assert hash_schema.get("pattern") == "^[a-zA-Z0-9]+$"
+    assert dept_schema["required"] == ["department_code"]
+    assert get_body_property_schema("/records", "unique_hash") == {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 50,
+        "pattern": "^[a-zA-Z0-9]+$",
+        "title": "Unique Hash",
+    }
 
     table_schema = get_body_schema("/tables")
-    assert table_schema.get("pattern") == "^[a-z_]+$"
+    assert hash_schema["required"] == ["unique_hash"]
+    assert get_body_property_schema("/tables", "table_name") == {
+        "type": "string",
+        "pattern": "^[a-z_]+$",
+        "title": "Table Name",
+    }
+    assert table_schema["required"] == ["table_name"]
