@@ -6,7 +6,8 @@ from pathlib import Path
 from sqlalchemy import Column, DateTime, MetaData, String, Table, func, select
 from sqlalchemy.engine import Engine
 
-from grad_pylib.core.db import get_engine
+from grad_pylib.core.config import get_settings
+from grad_pylib.core.db import NamedDatabases
 
 _GO_SPLIT = re.compile(r"^\s*go\s*$", re.IGNORECASE | re.MULTILINE)
 _MIGRATION_HISTORY = Table(
@@ -40,12 +41,21 @@ def applied_migrations(engine: Engine) -> dict[str, str]:
         return {row.file_name: row.checksum for row in rows}
 
 
+def default_engine() -> Engine:
+    databases = NamedDatabases.from_settings(
+        get_settings,
+        {"app": "database_url"},
+        default_name="app",
+    )
+    return databases.get_engine()
+
+
 def run_migrations(
         engine_override: Engine | None = None,
         *,
         schema_dir: str | Path | None = None,
 ) -> None:
-    eng = engine_override or get_engine()
+    eng = engine_override or default_engine()
     schema_path = Path(schema_dir) if schema_dir else default_schema_directory()
 
     ensure_migration_history(eng)

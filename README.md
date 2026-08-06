@@ -2,41 +2,6 @@
 
 Graduate College Python common library for web application APIs and other related projects.
 
-## Database bootstrap
-
-`grad_pylib.core.db.NamedDatabases` builds named `DatabaseRuntime` instances for FastAPI apps so
-services do not need to hand-write separate engine/session/bootstrap helpers for each database.
-
-```python
-from grad_pylib.core.config import BaseAppSettings, get_settings
-from grad_pylib.core.db import NamedDatabases
-
-
-class Settings(BaseAppSettings):
-    codebook_database_url: str | None = None
-
-
-databases = NamedDatabases.from_settings(
-    get_settings,
-    {"app": "database_url", "codebook": "codebook_database_url"},
-)
-
-app_db = databases["app"]
-codebook_db = databases["codebook"]
-
-get_engine = app_db.get_engine
-get_codebook_engine = codebook_db.get_engine
-
-get_session = app_db.get_session
-get_codebook_session = codebook_db.get_session
-
-DbSession = app_db.session_dependency()
-CodebookDbSession = codebook_db.session_dependency()
-
-get_background_session = app_db.get_background_session
-get_codebook_background_session = codebook_db.get_background_session
-```
-
 ## Authentication
 
 Applications authenticate with Azure AD through `grad_pylib.core.auth`. A few things are worth
