@@ -1,11 +1,12 @@
-from collections.abc import Callable, Generator
-from contextlib import contextmanager
-from typing import TypeVar, Any
+from collections.abc import Callable, Generator, Mapping
+from contextlib import AbstractContextManager, contextmanager
+from typing import Annotated, Any, Self
 import re
 import threading
 from dataclasses import dataclass
 from enum import Enum
 
+from fastapi import Depends
 from grad_pylib.core.config import BaseAppSettings, get_settings
 from pydantic import BaseModel
 from sqlalchemy import URL, create_engine, inspect, Table, Select, select
@@ -98,18 +99,172 @@ class DatabaseRuntime:
             session.close()
 
 
-_default_runtime = DatabaseRuntime(resolve_database_url)
+def _settings_database_url_resolver(
+        settings_provider: Callable[[], Any],
+        field_name: str,
+        *,
+        url_builder: Callable[[str], str],
+) -> Callable[[], str]:
+    def resolve() -> str:
+        settings = settings_provider()
+        database_url = getattr(settings, field_name, None)
+        if database_url:
+            return url_builder(database_url)
+        raise ValueError(f"{field_name.upper()} must be set.")
+
+    return resolve
 
 
-def get_engine() -> Engine:
+@dataclass(frozen=True, slots=True)
+class NamedDatabase:
+    """Bound helpers for one named database runtime."""
+
+    name: str
+    runtime: DatabaseRuntime
+
+    def get_engine(self) -> Engine:
+        return self.runtime.get_engine()
+
+    def get_session(self) -> Generator[Session]:
+        yield from self.runtime.session()
+
+    def get_background_session(self) -> AbstractContextManager[Session]:
+        return self.runtime.background_session()
+
+    def session_dependency(self) -> Any:
+        return Annotated[Session, Depends(self.get_session)]
+
+
+class NamedDatabases:
     """
-    Get the SQLAlchemy Engine for the default MSSQL database.
+    Shared multi-database bootstrap for FastAPI applications.
 
-    This function ensures that the engine is created only once and reused across
-    multiple calls. It uses a lock to prevent race conditions when multiple threads
-    might try to create the engine simultaneously.
+    Example:
+        databases = NamedDatabases.from_settings(
+            get_settings,
+            {"app": "database_url", "codebook": "codebook_database_url"},
+            default_name="app",
+        )
+
+        app_db = databases.default
+        codebook_db = databases["codebook"]
+
+        get_engine = databases.get_engine
+        get_codebook_engine = codebook_db.get_engine
+
+        get_session = databases.get_session
+        get_codebook_session = codebook_db.get_session
+
+        DbSession = databases.session_dependency()
+        CodebookDbSession = codebook_db.session_dependency()
+
+        get_background_session = databases.get_background_session
+        get_codebook_background_session = codebook_db.get_background_session
     """
-    return _default_runtime.get_engine()
+
+    def __init__(
+            self,
+            database_url_resolvers: Mapping[str, Callable[[], str]],
+            *,
+            default_name: str | None = None,
+            pool_pre_ping: bool = True,
+            pool_size: int = 5,
+            max_overflow: int = 20,
+    ) -> None:
+        if not database_url_resolvers:
+            raise ValueError("At least one named database must be configured.")
+
+        self._databases: dict[str, NamedDatabase] = {}
+
+        for name, resolver in database_url_resolvers.items():
+            normalized_name = name.strip()
+            if not normalized_name:
+                raise ValueError("Database names must not be blank.")
+            if normalized_name in self._databases:
+                raise ValueError(f"Duplicate database name: {normalized_name}")
+
+            runtime = DatabaseRuntime(
+                resolver,
+                pool_pre_ping=pool_pre_ping,
+                pool_size=pool_size,
+                max_overflow=max_overflow,
+            )
+            self._databases[normalized_name] = NamedDatabase(normalized_name, runtime)
+
+        self._default_name: str | None = None
+        if default_name is not None:
+            normalized_default_name = default_name.strip()
+            if not normalized_default_name:
+                raise ValueError("Default database name must not be blank.")
+            if normalized_default_name not in self._databases:
+                raise KeyError(f"Unknown default database: {default_name!r}")
+            self._default_name = normalized_default_name
+
+    @classmethod
+    def from_settings(
+            cls,
+            settings_provider: Callable[[], Any],
+            database_fields: Mapping[str, str],
+            *,
+            default_name: str | None = None,
+            url_builder: Callable[[str], str] = build_mssql_url,
+            pool_pre_ping: bool = True,
+            pool_size: int = 5,
+            max_overflow: int = 20,
+    ) -> Self:
+        return cls(
+            {
+                name: _settings_database_url_resolver(settings_provider, field_name, url_builder=url_builder)
+                for name, field_name in database_fields.items()
+            },
+            default_name=default_name,
+            pool_pre_ping=pool_pre_ping,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+        )
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._databases)
+
+    @property
+    def default_name(self) -> str | None:
+        return self._default_name
+
+    @property
+    def default(self) -> NamedDatabase:
+        if self._default_name is None:
+            raise ValueError("No default database configured.")
+        return self._databases[self._default_name]
+
+    def __getitem__(self, name: str) -> NamedDatabase:
+        return self.database(name)
+
+    def _database_or_default(self, name: str | None) -> NamedDatabase:
+        if name is None:
+            return self.default
+        return self.database(name)
+
+    def database(self, name: str) -> NamedDatabase:
+        try:
+            return self._databases[name.strip()]
+        except KeyError as exc:
+            raise KeyError(f"Unknown database: {name!r}") from exc
+
+    def get_runtime(self, name: str | None = None) -> DatabaseRuntime:
+        return self._database_or_default(name).runtime
+
+    def get_engine(self, name: str | None = None) -> Engine:
+        return self._database_or_default(name).get_engine()
+
+    def get_session(self, name: str | None = None) -> Generator[Session]:
+        yield from self._database_or_default(name).get_session()
+
+    def get_background_session(self, name: str | None = None) -> AbstractContextManager[Session]:
+        return self._database_or_default(name).get_background_session()
+
+    def session_dependency(self, name: str | None = None) -> Any:
+        return self._database_or_default(name).session_dependency()
 
 
 class SqlServerErrorType(Enum):
