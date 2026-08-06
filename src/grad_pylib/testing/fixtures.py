@@ -21,6 +21,7 @@ from grad_pylib.sqlserver_container import DEFAULT_SQL_SERVER_IMAGE, build_sql_s
 
 CODEBOOK_DATABASE_NAME = "Codebook"
 DbSessionHook = Callable[[], None]
+_ODBC_DATABASE_PATTERN = re.compile(r"(?i)(?:(?<=;)|^)(database|initial catalog)\s*=\s*[^;]*")
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +203,26 @@ def _build_pyodbc_url(base_pymssql_url: str) -> str:
     )
 
 
+def _set_odbc_connection_string_database(connection_string: str, database_name: str) -> str:
+    replacement = f"Database={database_name}"
+    if _ODBC_DATABASE_PATTERN.search(connection_string):
+        return _ODBC_DATABASE_PATTERN.sub(replacement, connection_string, count=1)
+    separator = "" if not connection_string or connection_string.endswith(";") else ";"
+    return f"{connection_string}{separator}{replacement}"
+
+
+def _url_with_database(url: Any, database_name: str) -> Any:
+    odbc_connection_string = url.query.get("odbc_connect")
+    if odbc_connection_string is None:
+        return url.set(database=database_name)
+    return url.set(
+        query={
+            **url.query,
+            "odbc_connect": _set_odbc_connection_string_database(odbc_connection_string, database_name),
+        }
+    )
+
+
 def start_controller_container(state: SharedSqlServerState, fixture_config: SqlServerFixtureConfig) -> str:
     if state.container is not None and state.admin_url is not None:
         return state.admin_url
@@ -286,7 +307,7 @@ def create_mssql_engine(request: pytest.FixtureRequest, fixture_config: SqlServe
 
 def create_codebook_engine(mssql_engine: Engine) -> Generator[Engine]:
     codebook_engine = create_engine(
-        mssql_engine.url.set(database=CODEBOOK_DATABASE_NAME),
+        _url_with_database(mssql_engine.url, CODEBOOK_DATABASE_NAME),
         future=True,
         pool_pre_ping=True,
     )
@@ -393,7 +414,7 @@ def ensure_sql_server_database(
         lock_name: str,
 ) -> None:
     provision_sql_server_database_from_file(
-        engine.url.set(database="master").render_as_string(hide_password=False),
+        _url_with_database(engine.url, "master").render_as_string(hide_password=False),
         database_name=database_name,
         sql_file=sql_file,
         lock_name=lock_name,
