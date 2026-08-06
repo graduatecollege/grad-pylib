@@ -18,20 +18,19 @@ SQLAlchemy expanding parameters.
 """
 
 import re
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from grad_pylib.core.exceptions import BadRequestError
 from sqlalchemy import Select, bindparam
 from sqlalchemy.orm import InstrumentedAttribute
 from sqlalchemy.sql.elements import ColumnElement, TextClause
 
-from grad_pylib.core.exceptions import BadRequestError
-
 type Column = ColumnElement[Any] | InstrumentedAttribute[Any]
 type FilterOperator = Callable[[Column, Any], ColumnElement[bool]]
 
-_OPERATORS: dict[str, FilterOperator] = {
+_COLUMN_FILTER_OPERATORS: dict[str, FilterOperator] = {
     "eq": lambda column, value: column == value,
     "ne": lambda column, value: column != value,
     "lt": lambda column, value: column < value,
@@ -40,7 +39,17 @@ _OPERATORS: dict[str, FilterOperator] = {
     "gte": lambda column, value: column >= value,
     "like": lambda column, value: column.like(value),
     "ilike": lambda column, value: column.ilike(value),
-    "in": lambda column, value: column.in_(value if isinstance(value, (list, tuple, set)) else [value]),
+}
+
+_RAW_FILTER_OPERATORS: dict[str, str] = {
+    "eq": "=",
+    "ne": "!=",
+    "lt": "<",
+    "lte": "<=",
+    "gt": ">",
+    "gte": ">=",
+    "like": "LIKE",
+    "ilike": "ILIKE",
 }
 
 
@@ -82,13 +91,49 @@ class RawWhereClause:
         yield self.sql
         yield self.params
 
+    def bind(self, query: TextClause) -> TextClause:
+        """Bind this clause's parameters onto ``query``.
+
+        Any ``IN`` parameters produced by :func:`build_where_clause` are marked as
+        SQLAlchemy expanding parameters automatically.
+        """
+        query = bind_expanding_params(query, self.expanding_params)
+        return query.params(**self.params)
+
 
 def _parse_filter_key(key: str) -> tuple[str, str]:
     field, _, operator = key.partition("__")
     return field, operator or "eq"
 
 
-def apply_filters[T: tuple[Any, ...]](stmt: Select[T], spec: QuerySpec, filters: Mapping[str, Any] | None) -> Select[T]:
+def _validate_requested_fields(
+        requested_fields: Iterable[str],
+        allowed_fields: Mapping[str, Any],
+        *,
+        action: str,
+) -> tuple[str, ...]:
+    unique_fields = tuple(dict.fromkeys(requested_fields))
+    for field in unique_fields:
+        if field not in allowed_fields:
+            raise BadRequestError(f"{action} by '{field}' is not supported.")
+    if len(unique_fields) > len(allowed_fields):
+        raise BadRequestError(
+            f"Too many {action.lower()} fields requested; at most {len(allowed_fields)} field(s) are allowed."
+        )
+    return unique_fields
+
+
+def _coerce_in_values(value: Any) -> list[Any]:
+    values = value if isinstance(value, (list, tuple, set, frozenset)) else [value]
+    coerced = list(values)
+    if not coerced:
+        raise BadRequestError("Filter operator 'in' requires at least one value.")
+    return coerced
+
+
+def apply_filters[T: tuple[Any, ...]](
+        stmt: Select[T], spec: QuerySpec, filters: Mapping[str, Any] | None
+) -> Select[T]:
     """Apply ``WHERE`` clauses for the supplied filters.
 
     Filter keys use a ``field`` or ``field__operator`` convention. Values that
@@ -97,19 +142,24 @@ def apply_filters[T: tuple[Any, ...]](stmt: Select[T], spec: QuerySpec, filters:
     """
     if not filters:
         return stmt
-    requested_fields = {_parse_filter_key(key)[0] for key, value in filters.items() if value is not None}
-    if len(requested_fields) > len(spec.filterable):
-        raise BadRequestError(
-            f"Too many filter fields requested; at most {len(spec.filterable)} field(s) are allowed."
-        )
+    _validate_requested_fields(
+        (
+            _parse_filter_key(key)[0]
+            for key, value in filters.items()
+            if value is not None
+        ),
+        spec.filterable,
+        action="Filtering",
+    )
     for key, value in filters.items():
         if value is None:
             continue
         field, operator = _parse_filter_key(key)
-        column = spec.filterable.get(field)
-        if column is None:
-            raise BadRequestError(f"Filtering by '{field}' is not supported.")
-        builder = _OPERATORS.get(operator)
+        column = spec.filterable[field]
+        if operator == "in":
+            stmt = stmt.where(column.in_(_coerce_in_values(value)))
+            continue
+        builder = _COLUMN_FILTER_OPERATORS.get(operator)
         if builder is None:
             raise BadRequestError(f"Filter operator '{operator}' is not supported.")
         stmt = stmt.where(builder(column, value))
@@ -129,7 +179,9 @@ def _parse_sort(sort: str | Sequence[str]) -> list[tuple[str, bool]]:
     return parsed
 
 
-def apply_sort[T: tuple[Any, ...]](stmt: Select[T], spec: QuerySpec, sort: str | Sequence[str] | None) -> Select[T]:
+def apply_sort[T: tuple[Any, ...]](
+        stmt: Select[T], spec: QuerySpec, sort: str | Sequence[str] | None
+) -> Select[T]:
     """Apply ``ORDER BY`` clauses for the requested sort expression.
 
     Falls back to ``spec.default_sort`` when ``sort`` is empty. Unknown fields
@@ -139,14 +191,11 @@ def apply_sort[T: tuple[Any, ...]](stmt: Select[T], spec: QuerySpec, sort: str |
     if not effective:
         return stmt
     requested_fields = _parse_sort(effective)
-    if len({field for field, _ in requested_fields}) > len(spec.sortable):
-        raise BadRequestError(
-            f"Too many sort fields requested; at most {len(spec.sortable)} field(s) are allowed."
-        )
+    _validate_requested_fields(
+        (field for field, _ in requested_fields), spec.sortable, action="Sorting"
+    )
     for field, descending in requested_fields:
-        column = spec.sortable.get(field)
-        if column is None:
-            raise BadRequestError(f"Sorting by '{field}' is not supported.")
+        column = spec.sortable[field]
         stmt = stmt.order_by(column.desc() if descending else column.asc())
     return stmt
 
@@ -166,7 +215,7 @@ def _raw_column_name(field: str, column: Column) -> str:
     a spec built from untrusted input) cannot produce injectable SQL that is
     later interpolated into a raw ``text(...)`` statement.
     """
-    name = getattr(column, "key", None) or getattr(column, "name", None)
+    name = getattr(column, "name", None) or getattr(column, "key", None)
     if not isinstance(name, str) or not name:
         raise BadRequestError(f"Unable to build SQL for field '{field}'.")
     if not _IDENTIFIER_RE.match(name):
@@ -185,27 +234,29 @@ def build_where_clause(
         spec: QuerySpec,
         filters: Mapping[str, Any] | None,
         *,
-        extra_clauses: Sequence[str] = (),
-        expanding_in: bool = False,
+        fixed_clauses: Sequence[str] = (),
 ) -> RawWhereClause:
     """Build a raw SQL ``WHERE`` clause and bind parameters.
 
-    ``extra_clauses`` lets callers prepend fixed, developer-authored predicates
+    ``fixed_clauses`` lets callers prepend fixed, developer-authored predicates
     (for example, ``"term = :term"``) without manually re-joining all ``WHERE``
-    fragments. When ``expanding_in`` is true, ``IN`` filters use a single bind
-    parameter and record its name in ``expanding_params`` for
-    :func:`bind_expanding_params`.
+    fragments. ``IN`` filters always use expanding parameters so callers can bind
+    the returned clause directly via :meth:`RawWhereClause.bind`.
     """
     filters = filters or {}
-    clauses = [clause.strip() for clause in extra_clauses if clause.strip()]
+    clauses = [clause.strip() for clause in fixed_clauses if clause.strip()]
     if not filters and not clauses:
         return RawWhereClause("", {})
 
-    requested_fields = {_parse_filter_key(key)[0] for key, value in filters.items() if value is not None}
-    if len(requested_fields) > len(spec.filterable):
-        raise BadRequestError(
-            f"Too many filter fields requested; at most {len(spec.filterable)} field(s) are allowed."
-        )
+    _validate_requested_fields(
+        (
+            _parse_filter_key(key)[0]
+            for key, value in filters.items()
+            if value is not None
+        ),
+        spec.filterable,
+        action="Filtering",
+    )
 
     params: dict[str, Any] = {}
     expanding_params: list[str] = []
@@ -213,21 +264,10 @@ def build_where_clause(
         if value is None:
             continue
         field, operator = _parse_filter_key(key)
-        column = spec.filterable.get(field)
-        if column is None:
-            raise BadRequestError(f"Filtering by '{field}' is not supported.")
+        column = spec.filterable[field]
 
         column_name = _raw_column_name(field, column)
-        operator_sql = {
-            "eq": "=",
-            "ne": "!=",
-            "lt": "<",
-            "lte": "<=",
-            "gt": ">",
-            "gte": ">=",
-            "like": "LIKE",
-            "ilike": "ILIKE",
-        }.get(operator)
+        operator_sql = _RAW_FILTER_OPERATORS.get(operator)
 
         if operator_sql is not None:
             param_name = f"{field}_{index}"
@@ -236,29 +276,19 @@ def build_where_clause(
             continue
 
         if operator == "in":
-            values = value if isinstance(value, (list, tuple, set)) else [value]
-            values = list(values)
-            if not values:
-                raise BadRequestError("Filter operator 'in' requires at least one value.")
-            if expanding_in:
-                param_name = f"{field}_{index}"
-                clauses.append(f"{column_name} IN :{param_name}")
-                params[param_name] = values
-                expanding_params.append(param_name)
-                continue
-            placeholders: list[str] = []
-            for item_index, item in enumerate(values, start=1):
-                param_name = f"{field}_{index}_{item_index}"
-                placeholders.append(f":{param_name}")
-                params[param_name] = item
-            clauses.append(f"{column_name} IN ({', '.join(placeholders)})")
+            param_name = f"{field}_{index}"
+            clauses.append(f"{column_name} IN :{param_name}")
+            params[param_name] = _coerce_in_values(value)
+            expanding_params.append(param_name)
             continue
 
         raise BadRequestError(f"Filter operator '{operator}' is not supported.")
 
     if not clauses:
         return RawWhereClause("", {})
-    return RawWhereClause(f"WHERE {' AND '.join(clauses)}", params, tuple(expanding_params))
+    return RawWhereClause(
+        f"WHERE {' AND '.join(clauses)}", params, tuple(expanding_params)
+    )
 
 
 def build_order_by_clause(spec: QuerySpec, sort: str | Sequence[str] | None) -> str:
@@ -268,16 +298,13 @@ def build_order_by_clause(spec: QuerySpec, sort: str | Sequence[str] | None) -> 
         return ""
 
     requested_fields = _parse_sort(effective)
-    if len({field for field, _ in requested_fields}) > len(spec.sortable):
-        raise BadRequestError(
-            f"Too many sort fields requested; at most {len(spec.sortable)} field(s) are allowed."
-        )
+    _validate_requested_fields(
+        (field for field, _ in requested_fields), spec.sortable, action="Sorting"
+    )
 
     clauses: list[str] = []
     for field, descending in requested_fields:
-        column = spec.sortable.get(field)
-        if column is None:
-            raise BadRequestError(f"Sorting by '{field}' is not supported.")
+        column = spec.sortable[field]
         direction = "DESC" if descending else "ASC"
         clauses.append(f"{_raw_column_name(field, column)} {direction}")
 

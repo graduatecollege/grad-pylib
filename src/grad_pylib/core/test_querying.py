@@ -1,7 +1,8 @@
 from typing import Any
 
 import pytest
-from sqlalchemy import Select, select, text
+from sqlalchemy import Select, String, select, text
+from sqlalchemy.orm import Mapped, declarative_base, mapped_column
 
 from grad_pylib.core.exceptions import BadRequestError
 from grad_pylib.core.querying import (
@@ -15,6 +16,15 @@ from grad_pylib.core.querying import (
     build_where_clause,
 )
 from grad_pylib.testing.fake_models import FooNomination, t_foo_view
+
+Base = declarative_base()
+
+
+class AliasedColumnModel(Base):
+    __tablename__ = "aliased_column_model"
+
+    python_name: Mapped[str] = mapped_column("db_name", String, primary_key=True)
+
 
 SPEC = QuerySpec(
     filterable={
@@ -40,7 +50,9 @@ def test_apply_filters_equality():
 
 
 def test_apply_filters_ignores_none_values():
-    stmt = apply_filters(select(FooNomination), SPEC, {"term_code": None, "department_code": "1227"})
+    stmt = apply_filters(
+        select(FooNomination), SPEC, {"term_code": None, "department_code": "1227"}
+    )
     sql = _sql(stmt)
     assert "term_code" not in sql.split("WHERE", 1)[1]
     assert "department_code = '1227'" in sql
@@ -61,18 +73,9 @@ def test_apply_filters_unknown_operator_raises():
         apply_filters(select(FooNomination), SPEC, {"term_code__between": "x"})
 
 
-def test_apply_filters_too_many_fields_raises():
-    with pytest.raises(BadRequestError, match="Too many filter fields"):
-        apply_filters(
-            select(FooNomination),
-            SPEC,
-            {
-                "term_code": "120251",
-                "department_code": "1227",
-                "requested_amount__gte": 100,
-                "uin": "123",
-            },
-        )
+def test_apply_filters_empty_in_list_raises():
+    with pytest.raises(BadRequestError, match="requires at least one value"):
+        apply_filters(select(FooNomination), SPEC, {"department_code__in": []})
 
 
 def test_apply_sort_descending():
@@ -107,8 +110,8 @@ def test_apply_sort_unknown_field_raises():
         apply_sort(select(FooNomination), SPEC, "uin")
 
 
-def test_apply_sort_too_many_fields_raises():
-    with pytest.raises(BadRequestError, match="Too many sort fields"):
+def test_apply_sort_unknown_field_preferred_over_length_error():
+    with pytest.raises(BadRequestError, match="Sorting by 'uin' is not supported"):
         apply_sort(select(FooNomination), SPEC, "department_code,submitted_at,uin")
 
 
@@ -125,7 +128,9 @@ def test_apply_pagination_limit_must_be_positive():
 
 
 def test_apply_pagination_offset_must_be_non_negative():
-    with pytest.raises(BadRequestError, match="'offset' must be greater than or equal to 0"):
+    with pytest.raises(
+        BadRequestError, match="'offset' must be greater than or equal to 0"
+    ):
         apply_pagination(select(FooNomination), offset=-1)
 
 
@@ -163,22 +168,28 @@ def test_apply_query_combines_filter_sort_and_pagination():
 
 
 def test_build_where_clause_equality_and_operator_suffix():
-    where, params = build_where_clause(SPEC, {"department_code": "1227", "requested_amount__gte": 100})
-    assert where == "WHERE department_code = :department_code_1 AND requested_amount >= :requested_amount_2"
+    where, params = build_where_clause(
+        SPEC, {"department_code": "1227", "requested_amount__gte": 100}
+    )
+    assert (
+        where
+        == "WHERE department_code = :department_code_1 AND requested_amount >= :requested_amount_2"
+    )
     assert params == {"department_code_1": "1227", "requested_amount_2": 100}
 
 
 def test_build_where_clause_in_operator():
-    where, params = build_where_clause(SPEC, {"department_code__in": ["1227", "1234"]})
-    assert where == "WHERE department_code IN (:department_code_1_1, :department_code_1_2)"
-    assert params == {"department_code_1_1": "1227", "department_code_1_2": "1234"}
+    clause = build_where_clause(SPEC, {"department_code__in": ["1227", "1234"]})
+    assert clause.sql == "WHERE department_code IN :department_code_1"
+    assert clause.params == {"department_code_1": ["1227", "1234"]}
+    assert clause.expanding_params == ("department_code_1",)
 
 
-def test_build_where_clause_composes_extra_clauses():
+def test_build_where_clause_composes_fixed_clauses():
     clause = build_where_clause(
         SPEC,
         {"department_code": "1227"},
-        extra_clauses=("term_code = :term_code", "status = :status"),
+        fixed_clauses=("term_code = :term_code", "status = :status"),
     )
     assert clause.sql == (
         "WHERE term_code = :term_code AND status = :status AND department_code = :department_code_1"
@@ -187,26 +198,29 @@ def test_build_where_clause_composes_extra_clauses():
     assert clause.expanding_params == ()
 
 
-def test_build_where_clause_supports_extra_clauses_without_filters():
-    clause = build_where_clause(SPEC, None, extra_clauses=("term_code = :term_code",))
+def test_build_where_clause_supports_fixed_clauses_without_filters():
+    clause = build_where_clause(SPEC, None, fixed_clauses=("term_code = :term_code",))
     assert clause.sql == "WHERE term_code = :term_code"
     assert clause.params == {}
     assert clause.expanding_params == ()
 
 
-def test_build_where_clause_in_operator_with_expanding_param():
-    clause = build_where_clause(SPEC, {"department_code__in": ["1227", "1234"]}, expanding_in=True)
-    assert clause.sql == "WHERE department_code IN :department_code_1"
-    assert clause.params == {"department_code_1": ["1227", "1234"]}
-    assert clause.expanding_params == ("department_code_1",)
+def test_raw_where_clause_bind_marks_text_clause_for_postcompile_expansion():
+    clause = build_where_clause(SPEC, {"department_code__in": ["1227", "1234"]})
+    stmt = clause.bind(
+        text(f"SELECT department_code FROM foo_nominations {clause.sql}")
+    )
+    assert "__[POSTCOMPILE_department_code_1]" in str(stmt)
+    assert stmt.compile().params == {"department_code_1": ["1227", "1234"]}
 
 
 def test_bind_expanding_params_marks_text_clause_for_postcompile_expansion():
-    clause = build_where_clause(SPEC, {"department_code__in": ["1227", "1234"]}, expanding_in=True)
     stmt = bind_expanding_params(
-        text(f"SELECT department_code FROM foo_nominations {clause.sql}"),
-        clause.expanding_params,
-    ).params(**clause.params)
+        text(
+            "SELECT department_code FROM foo_nominations WHERE department_code IN :department_code_1"
+        ),
+        ("department_code_1",),
+    ).params(department_code_1=["1227", "1234"])
     assert "__[POSTCOMPILE_department_code_1]" in str(stmt)
     assert stmt.compile().params == {"department_code_1": ["1227", "1234"]}
 
@@ -219,6 +233,15 @@ def test_build_where_clause_rejects_empty_in_values():
 def test_build_where_clause_unknown_field_raises():
     with pytest.raises(BadRequestError):
         build_where_clause(SPEC, {"uin": "123"})
+
+
+def test_build_where_clause_prefers_database_column_names():
+    aliased_spec = QuerySpec(
+        filterable={"public_name": AliasedColumnModel.python_name},
+    )
+    clause = build_where_clause(aliased_spec, {"public_name": "value"})
+    assert clause.sql == "WHERE db_name = :public_name_1"
+    assert clause.params == {"public_name_1": "value"}
 
 
 def test_build_order_by_clause_multiple_fields():
@@ -234,6 +257,14 @@ def test_build_order_by_clause_uses_default_when_empty():
 def test_build_order_by_clause_unknown_field_raises():
     with pytest.raises(BadRequestError):
         build_order_by_clause(SPEC, "uin")
+
+
+def test_build_order_by_clause_prefers_database_column_names():
+    aliased_spec = QuerySpec(
+        sortable={"public_name": AliasedColumnModel.python_name},
+        default_sort="public_name",
+    )
+    assert build_order_by_clause(aliased_spec, None) == "ORDER BY db_name ASC"
 
 
 def test_build_where_clause_rejects_non_identifier_column_name():

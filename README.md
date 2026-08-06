@@ -2,56 +2,15 @@
 
 Graduate College Python common library for web application APIs and other related projects.
 
-## Query building
+Additional docs in the repository root:
 
-`grad_pylib.core.querying` is the shared query-construction layer for both
-SQLAlchemy `select(...)` queries and small app-local raw SQL helpers. Prefer
-extending or reusing it instead of creating a second raw-SQL utility module.
-
-For raw SQL, keep the actual SQL visible and let `QuerySpec` own the generic
-allowlist and parameter-building mechanics:
-
-```python
-from sqlalchemy import text
-
-from grad_pylib.core.querying import QuerySpec, bind_expanding_params, build_where_clause
-
-lookup_spec = QuerySpec(
-    filterable={
-        "department": awards.c.department,
-        "degree_program": awards.c.degree_program,
-    },
-)
-
-filters: dict[str, object] = {}
-if programs:
-    filters["degree_program__in"] = programs
-elif departments:
-    filters["department__in"] = departments
-
-where = build_where_clause(
-    lookup_spec,
-    filters,
-    extra_clauses=("term = :term",),
-    expanding_in=True,
-)
-params = {"term": term, **where.params}
-
-query = text(
-    f"""
-    SELECT degree_program, department
-    FROM degree_program_lookup
-    {where.sql}
-    """
-)
-query = bind_expanding_params(query, where.expanding_params)
-```
-
-Keep domain decisions in the application layer, outside `grad_pylib`, such as:
-
-* precedence between two filters (`programs` vs `departments`)
-* whether an empty effective scope should short-circuit to `None` or `[]`
-* domain-specific fixed predicates and parameter names
+* [AUTH.md](AUTH.md)
+* [DB.md](DB.md)
+* [E2E.md](E2E.md)
+* [PARAMS.md](PARAMS.md)
+* [QUERYING.md](QUERYING.md)
+* [RESPONSES.md](RESPONSES.md)
+* [SCHEMA.md](SCHEMA.md)
 
 ## Authentication
 

@@ -10,8 +10,8 @@ from grad_pylib.core.exceptions import ApiError, BadRequestError, ForbiddenError
 from grad_pylib.core.logging import REQUEST_ID_HEADER, REQUEST_ID_FIELD, configure_logging, bind_request_id_context
 from grad_pylib.core.multiquery import qualified_columns, section_columns, split_row_sections, read_all_result_sets, cursor_rows_to_dicts, map_row_to_pydantic
 from grad_pylib.core.params import TermCodePath, TermCodeQuery, DepartmentCodePath, DepartmentCodeQuery, UniqueHashPath, SnakeCaseNamePath, TermCode, DepartmentCode, UniqueHash, SnakeCaseName
-from grad_pylib.core.querying import QuerySpec, apply_filters, apply_sort, build_where_clause, build_order_by_clause, apply_pagination, apply_query
-from grad_pylib.core.schemas import to_camel, CamelModel, DataResponse, ItemResponse, ListResponse, MetaResponse, StatusResponse, build_status_response
+from grad_pylib.core.querying import QuerySpec, RawWhereClause, apply_filters, apply_sort, bind_expanding_params, build_where_clause, build_order_by_clause, apply_pagination, apply_query
+from grad_pylib.core.schemas import parse_comma_separated_strings, validate_string_items, parse_validated_comma_separated_strings, parse_json_blob, normalize_email_list, CamelModel, DataResponse, ItemResponse, ListResponse, MetaResponse, StatusResponse, build_status_response
 from grad_pylib.core.time import utc_now, utc_from_millis
 from grad_pylib.sqlserver_container import DEFAULT_SQL_SERVER_IMAGE, DEFAULT_SQL_SERVER_CONTAINER_MEMORY_LIMIT, DEFAULT_SQL_SERVER_MEMORY_LIMIT_MB, build_sql_server_container_kwargs
 
@@ -37,7 +37,6 @@ __all__ = [
     "DepartmentCode",
     "DepartmentCodePath",
     "DepartmentCodeQuery",
-    "SnakeCaseName",
     "ENVIRONMENT_ENV_VAR",
     "ForbiddenError",
     "INSTITUTIONAL_EMAIL_DOMAINS",
@@ -60,6 +59,8 @@ __all__ = [
     "QuerySpec",
     "REQUEST_ID_FIELD",
     "REQUEST_ID_HEADER",
+    "RawWhereClause",
+    "SnakeCaseName",
     "SnakeCaseNamePath",
     "SqlServerErrorType",
     "StatusResponse",
@@ -76,6 +77,7 @@ __all__ = [
     "apply_sort",
     "azure_ad_configured",
     "azure_user_to_current_user",
+    "bind_expanding_params",
     "bind_request_id_context",
     "build_auth_runtime",
     "build_azure_scheme",
@@ -99,11 +101,15 @@ __all__ = [
     "load_azure_openid_config",
     "map_row_to_pydantic",
     "netid_from_email",
+    "normalize_email_list",
     "normalize_role",
     "orm_upsert",
+    "parse_comma_separated_strings",
     "parse_distinct_strings",
+    "parse_json_blob",
     "parse_mssql_error",
     "parse_roles",
+    "parse_validated_comma_separated_strings",
     "qualified_columns",
     "read_all_result_sets",
     "register_exception_handlers",
@@ -115,10 +121,10 @@ __all__ = [
     "split_row_sections",
     "store_request_user",
     "subject_of",
-    "to_camel",
     "unauthorized_error",
     "utc_from_millis",
     "utc_now",
+    "validate_string_items",
     "warn_if_azure_ad_missing",
     "with_azure_development_placeholders",
 ]
