@@ -1,22 +1,11 @@
 import json
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict
+from pydantic.alias_generators import to_camel
 
 
 from grad_pylib.core.time import utc_now
-
-
-def _dedupe_preserving_order(values: Iterable[str]) -> list[str]:
-    seen: set[str] = set()
-    distinct: list[str] = []
-    for value in values:
-        if value in seen:
-            continue
-        distinct.append(value)
-        seen.add(value)
-    return distinct
 
 
 def parse_comma_separated_strings(
@@ -47,7 +36,7 @@ def parse_comma_separated_strings(
         if item is not None and (normalized := str(item).strip())
     ]
     if dedupe:
-        parsed = _dedupe_preserving_order(parsed)
+        parsed = list(dict.fromkeys(parsed))
     if sort:
         parsed = sorted(parsed)
     return parsed
@@ -77,12 +66,12 @@ def parse_validated_comma_separated_strings[T](
 
 
 def parse_json_blob(
-    value: Any,
+    value: object,
     *,
     invalid_to_none: bool = False,
-) -> Any | None:
+) -> object:
     """Parse JSON when the input is a string, otherwise pass through the existing value."""
-    if value is None or not isinstance(value, str):
+    if not isinstance(value, str):
         return value
 
     try:
@@ -103,17 +92,12 @@ def normalize_email_list(
     """Trim, lowercase, and optionally deduplicate a list of email values."""
     parsed = [email.lower() for email in parse_comma_separated_strings(value)]
     if dedupe:
-        parsed = _dedupe_preserving_order(parsed)
+        parsed = list(dict.fromkeys(parsed))
     if sort:
         parsed = sorted(parsed)
     if require_non_empty and not parsed:
         raise ValueError("Expected at least one email address.")
     return parsed
-
-
-def to_camel(value: str) -> str:
-    head, *tail = value.split("_")
-    return head + "".join(part.capitalize() for part in tail)
 
 
 class CamelModel(BaseModel):
