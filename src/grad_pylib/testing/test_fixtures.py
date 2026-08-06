@@ -234,6 +234,47 @@ def test_ensure_sql_server_database_targets_master(monkeypatch: pytest.MonkeyPat
     }
 
 
+def test_ensure_sql_server_database_rewrites_odbc_connect_database(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+) -> None:
+    recorded: dict[str, Any] = {}
+
+    def fake_provision(
+            admin_url: str,
+            *,
+            database_name: str,
+            sql_file: Path,
+            lock_name: str,
+    ) -> None:
+        recorded["call"] = {
+            "admin_url": admin_url,
+            "database_name": database_name,
+            "sql_file": sql_file,
+            "lock_name": lock_name,
+        }
+
+    monkeypatch.setattr("grad_pylib.testing.fixtures.provision_sql_server_database_from_file", fake_provision)
+    engine = SimpleNamespace(
+        url=make_url(
+            "mssql+pyodbc:///?odbc_connect="
+            "Driver%3D%7BODBC+Driver+18+for+SQL+Server%7D%3BServer%3Dlocalhost%3BDatabase%3DApp"
+        )
+    )
+    sql_file = tmp_path / "codebook.sql"
+
+    ensure_sql_server_database(
+        engine,
+        database_name="Codebook",
+        sql_file=sql_file,
+        lock_name="codebook-lock",
+    )
+
+    assert make_url(recorded["call"]["admin_url"]).query["odbc_connect"] == (
+        "Driver={ODBC Driver 18 for SQL Server};Server=localhost;Database=master"
+    )
+
+
 def test_sql_server_bootstrap_config_requires_codebook_sql_path() -> None:
     fixture_config = SqlServerFixtureConfig(migration_runner=lambda _engine: None, tables_to_clean=())
 
@@ -408,6 +449,45 @@ def test_create_codebook_engine_targets_codebook_database_name(monkeypatch: pyte
         "future": True,
         "pool_pre_ping": True,
     }
+
+    with pytest.raises(StopIteration):
+        next(generator)
+
+    assert recorded["engine"].disposed is True
+
+
+def test_create_codebook_engine_rewrites_odbc_connect_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorded: dict[str, object] = {}
+
+    class _FakeEngine:
+        def __init__(self, url: object) -> None:
+            self.url = url
+            self.disposed = False
+
+        def dispose(self) -> None:
+            self.disposed = True
+
+    def fake_create_engine(url: object, *, future: bool, pool_pre_ping: bool) -> _FakeEngine:
+        recorded["call"] = {"url": url, "future": future, "pool_pre_ping": pool_pre_ping}
+        engine = _FakeEngine(url)
+        recorded["engine"] = engine
+        return engine
+
+    monkeypatch.setattr("grad_pylib.testing.fixtures.create_engine", fake_create_engine)
+    mssql_engine = SimpleNamespace(
+        url=make_url(
+            "mssql+pyodbc:///?odbc_connect="
+            "Driver%3D%7BODBC+Driver+18+for+SQL+Server%7D%3BServer%3Dlocalhost%3BDatabase%3DApp"
+        )
+    )
+    generator = create_codebook_engine(mssql_engine)
+
+    assert next(generator) is recorded["engine"]
+    assert make_url(str(recorded["call"]["url"])).query["odbc_connect"] == (
+        "Driver={ODBC Driver 18 for SQL Server};Server=localhost;Database=Codebook"
+    )
+    assert recorded["call"]["future"] is True
+    assert recorded["call"]["pool_pre_ping"] is True
 
     with pytest.raises(StopIteration):
         next(generator)
