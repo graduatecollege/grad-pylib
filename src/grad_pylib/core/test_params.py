@@ -194,3 +194,96 @@ def test_shared_parameter_aliases_generate_openapi_validation_metadata(client: T
             "title": "Table Name",
         },
     )
+
+
+# ---- Body alias tests ----
+
+from grad_pylib.core.params import (
+    DepartmentCodeBody,
+    SnakeCaseNameBody,
+    TermCodeBody,
+    UniqueHashBody,
+)
+
+
+@pytest.fixture
+def body_client() -> Iterator[TestClient]:
+    app = FastAPI()
+
+    @app.post("/terms")
+    def create_term(term_code: TermCodeBody) -> dict[str, str]:
+        return {"term_code": term_code}
+
+    @app.post("/departments")
+    def create_department(department_code: DepartmentCodeBody) -> dict[str, str]:
+        return {"department_code": department_code}
+
+    @app.post("/records")
+    def create_record(unique_hash: UniqueHashBody) -> dict[str, str]:
+        return {"unique_hash": unique_hash}
+
+    @app.post("/tables")
+    def create_table(table_name: SnakeCaseNameBody) -> dict[str, str]:
+        return {"table_name": table_name}
+
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/terms", "202508"),
+        ("/departments", "1234"),
+        ("/records", "AbC123"),
+        ("/tables", "degree_audit"),
+    ],
+)
+def test_body_aliases_accept_valid_values(body_client: TestClient, path: str, body: str) -> None:
+    response = body_client.post(path, json=body)
+
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/terms", "20250"),
+        ("/terms", "20A508"),
+        ("/departments", "12"),
+        ("/departments", "abcd"),
+        ("/records", "hash-with-dash"),
+        ("/records", "a" * 51),
+        ("/tables", "degree-audit"),
+        ("/tables", "Degree_Audit"),
+    ],
+)
+def test_body_aliases_reject_invalid_values(body_client: TestClient, path: str, body: str) -> None:
+    response = body_client.post(path, json=body)
+
+    assert response.status_code == 422
+
+
+def test_body_aliases_generate_openapi_validation_metadata(body_client: TestClient) -> None:
+    openapi = body_client.app.openapi()
+
+    def get_body_schema(path: str) -> dict[str, object]:
+        return openapi["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+
+    term_schema = get_body_schema("/terms")
+    assert term_schema.get("minLength") == 6
+    assert term_schema.get("maxLength") == 6
+    assert term_schema.get("pattern") == "^[0-9]{6}$"
+
+    dept_schema = get_body_schema("/departments")
+    assert dept_schema.get("minLength") == 3
+    assert dept_schema.get("maxLength") == 4
+    assert dept_schema.get("pattern") == "^[0-9]{3,4}$"
+
+    hash_schema = get_body_schema("/records")
+    assert hash_schema.get("minLength") == 1
+    assert hash_schema.get("maxLength") == 50
+    assert hash_schema.get("pattern") == "^[a-zA-Z0-9]+$"
+
+    table_schema = get_body_schema("/tables")
+    assert table_schema.get("pattern") == "^[a-z_]+$"
