@@ -1,11 +1,12 @@
-from grad_pylib.core.schemas import (
-)
-
+import json
 import re
+from datetime import datetime
 
 import pytest
 from pydantic import BaseModel, ValidationError, field_validator
 
+from grad_pylib.core.schemas import (
+    CamelModel, DataResponse, ItemResponse, ListResponse, MetaResponse, StatusResponse, build_status_response)
 from grad_pylib.core.schemas import (
     normalize_email_list,
     parse_comma_separated_strings,
@@ -98,39 +99,6 @@ def test_parse_validated_comma_separated_strings_fits_field_validators() -> None
 def test_parse_validated_comma_separated_strings_keeps_business_rules_local() -> None:
     with pytest.raises(ValidationError, match="Invalid department code: AB12"):
         _DepartmentCodesModel(department_codes="1234,AB12")
-
-
-
-
-
-
-        )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import json
-from datetime import datetime
-
-from grad_pylib.core.schemas import (
-    CamelModel,
-    DataResponse,
-    ItemResponse,
-    ListResponse,
-    MetaResponse,
-    StatusResponse,
-    build_status_response,
-)
 
 
 class UserDto(CamelModel):

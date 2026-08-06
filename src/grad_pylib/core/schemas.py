@@ -1,7 +1,8 @@
 import json
 from collections.abc import Callable, Iterable, Mapping
+from datetime import datetime, timezone, UTC
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 
@@ -142,7 +143,7 @@ def build_status_response(
     if timestamp is None:
         ts = utc_now()
     elif timestamp.tzinfo is not None:
-        ts = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+        ts = timestamp.astimezone(UTC).replace(tzinfo=None)
     else:
         ts = timestamp
     return StatusResponse(
