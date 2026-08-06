@@ -6,6 +6,9 @@
 * Use `data` for the primary payload.
 * Add a sibling `meta` object only when the response genuinely has metadata.
 * Avoid custom top-level payload keys such as `user_info`, `student`, or `results`.
+* For concrete FastAPI response models, use a minimal subclass of the shared
+  generic helper instead of a type alias, so the generated OpenAPI schema name
+  stays short and intentional.
 
 The shared models are:
 
@@ -15,6 +18,10 @@ The shared models are:
 * `StatusResponse` and `build_status_response()` for `/status` endpoints
 
 `DataResponse[T]` remains the generic base envelope that these helpers build on.
+
+Type aliases such as `UserResponse = ItemResponse[UserDto]` work for static
+typing, but FastAPI/OpenAPI derive awkward schema names from them. Prefer a
+named subclass even when it has no additional fields.
 
 ### Single-item response
 
@@ -27,7 +34,8 @@ class UserDto(CamelModel):
     full_name: str
 
 
-UserResponse = ItemResponse[UserDto]
+class UserResponse(ItemResponse[UserDto]):
+    pass
 ```
 
 ### List response
@@ -37,7 +45,9 @@ Use `ListResponse[T]` when the payload is only a list:
 ```python
 from grad_pylib.core.schemas import ListResponse
 
-UsersResponse = ListResponse[UserDto]
+
+class UsersResponse(ListResponse[UserDto]):
+    pass
 ```
 
 If the list needs metadata, prefer a sibling `meta` object instead of inventing more top-level keys:
@@ -51,7 +61,8 @@ class UsersMeta(CamelModel):
     next_cursor: str | None = None
 
 
-UsersResponse = MetaResponse[list[UserDto], UsersMeta]
+class UsersResponse(MetaResponse[list[UserDto], UsersMeta]):
+    pass
 ```
 
 ### Status endpoint response
@@ -74,7 +85,7 @@ def status() -> StatusResponse:
 Prefer migrating existing app responses toward these conventions:
 
 * move custom primary payload keys to `data`
-* replace one-off single-item wrappers with `ItemResponse[T]`
-* replace one-off list wrappers with `ListResponse[T]`
-* replace ad hoc pagination or summary wrappers with `MetaResponse[T, M]`
+* replace one-off single-item wrappers with small `ItemResponse[T]` subclasses
+* replace one-off list wrappers with small `ListResponse[T]` subclasses
+* replace ad hoc pagination or summary wrappers with small `MetaResponse[T, M]` subclasses
 * standardize `/status` endpoints on `StatusResponse`
