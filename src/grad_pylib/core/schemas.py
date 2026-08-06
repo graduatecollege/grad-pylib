@@ -1,13 +1,104 @@
-from datetime import datetime, timezone
+import json
+from collections.abc import Callable, Iterable, Mapping
+from datetime import datetime, timezone, UTC
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic.alias_generators import to_camel
+
 
 from grad_pylib.core.time import utc_now
 
 
-def to_camel(value: str) -> str:
-    head, *tail = value.split("_")
-    return head + "".join(part.capitalize() for part in tail)
+def parse_comma_separated_strings(
+    value: str | Iterable[object] | None,
+    *,
+    dedupe: bool = False,
+    sort: bool = False,
+) -> list[str]:
+    """
+    Parse a comma-separated string or iterable of values into a clean string list.
+
+    Blank items are removed and surrounding whitespace is stripped. Duplicates and sorting are
+    caller-controlled so application validators can keep their business semantics explicit.
+    """
+    if value is None:
+        return []
+
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    elif isinstance(value, Iterable) and not isinstance(value, (Mapping, bytes, bytearray)):
+        raw_items = value
+    else:
+        raise ValueError("Expected a comma-separated string, an iterable of values, or None.")
+
+    parsed = [
+        normalized
+        for item in raw_items
+        if item is not None and (normalized := str(item).strip())
+    ]
+    if dedupe:
+        parsed = list(dict.fromkeys(parsed))
+    if sort:
+        parsed = sorted(parsed)
+    return parsed
+
+
+def validate_string_items[T](
+    values: Iterable[str],
+    *,
+    validator: Callable[[str], T],
+) -> list[T]:
+    """Apply a caller-provided validator to each item in a parsed string list."""
+    return [validator(value) for value in values]
+
+
+def parse_validated_comma_separated_strings[T](
+    value: str | Iterable[object] | None,
+    *,
+    validator: Callable[[str], T],
+    dedupe: bool = False,
+    sort: bool = False,
+) -> list[T]:
+    """Parse a comma-separated string field and validate or normalize each item."""
+    return validate_string_items(
+        parse_comma_separated_strings(value, dedupe=dedupe, sort=sort),
+        validator=validator,
+    )
+
+
+def parse_json_blob(
+    value: object,
+    *,
+    invalid_to_none: bool = False,
+) -> object:
+    """Parse JSON when the input is a string, otherwise pass through the existing value."""
+    if not isinstance(value, str):
+        return value
+
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        if invalid_to_none:
+            return None
+        raise ValueError("Invalid JSON.") from exc
+
+
+def normalize_email_list(
+    value: str | Iterable[object] | None,
+    *,
+    dedupe: bool = False,
+    sort: bool = False,
+    require_non_empty: bool = False,
+) -> list[str]:
+    """Trim, lowercase, and optionally deduplicate a list of email values."""
+    parsed = [email.lower() for email in parse_comma_separated_strings(value)]
+    if dedupe:
+        parsed = list(dict.fromkeys(parsed))
+    if sort:
+        parsed = sorted(parsed)
+    if require_non_empty and not parsed:
+        raise ValueError("Expected at least one email address.")
+    return parsed
 
 
 class CamelModel(BaseModel):
@@ -52,7 +143,7 @@ def build_status_response(
     if timestamp is None:
         ts = utc_now()
     elif timestamp.tzinfo is not None:
-        ts = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+        ts = timestamp.astimezone(UTC).replace(tzinfo=None)
     else:
         ts = timestamp
     return StatusResponse(

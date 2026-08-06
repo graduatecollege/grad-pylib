@@ -65,3 +65,83 @@ the application, with `parse_roles()` and `parse_distinct_strings()`. Users are 
   it passed in cannot change authorization decisions at runtime.
 
 A policy grants access when the user holds *any* of its roles.
+
+## Schema helpers
+
+`grad_pylib.core.schemas` also includes a small set of reusable helpers for common Pydantic
+normalization patterns:
+
+* `parse_comma_separated_strings()` parses either a comma-separated string or an existing list,
+  strips whitespace, drops blanks, and can optionally deduplicate or sort.
+* `parse_validated_comma_separated_strings()` builds on that parser and applies an app-local
+  validator to each item.
+* `parse_json_blob()` parses JSON when a field arrives as a string and can optionally turn invalid
+  JSON into `None`.
+* `normalize_email_list()` trims, lowercases, removes blanks, and can require at least one email
+  after normalization.
+
+These helpers are intentionally generic. Business rules such as “department codes must be four
+digits” should still live in the consuming app.
+
+### Before
+
+```python
+@field_validator("department_codes", mode="before")
+@classmethod
+def _parse_department_codes(cls, value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = value.split(",")
+    else:
+        items = value
+
+    parsed: list[str] = []
+    for item in items:
+        code = str(item).strip()
+        if not code:
+            continue
+        if not DEPARTMENT_CODE_PATTERN.fullmatch(code):
+            raise ValueError(f"Invalid department code: {code}")
+        if code not in parsed:
+            parsed.append(code)
+    return sorted(parsed)
+```
+
+### After
+
+```python
+from grad_pylib.core.schemas import parse_validated_comma_separated_strings
+
+
+def _department_code(value: str) -> str:
+    if not DEPARTMENT_CODE_PATTERN.fullmatch(value):
+        raise ValueError(f"Invalid department code: {value}")
+    return value
+
+
+@field_validator("department_codes", mode="before")
+@classmethod
+def _parse_department_codes(cls, value: object) -> list[str]:
+    return parse_validated_comma_separated_strings(
+        value,
+        validator=_department_code,
+        dedupe=True,
+        sort=True,
+    )
+```
+
+The same pattern works for smaller field validators:
+
+```python
+@field_validator("emails", mode="before")
+@classmethod
+def _normalize_emails(cls, value: object) -> list[str]:
+    return normalize_email_list(value, dedupe=True, require_non_empty=True)
+
+
+@field_validator("metadata", mode="before")
+@classmethod
+def _parse_metadata(cls, value: object) -> dict[str, object] | None:
+    return parse_json_blob(value, invalid_to_none=True)
+```
