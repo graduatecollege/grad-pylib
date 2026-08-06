@@ -70,19 +70,22 @@ class BaseUser:
         first_name (str): The first name of the user.
         last_name (str): The last name of the user.
         roles (tuple[str, ...]): The roles assigned to the user by the identity provider.
-        roles_override (tuple[str, ...]): Roles that override the user's assigned roles.
+        roles_override (tuple[str, ...] | None): Explicit roles to authorize with for this
+            request. ``None`` means the provider-issued roles are used unchanged.
         attributes (Mapping[str, tuple[str, ...]]): A read-only mapping of user attributes.
     """
     email: str = ""
     first_name: str = ""
     last_name: str = ""
     roles: tuple[str, ...] = ()
-    roles_override: tuple[str, ...] = ()
+    roles_override: tuple[str, ...] | None = None
     attributes: Mapping[str, tuple[str, ...]] = field(default=EMPTY_ATTRIBUTES)
 
     @property
     def effective_roles(self) -> tuple[str, ...]:
-        return self.roles_override or self.roles
+        if self.roles_override is None:
+            return self.roles
+        return self.roles_override
 
     @property
     def netid(self) -> str | None:
@@ -486,14 +489,17 @@ def is_allowed_api_key_client(request: Request, allowed_hosts: Collection[str]) 
 
 
 def constant_time_equals(presented: str, expected: str | None) -> bool:
-    """Compares two secrets in constant time, tolerating non-ASCII input.
+    """Compares two secrets in constant time, tolerating malformed Unicode input.
 
-    ``secrets.compare_digest`` raises TypeError for non-ASCII strings, which would
-    otherwise turn a hostile header into a 500.
+    ``secrets.compare_digest`` only accepts matching types, and UTF-8 encoding can still
+    raise for malformed surrogate code points. Authentication failures must stay 401s.
     """
     if not expected:
         return False
-    return secrets.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
+    try:
+        return secrets.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False
 
 
 def store_request_user(request: Request, user: AuthUser) -> None:
@@ -542,6 +548,7 @@ def _apply_override(
     if not override_loader:
         return user
 
+    original_subject = subject_of(user)
     original_roles = tuple(getattr(user, "effective_roles", ()))
     user = override_loader(user, session)
     effective_roles = tuple(getattr(user, "effective_roles", ()))
@@ -550,7 +557,8 @@ def _apply_override(
             "auth.roles.overridden",
             policy=policy,
             mechanism=mechanism,
-            subject=subject_of(user),
+            subject=original_subject,
+            effective_subject=subject_of(user),
             original_roles=list(original_roles),
             effective_roles=list(effective_roles),
             client_host=client_host(request),
