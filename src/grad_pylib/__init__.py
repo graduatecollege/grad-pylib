@@ -1,7 +1,7 @@
 # 🚨 AUTO-GENERATED BARREL FILE. DO NOT EDIT MANUALLY.
 # Run `make barrel` to regenerate.
 
-from grad_pylib.core.auth import AUDIT_LOGGER_NAME, INSTITUTIONAL_EMAIL_DOMAINS, LOOPBACK_CLIENT_HOSTS, MECHANISM_AZURE_AD, MECHANISM_DEV_API_KEY, AuthUser, BaseUser, AuthConfiguration, AuthRuntimeConfig, AuthRuntime, netid_from_email, azure_ad_configured, warn_if_azure_ad_missing, with_azure_development_placeholders, build_azure_scheme, load_azure_openid_config, normalize_role, parse_roles, parse_distinct_strings, claim_list, claim_value, unauthorized_error, default_claims_to_user, azure_user_to_current_user, client_host, is_allowed_api_key_client, constant_time_equals, store_request_user, subject_of, require_policy, build_auth_runtime, dev_api_key_enabled_for
+from grad_pylib.core.auth import AUDIT_LOGGER_NAME, INSTITUTIONAL_EMAIL_DOMAINS, LOOPBACK_CLIENT_HOSTS, MECHANISM_AZURE_AD, MECHANISM_DEV_API_KEY, AuthUser, BaseUser, AuthConfiguration, AuthRuntimeConfig, AuthRuntime, AuthAppFactory, netid_from_email, azure_ad_configured, warn_if_azure_ad_missing, with_azure_development_placeholders, build_azure_scheme, load_azure_openid_config, normalize_role, parse_roles, parse_distinct_strings, claim_list, claim_value, unauthorized_error, default_claims_to_user, azure_user_to_current_user, client_host, is_allowed_api_key_client, constant_time_equals, store_request_user, subject_of, require_policy, build_auth_runtime, dev_api_key_enabled_for
 from grad_pylib.core.cache import LazyValueCache
 from grad_pylib.core.config import ENVIRONMENT_ENV_VAR, DEVELOPMENT_ENVIRONMENTS, is_development_environment, BaseAppSettings, configure_settings_factory, get_settings
 from grad_pylib.core.db import build_mssql_url, resolve_database_url, DatabaseRuntime, NamedDatabase, NamedDatabases, SqlServerErrorType, ParsedSqlError, parse_mssql_error, retry_on_transient_conflict, orm_upsert, select_exclude
@@ -17,6 +17,7 @@ from grad_pylib.sqlserver_container import DEFAULT_SQL_SERVER_IMAGE, DEFAULT_SQL
 __all__ = [
     "AUDIT_LOGGER_NAME",
     "ApiError",
+    "AuthAppFactory",
     "AuthConfiguration",
     "AuthRuntime",
     "AuthRuntimeConfig",

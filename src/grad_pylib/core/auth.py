@@ -70,19 +70,22 @@ class BaseUser:
         first_name (str): The first name of the user.
         last_name (str): The last name of the user.
         roles (tuple[str, ...]): The roles assigned to the user by the identity provider.
-        roles_override (tuple[str, ...]): Roles that override the user's assigned roles.
+        roles_override (tuple[str, ...] | None): Explicit roles to authorize with for this
+            request. ``None`` means the provider-issued roles are used unchanged.
         attributes (Mapping[str, tuple[str, ...]]): A read-only mapping of user attributes.
     """
     email: str = ""
     first_name: str = ""
     last_name: str = ""
     roles: tuple[str, ...] = ()
-    roles_override: tuple[str, ...] = ()
+    roles_override: tuple[str, ...] | None = None
     attributes: Mapping[str, tuple[str, ...]] = field(default=EMPTY_ATTRIBUTES)
 
     @property
     def effective_roles(self) -> tuple[str, ...]:
-        return self.roles_override or self.roles
+        if self.roles_override is None:
+            return self.roles
+        return self.roles_override
 
     @property
     def netid(self) -> str | None:
@@ -187,9 +190,65 @@ class AuthRuntimeConfig:
 
 @dataclass(frozen=True, slots=True)
 class AuthRuntime:
+    """Ready-to-export auth helpers for a FastAPI application."""
+
     azure_scheme: SingleTenantAzureAuthorizationCodeBearer
-    require_policy: Callable[[str], Any]
+    _build_policy: Callable[[str], Any]
     load_azure_openid_config: Callable[[], Awaitable[None]]
+
+    def require_policy(self, policy: str) -> Any:
+        return self._build_policy(policy)
+
+    def depends_on(self, policy: str) -> Any:
+        return Depends(self.require_policy(policy))
+
+
+@dataclass(frozen=True, slots=True)
+class AuthAppFactory:
+    """Builds one or more auth runtimes from a shared application auth configuration."""
+
+    runtime_config: AuthRuntimeConfig
+
+    @classmethod
+    def configure(
+            cls,
+            *,
+            config: AuthConfiguration,
+            get_settings: SettingsProvider,
+            get_session: SessionProvider,
+            forbidden_error_factory: Callable[[str], Exception],
+            claims_to_user: ClaimsToUser,
+            override_loader: OverrideLoader | None = None,
+            dev_api_key_enabled: Callable[[Any], bool] | None = None,
+            api_key_user_builder: ApiKeyUserBuilder | None = None,
+            allow_dev_placeholder_ids: bool = False,
+            development_client_id: str = "development-client-id",
+            development_tenant_id: str = "development-tenant-id",
+    ) -> Self:
+        return cls(
+            AuthRuntimeConfig(
+                config=config,
+                get_settings=get_settings,
+                get_session=get_session,
+                forbidden_error_factory=forbidden_error_factory,
+                claims_to_user=claims_to_user,
+                override_loader=override_loader,
+                dev_api_key_enabled=dev_api_key_enabled,
+                api_key_user_builder=api_key_user_builder,
+                allow_dev_placeholder_ids=allow_dev_placeholder_ids,
+                development_client_id=development_client_id,
+                development_tenant_id=development_tenant_id,
+            )
+        )
+
+    def runtime(self) -> AuthRuntime:
+        return build_auth_runtime(self.runtime_config)
+
+    def with_overrides(self, override_loader: OverrideLoader) -> AuthRuntime:
+        return build_auth_runtime(replace(self.runtime_config, override_loader=override_loader))
+
+    def without_overrides(self) -> AuthRuntime:
+        return build_auth_runtime(replace(self.runtime_config, override_loader=None))
 
 
 def netid_from_email(email: str) -> str | None:
@@ -430,14 +489,17 @@ def is_allowed_api_key_client(request: Request, allowed_hosts: Collection[str]) 
 
 
 def constant_time_equals(presented: str, expected: str | None) -> bool:
-    """Compares two secrets in constant time, tolerating non-ASCII input.
+    """Compares two secrets in constant time, tolerating malformed Unicode input.
 
-    ``secrets.compare_digest`` raises TypeError for non-ASCII strings, which would
-    otherwise turn a hostile header into a 500.
+    ``secrets.compare_digest`` only accepts matching types, and UTF-8 encoding can still
+    raise for malformed surrogate code points. Authentication failures must stay 401s.
     """
     if not expected:
         return False
-    return secrets.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
+    try:
+        return secrets.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False
 
 
 def store_request_user(request: Request, user: AuthUser) -> None:
@@ -486,6 +548,7 @@ def _apply_override(
     if not override_loader:
         return user
 
+    original_subject = subject_of(user)
     original_roles = tuple(getattr(user, "effective_roles", ()))
     user = override_loader(user, session)
     effective_roles = tuple(getattr(user, "effective_roles", ()))
@@ -494,7 +557,8 @@ def _apply_override(
             "auth.roles.overridden",
             policy=policy,
             mechanism=mechanism,
-            subject=subject_of(user),
+            subject=original_subject,
+            effective_subject=subject_of(user),
             original_roles=list(original_roles),
             effective_roles=list(effective_roles),
             client_host=client_host(request),
@@ -670,7 +734,7 @@ def build_auth_runtime(runtime_config: AuthRuntimeConfig) -> AuthRuntime:
 
     return AuthRuntime(
         azure_scheme=azure_scheme,
-        require_policy=build_policy,
+        _build_policy=build_policy,
         load_azure_openid_config=load_openid_config,
     )
 
