@@ -53,6 +53,11 @@ class AuthUser(Protocol):
         """The roles the user is authorized with for this request."""
         ...
 
+    @property
+    def audit_log_info(self) -> dict[str, Any] | None:
+        """Additional information that should be logged for the user with auth logging."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class BaseUser:
@@ -86,6 +91,10 @@ class BaseUser:
         if self.roles_override is None:
             return self.roles
         return self.roles_override
+
+    @property
+    def audit_log_info(self) -> dict[str, Any] | None:
+        return None
 
     @property
     def netid(self) -> str | None:
@@ -776,6 +785,9 @@ def _evaluate_policy(
     if request is not None:
         fields["client_host"] = client_host(request)
         fields.update(_request_fields(request))
+
+    if user.audit_log_info is not None:
+        fields["info"] = user.audit_log_info
 
     if roles.intersection(required_roles):
         _audit_logger.info("auth.access.granted", **fields)
