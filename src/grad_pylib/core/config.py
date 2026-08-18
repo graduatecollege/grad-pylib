@@ -10,10 +10,21 @@ DEVELOPMENT_ENVIRONMENTS = frozenset({"development", "local", "test"})
 
 
 def is_development_environment(environment: str | None) -> bool:
+    """Return whether `environment` permits local-development behavior.
+
+    Matching is case-insensitive and ignores surrounding whitespace so the same definition
+    safely controls dotenv loading and development-only authentication features.
+    """
     return (environment or "").strip().lower() in DEVELOPMENT_ENVIRONMENTS
 
 
 class BaseAppSettings(BaseSettings):
+    """Common application settings loaded from environment variables and, locally, `.env`.
+
+    Subclass this model for service-specific settings. Dotenv values are deliberately accepted
+    only in development environments, preventing a mounted or shipped `.env` from overriding
+    deployed configuration; enabling the development API-key bypass elsewhere is rejected.
+    """
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -60,6 +71,7 @@ class BaseAppSettings(BaseSettings):
 
     @property
     def is_development(self) -> bool:
+        """Return whether this settings instance enables development-only behavior."""
         return is_development_environment(self.environment)
 
     @model_validator(mode="after")
@@ -74,12 +86,18 @@ class BaseAppSettings(BaseSettings):
 
     @property
     def azure_ad_scope_name(self) -> str:
+        """Return this application's Azure AD delegated scope identifier.
+
+        A client ID is required because the scope is used by the authentication bootstrap and
+        OpenAPI configuration to describe the protected API.
+        """
         if not self.azure_ad_client_id:
             raise ValueError("Azure AD scope must be set in the environment or settings.")
         return f"api://{self.azure_ad_client_id}/{self.azure_ad_scope_description}"
 
     @property
     def azure_ad_scopes(self) -> dict[str, str]:
+        """Return Azure AD scopes in the mapping format required by the bearer scheme."""
         if not self.azure_ad_scope_name:
             return {}
         return {self.azure_ad_scope_name: self.azure_ad_scope_description}
@@ -89,6 +107,11 @@ _settings_factory: Callable[[], BaseAppSettings] = BaseAppSettings
 
 
 def configure_settings_factory(factory: Callable[[], BaseAppSettings]) -> None:
+    """Set the application settings factory and invalidate the shared cached instance.
+
+    Applications use this during startup to register a `BaseAppSettings` subclass; tests can
+    temporarily replace it without retaining stale settings from an earlier configuration.
+    """
     global _settings_factory
     _settings_factory = factory
     get_settings.cache_clear()
@@ -96,4 +119,9 @@ def configure_settings_factory(factory: Callable[[], BaseAppSettings]) -> None:
 
 @lru_cache(maxsize=1)
 def get_settings() -> BaseAppSettings:
+    """Return the process-wide settings instance produced by the configured factory.
+
+    Settings are cached so request dependencies share one validated configuration; call
+    `configure_settings_factory` before first use when an application defines a subclass.
+    """
     return _settings_factory()

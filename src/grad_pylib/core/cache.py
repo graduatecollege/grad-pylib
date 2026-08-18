@@ -1,6 +1,5 @@
 from collections.abc import Callable
 from threading import Lock
-from typing import cast
 
 _UNSET = object()
 
@@ -18,12 +17,12 @@ class LazyValueCache[**P, ValueT]:
     def get(self, *args: P.args, **kwargs: P.kwargs) -> ValueT:
         value = self._value
         if value is not _UNSET:
-            return cast(ValueT, value)
+            return value
 
         with self._lock:
             value = self._value
             if value is not _UNSET:
-                return cast(ValueT, value)
+                return value
 
             value = self._loader(*args, **kwargs)
             self._value = value

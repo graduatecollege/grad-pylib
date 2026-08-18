@@ -7,6 +7,11 @@ OptionalStringDecimal = Annotated[
     Decimal | None,
     WithJsonSchema({"anyOf": [{"type": "string", "format": "big-decimal"}, {"type": "null"}]})
 ]
+"""Nullable precise decimal rendered as a string in the OpenAPI schema and JSON responses.
+
+Use for values whose precision must survive clients that use IEEE 754 numbers, such as monetary
+amounts. Pydantic still validates input as `Decimal`.
+"""
 
 OptionalNumberDecimal = Annotated[
     Decimal | None,
@@ -17,6 +22,7 @@ OptionalNumberDecimal = Annotated[
     ),
     WithJsonSchema({"anyOf": [{"type": "number"}, {"type": "null"}]})
 ]
+"""Nullable decimal rendered as a JSON number for APIs that accept floating-point precision loss."""
 
 OptionalIntDecimal = Annotated[
     Decimal | None,
@@ -27,11 +33,13 @@ OptionalIntDecimal = Annotated[
     ),
     WithJsonSchema({"anyOf": [{"type": "integer"}, {"type": "null"}]})
 ]
+"""Nullable decimal rendered as an integer, truncating any fractional portion on JSON output."""
 
 StringDecimal = Annotated[
     Decimal,
     WithJsonSchema({"type": "string", "format": "big-decimal"})
 ]
+"""Required precise decimal rendered as a string to preserve its exact value for API clients."""
 
 NumberDecimal = Annotated[
     Decimal,
@@ -42,6 +50,7 @@ NumberDecimal = Annotated[
     ),
     WithJsonSchema({"type": "number"})
 ]
+"""Required decimal rendered as a JSON number when float conversion is acceptable."""
 
 IntDecimal = Annotated[
     Decimal,
@@ -52,3 +61,4 @@ IntDecimal = Annotated[
     ),
     WithJsonSchema({"type": "integer"})
 ]
+"""Required decimal rendered as an integer, truncating any fractional portion on JSON output."""

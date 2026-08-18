@@ -28,56 +28,41 @@ LOOPBACK_CLIENT_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"
 """Client hosts allowed to authenticate with the development API key."""
 
 MECHANISM_AZURE_AD = "azure_ad"
+"""Audit-log identifier for Azure AD authentication."""
 MECHANISM_DEV_API_KEY = "dev_api_key"
+"""Audit-log identifier for development API-key authentication."""
 
 EMPTY_ATTRIBUTES: Mapping[str, tuple[str, ...]] = MappingProxyType({})
 """The default (empty, read-only) attribute mapping of a user."""
 
 
 class AuthUser(Protocol):
-    """
-    The contract this library requires of an authenticated user.
+    """Contract for the immutable application user evaluated by authorization policies.
 
-    Authorization only ever needs the effective roles, so consuming applications are free
-    to model their user however they like -- dataclass, pydantic model, or anything else --
-    as long as it satisfies this protocol. :class:`BaseUser` is a ready-made implementation,
-    but subclassing it is a convenience rather than a requirement.
-
-    Implementations must be immutable: authorization decisions are made from this object,
-    so a request handler (or a cached reference to it) must not be able to change the roles
-    after the fact.
+    Applications may use any immutable user model that implements this protocol; `BaseUser`
+    is a ready-made implementation, not a required base class. Authorization decisions use
+    this object, so handlers and cached references must not be able to change its roles.
     """
 
     @property
     def effective_roles(self) -> Sequence[str]:
-        """The roles the user is authorized with for this request."""
+        """Return the roles used to authorize the current request."""
         ...
 
     @property
     def audit_log_info(self) -> dict[str, Any] | None:
-        """Additional information that should be logged for the user with auth logging."""
+        """Return optional application-specific fields for authorization audit events."""
         ...
 
 
 @dataclass(frozen=True, slots=True)
 class BaseUser:
-    """
-    A ready-made immutable :class:`AuthUser` implementation.
+    """Ready-made immutable `AuthUser` populated from claims and optional role overrides.
 
-    The fields are stored exactly as declared: sequences must already be tuples. Untrusted
-    input is normalized where it enters the application -- see :func:`parse_roles` and
-    :func:`parse_distinct_strings` -- rather than being coerced by the constructor, so
-    subclasses need no cooperation from this class and the annotations describe what is
-    really stored.
-
-    Attributes:
-        email (str): The email address of the user.
-        first_name (str): The first name of the user.
-        last_name (str): The last name of the user.
-        roles (tuple[str, ...]): The roles assigned to the user by the identity provider.
-        roles_override (tuple[str, ...] | None): Explicit roles to authorize with for this
-            request. ``None`` means the provider-issued roles are used unchanged.
-        attributes (Mapping[str, tuple[str, ...]]): A read-only mapping of user attributes.
+    Fields are stored as declared: callers should normalize untrusted sequences before
+    construction with helpers such as `parse_roles` and `parse_distinct_strings`. `roles`
+    records identity-provider roles, while a non-`None` `roles_override` replaces them for
+    authorization; `attributes` is a read-only mapping of application-specific values.
     """
     email: str = ""
     first_name: str = ""
@@ -88,21 +73,23 @@ class BaseUser:
 
     @property
     def effective_roles(self) -> tuple[str, ...]:
+        """Return override roles when present, otherwise provider-issued roles."""
         if self.roles_override is None:
             return self.roles
         return self.roles_override
 
     @property
     def audit_log_info(self) -> dict[str, Any] | None:
+        """Return extra audit fields; the default user does not add any."""
         return None
 
     @property
     def netid(self) -> str | None:
-        """The institutional netid, or None when the email is not an institutional address."""
+        """Return the institutional NetID derived from the user's email, when available."""
         return netid_from_email(self.email)
 
     def with_roles_override(self, roles: Sequence[str]) -> Self:
-        """Returns a copy of this user with the given override roles applied."""
+        """Return a copy whose supplied roles replace provider roles for authorization."""
         return replace(self, roles_override=tuple(roles))
 
 
@@ -142,29 +129,14 @@ def _normalize_policy_roles(
 
 
 class AuthConfiguration(BaseModel):
-    """
-    Represents the configuration settings for authentication.
+    """Immutable role policies and development API-key settings for an application.
 
-    This class provides a structured format to define and manage
-    authentication-related configurations including roles, policies,
-    and specific API header fields.
+    A policy grants access to a user holding any of its configured valid roles. Construction
+    canonicalizes policy roles against `valid_roles`, rejects empty policies and unknown
+    roles, and freezes the result so authorization decisions cannot change at runtime.
 
-    Api-Key should only be used for development and testing purposes.
-
-    A policy grants access when the user holds *any* of the roles configured for it.
-
-    The configuration is validated and deep-frozen on construction: policy roles must name
-    roles from `valid_roles` (matched case-insensitively and stored canonically), no policy
-    may be empty, and a caller that keeps a reference to the mapping or the role sets it
-    passed in cannot change authorization decisions at runtime.
-
-    Attributes:
-        valid_roles (tuple[str, ...]): A tuple of valid role names.
-        policy_roles (Mapping[str, frozenset[str]]): A mapping of policy names to role names.
-        api_key_header (str): The header name for the API key.
-        api_role_header (str): The header name for the API role.
-        api_key_allowed_hosts (frozenset[str]): Client hosts allowed to use the development
-            API key. Defaults to loopback addresses only.
+    The API-key headers support only the local development/testing bypass configured by
+    `require_policy`; `api_key_allowed_hosts` defaults to loopback clients.
     """
     model_config = ConfigDict(frozen=True)
 
@@ -176,14 +148,25 @@ class AuthConfiguration(BaseModel):
 
 
 type ClaimsToUser = Callable[[dict[str, Any]], AuthUser]
+"""Converts validated Azure AD claims into an application user."""
 type OverrideLoader = Callable[[AuthUser, Session], AuthUser]
+"""Loads application-specific authorization overrides for an authenticated user."""
 type ApiKeyUserBuilder = Callable[[str | None, Request], AuthUser]
+"""Builds the development user selected by an API-key request's role header."""
 type SettingsProvider = Callable[[], BaseAppSettings]
+"""Supplies current application settings to authentication helpers."""
 type SessionProvider = Callable[[], Any]
+"""Supplies the request-scoped session used by optional role overrides."""
 
 
 @dataclass(frozen=True, slots=True)
 class AuthRuntimeConfig:
+    """Application-specific dependencies and options for an authentication runtime.
+
+    This separates application claim parsing, persistence-backed role overrides, error
+    choices, and development API-key behavior from the shared Azure AD policy machinery.
+    """
+
     config: AuthConfiguration
     get_settings: SettingsProvider
     get_session: SessionProvider
@@ -199,22 +182,40 @@ class AuthRuntimeConfig:
 
 @dataclass(frozen=True, slots=True)
 class AuthRuntime:
-    """Ready-to-export auth helpers for a FastAPI application."""
+    """Ready-to-export Azure scheme and policy dependencies for a FastAPI application.
+
+    Applications commonly expose `azure_scheme`, `load_azure_openid_config`, and
+    `require_policy` from this object during startup and endpoint declaration.
+    """
 
     azure_scheme: SingleTenantAzureAuthorizationCodeBearer
     _build_policy: Callable[[str], Any]
     load_azure_openid_config: Callable[[], Awaitable[None]]
 
     def require_policy(self, policy: str) -> Any:
+        """Build the dependency that authenticates a request and enforces `policy`.
+
+        The returned synchronous FastAPI dependency converts the authenticated identity,
+        applies this runtime's optional role override, and checks the policy's roles.
+        """
         return self._build_policy(policy)
 
     def depends_on(self, policy: str) -> Any:
+        """Wrap the dependency for `policy` in `Depends` for typed endpoint parameters.
+
+        Use this in an `Annotated` endpoint parameter while `require_policy` remains useful
+        for applications that export the raw dependency function.
+        """
         return Depends(self.require_policy(policy))
 
 
 @dataclass(frozen=True, slots=True)
 class AuthAppFactory:
-    """Builds one or more auth runtimes from a shared application auth configuration."""
+    """Build one or more policy runtimes from shared application authentication wiring.
+
+    A single factory can produce override-aware and override-free runtimes for endpoints
+    that differ only in whether application-specific role overrides are honored.
+    """
 
     runtime_config: AuthRuntimeConfig
 
@@ -234,6 +235,12 @@ class AuthAppFactory:
             development_client_id: str = "development-client-id",
             development_tenant_id: str = "development-tenant-id",
     ) -> Self:
+        """Capture application auth dependencies for later runtime construction.
+
+        `claims_to_user` establishes the application's user model. Optional loaders and
+        builders implement application-specific authorization overrides and development
+        API-key identities without coupling them to the shared runtime.
+        """
         return cls(
             AuthRuntimeConfig(
                 config=config,
@@ -251,23 +258,31 @@ class AuthAppFactory:
         )
 
     def runtime(self) -> AuthRuntime:
+        """Build a runtime that uses the factory's configured role-override loader."""
         return build_auth_runtime(self.runtime_config)
 
     def with_overrides(self, override_loader: OverrideLoader) -> AuthRuntime:
+        """Build a runtime that applies `override_loader` before policy evaluation.
+
+        This loader may grant or replace provider-issued roles, so every changed effective
+        role set is written to the authentication audit log.
+        """
         return build_auth_runtime(replace(self.runtime_config, override_loader=override_loader))
 
     def without_overrides(self) -> AuthRuntime:
+        """Build a runtime that evaluates provider roles without application overrides.
+
+        Use this for endpoints that must rely only on roles established by the identity
+        provider or development API-key user builder.
+        """
         return build_auth_runtime(replace(self.runtime_config, override_loader=None))
 
 
 def netid_from_email(email: str) -> str | None:
-    """
-    Extracts the netid from an institutional email address.
+    """Return an institutional email's normalized NetID, or `None` for other addresses.
 
-    Returns None when the address is missing, malformed, or belongs to a domain outside
-    :data:`INSTITUTIONAL_EMAIL_DOMAINS`. Callers must not treat a missing netid as an
-    identity: every non-institutional account would otherwise collapse onto the same
-    empty value and could collide in caches, dictionaries or database filters.
+    A missing NetID is not an identity: treating it as one would collapse all malformed or
+    non-institutional addresses into the same value in caches, lookups, or audit records.
     """
     normalized = email.strip().lower()
     if "@" not in normalized:
@@ -279,10 +294,12 @@ def netid_from_email(email: str) -> str | None:
 
 
 def azure_ad_configured(settings: BaseAppSettings) -> bool:
+    """Return whether settings contain the Azure AD client and tenant identifiers."""
     return bool(settings.azure_ad_client_id and settings.azure_ad_tenant_id)
 
 
 def warn_if_azure_ad_missing(settings: BaseAppSettings) -> None:
+    """Warn when a non-development application will reject requests without Azure AD."""
     if settings.is_development or azure_ad_configured(settings):
         return
 
@@ -298,6 +315,11 @@ def with_azure_development_placeholders[SettingsT: BaseAppSettings](
         development_client_id: str = "development-client-id",
         development_tenant_id: str = "development-tenant-id",
 ) -> SettingsT:
+    """Add placeholder Azure identifiers only to unconfigured development settings.
+
+    This lets FastAPI Azure Auth initialize locally when Azure AD is intentionally absent;
+    configured and non-development settings are returned unchanged.
+    """
     if azure_ad_configured(settings) or not settings.is_development:
         return settings
 
@@ -308,12 +330,11 @@ def with_azure_development_placeholders[SettingsT: BaseAppSettings](
 
 
 def build_azure_scheme(settings: BaseAppSettings) -> SingleTenantAzureAuthorizationCodeBearer:
-    """
-    Builds and returns an Azure authorization scheme configured for single-tenant authentication.
+    """Build the single-tenant Azure AD bearer scheme from configured application settings.
 
-    Parameters:
-        settings (BaseAppSettings): The application settings object containing the Azure AD
-            configuration. Must have valid `azure_ad_client_id` and `azure_ad_tenant_id` attributes.
+    Missing client or tenant IDs are a configuration error. In development the scheme leaves
+    missing bearer tokens for the policy dependency to handle, allowing the local API-key
+    flow; other environments return Azure Auth errors immediately.
     """
     if not settings.azure_ad_client_id or not settings.azure_ad_tenant_id:
         raise ValueError(
@@ -332,29 +353,17 @@ async def load_azure_openid_config(
         *,
         get_settings: SettingsProvider,
 ) -> None:
+    """Load Azure OpenID metadata when Azure AD credentials are configured."""
     if not azure_ad_configured(get_settings()):
         return
     await azure_scheme.openid_config.load_config()
 
 
 def normalize_role(value: str, valid_roles: tuple[str, ...]) -> str | None:
-    """
-    Normalize a role value to match a valid role if possible.
+    """Match an untrusted role to a canonical configured name, ignoring case and space.
 
-    This function takes a role value as a string, strips leading and trailing
-    whitespace, converts it to lowercase, and checks if it matches any of the
-    valid roles provided.
-
-    Parameters:
-        value: str
-            The role value to normalize.
-        valid_roles: tuple[str, ...]
-            A tuple containing the valid roles to compare against.
-
-    Returns:
-        str | None
-            The matched valid role from the valid_roles tuple if a match is found,
-            otherwise None.
+    Returning the configured spelling makes identity-provider roles and policy roles compare
+    consistently; an unknown role returns `None` rather than gaining access.
     """
     normalized = value.strip().lower()
     for role in valid_roles:
@@ -364,7 +373,11 @@ def normalize_role(value: str, valid_roles: tuple[str, ...]) -> str | None:
 
 
 def parse_roles(values: Collection[str], valid_roles: tuple[str, ...]) -> tuple[str, ...]:
-    """Normalizes untrusted role values into the canonical, deduplicated tuple stored on a user."""
+    """Normalize untrusted claim roles into a canonical, deduplicated user-role tuple.
+
+    Unknown and empty values are discarded, so claims can grant only roles explicitly
+    configured by the application.
+    """
     parsed: list[str] = []
     seen: set[str] = set()
     for value in values:
@@ -392,6 +405,11 @@ def parse_distinct_strings(
 
 
 def claim_list(claims: dict[str, Any], name: str) -> list[str]:
+    """Return a claim's scalar or iterable values as strings, ignoring unsafe containers.
+
+    Mappings and byte sequences are rejected rather than iterated, preventing malformed
+    token data from being mistaken for a collection of claims.
+    """
     value = claims.get(name) or []
     if isinstance(value, str):
         return [value]
@@ -405,6 +423,7 @@ def claim_list(claims: dict[str, Any], name: str) -> list[str]:
 
 
 def claim_value(claims: dict[str, Any], *names: str) -> str:
+    """Return the first nonempty string among alternative claim names."""
     for name in names:
         value = claims.get(name)
         if isinstance(value, str) and value:
@@ -413,10 +432,10 @@ def claim_value(claims: dict[str, Any], *names: str) -> str:
 
 
 def unauthorized_error(detail: str = "Not authenticated") -> HTTPException:
-    """Builds the 401 raised for every authentication failure.
+    """Build the bearer-authentication `401` without exposing failure details.
 
-    The detail is deliberately generic so that a caller cannot distinguish between an
-    unknown identity, a rejected domain, and a bad API key.
+    Authentication paths deliberately share this generic response so callers cannot
+    distinguish an unknown identity, rejected domain, or invalid API key.
     """
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -426,21 +445,10 @@ def unauthorized_error(detail: str = "Not authenticated") -> HTTPException:
 
 
 def default_claims_to_user(claims: dict[str, Any], valid_roles: tuple[str, ...]) -> BaseUser:
-    """
-    Converts Azure AD claims to a BaseUser object.
+    """Build a `BaseUser` from institutional Azure claims or reject the identity with `401`.
 
-    The function processes claims from Azure AD, extracts the user's email (UPN),
-    first name, last name, and roles. Tokens without a UPN claim, and identities
-    outside :data:`INSTITUTIONAL_EMAIL_DOMAINS`, are rejected with a 401 rather than
-    surfacing as a 500.
-
-    Parameters:
-        claims (dict[str, Any]): A dictionary of claims received from Azure AD.
-        valid_roles (tuple[str, ...]): A tuple containing valid role names to
-            filter and assign to the user.
-
-    Returns:
-        BaseUser: An instance representing the user with extracted details.
+    Tokens require an institutional `upn`; names are read from standard Azure claims and
+    token roles are filtered against `valid_roles`. Rejections are recorded in the audit log.
     """
     email = claim_value(claims, "upn")
     if not email:
@@ -471,12 +479,17 @@ def azure_user_to_current_user(
         *,
         claims_to_user: ClaimsToUser,
 ) -> AuthUser:
+    """Convert FastAPI Azure Auth's token user into the application's authorization user.
+
+    Only a copy of claims is passed to the application converter, separating the token-bearing
+    upstream user representation from the object used for authorization and request state.
+    """
     claims = dict(user.claims)
     return claims_to_user(claims)
 
 
 def client_host(request: Request) -> str | None:
-    """Returns the peer address of the connection, ignoring forwarding headers."""
+    """Return the direct peer address, deliberately ignoring forwarding headers."""
     client = request.scope.get("client")
     if not client:
         return None
@@ -484,12 +497,10 @@ def client_host(request: Request) -> str | None:
 
 
 def is_allowed_api_key_client(request: Request, allowed_hosts: Collection[str]) -> bool:
-    """
-    Checks whether the development API key may be used from this connection.
+    """Return whether the direct peer is approved for development API-key use.
 
-    Only the real peer address is considered. Forwarding headers such as
-    ``X-Forwarded-For`` are deliberately ignored because they are client-controlled,
-    and a connection with no peer address is rejected.
+    Forwarding headers are intentionally ignored because clients control them, and a request
+    without a peer address is rejected.
     """
     host = client_host(request)
     if not host:
@@ -498,10 +509,10 @@ def is_allowed_api_key_client(request: Request, allowed_hosts: Collection[str]) 
 
 
 def constant_time_equals(presented: str, expected: str | None) -> bool:
-    """Compares two secrets in constant time, tolerating malformed Unicode input.
+    """Compare API-key secrets in constant time and treat malformed input as nonmatching.
 
-    ``secrets.compare_digest`` only accepts matching types, and UTF-8 encoding can still
-    raise for malformed surrogate code points. Authentication failures must stay 401s.
+    UTF-8 encoding may fail for malformed surrogate input; authentication must still produce
+    a normal `401` response rather than exposing an internal error.
     """
     if not expected:
         return False
@@ -512,19 +523,16 @@ def constant_time_equals(presented: str, expected: str | None) -> bool:
 
 
 def store_request_user(request: Request, user: AuthUser) -> None:
-    """
-    Replaces the upstream Azure user on the request state with the application user.
+    """Store the application user in request state instead of token-bearing Azure data.
 
-    ``fastapi_azure_auth`` stores its own user object -- including the raw access token
-    and the full claim set -- on ``request.state.user``. Anything that serializes the
-    request state (error handlers, APM integrations) would then leak a live bearer
-    token, so only the application's own user object is kept.
+    This replaces FastAPI Azure Auth's upstream user, whose raw token and complete claims
+    could otherwise be exposed by request-state serialization or observability tooling.
     """
     request.state.user = user
 
 
 def subject_of(user: AuthUser) -> str | None:
-    """Best-effort subject identifier for audit records."""
+    """Return the user's NetID or email for authorization audit records."""
     return getattr(user, "netid", None) or getattr(user, "email", None) or None
 
 
@@ -589,60 +597,29 @@ def require_policy(
         dev_api_key_enabled: Callable[[Any], bool] | None = None,
         api_key_user_builder: ApiKeyUserBuilder | None = None,
 ):
-    """
-    Provides a dependency function enforcing authorization policies through roles.
+    """Build a FastAPI dependency that authenticates a request and enforces `policy`.
 
-    This function dynamically constructs a dependency to validate if the user
-    associated with the current request has the required roles to satisfy a
-    given policy. Policies are defined in the `AuthConfiguration`.
+    Azure AD users are converted to the application's immutable user model and optionally
+    role-overridden before authorization. Every grant, denial, and authentication failure is
+    audited through `grad_pylib.audit.auth`.
 
-    **Api-Key** is a full authentication bypass with a caller-chosen role and exists only
-    for local development and automated testing. It is accepted only when all of the
-    following hold: the environment is a development environment, `dev_api_key_enabled`
-    returns True, and the request originates from a loopback address. Any request that
-    presents the API key header without satisfying those conditions is rejected with a
-    401 and audited; it never falls through to Azure AD authentication.
+    The development API key is a loopback-only, caller-role-selected bypass intended only for
+    development and automated tests. It is enabled only when the application says so in a
+    development environment; a presented but unusable key is audited and rejected with `401`,
+    never allowed to fall through to Azure AD. `override_loader` is privilege-granting and may
+    replace provider roles, so changes to effective roles are audited.
 
-    Every authentication decision is written to the `grad_pylib.audit.auth` logger.
-
-    Parameters:
-        policy: Name of the policy to validate. The policy must be present in the
-            `AuthConfiguration`, which guarantees it names at least one valid role.
-
-        config: The authentication configuration object containing required
-            authorization-related settings.
-
-        azure_scheme: The Azure AD Bearer token scheme object for performing
-            user authentication.
-
-        get_settings: A callable that retrieves application settings, such as
-            environment configuration and development API key.
-
-        get_session: A callable providing access to the database session for the
-            current request.
-
-        forbidden_error_factory: A callable that takes a role name as input and
-            produces an exception to be raised if the user lacks the required role.
-
-        claims_to_user: A callable that maps claims from a token to a user
-            representation used within the application.
-
-        override_loader: Optional. A callable that can modify or replace the
-            current user object using information from the active database session.
-            This is a privilege-granting hook: it may replace the roles issued by the
-            identity provider entirely. Every override that changes the effective roles
-            is audited.
-
-        dev_api_key_enabled: Optional. A callable evaluating whether development
-            API key-based authentication is enabled for a given application
-            configuration.
-
-        api_key_user_builder: Optional. A callable that generates a user object
-            when a valid API key and associated role are provided in the request.
-
-    Returns:
-        A dependency callable which can be used within a framework like FastAPI
-        to enforce role-based access control for endpoints.
+    Args:
+        policy: Name of the configured policy to enforce.
+        config: Role policies and development API-key header settings.
+        azure_scheme: Azure AD bearer scheme that validates access tokens.
+        get_settings: Supplies current application settings for each request.
+        get_session: Supplies the request-scoped session for role overrides.
+        forbidden_error_factory: Creates the error raised when authorization is denied.
+        claims_to_user: Converts validated Azure AD claims into the application user.
+        override_loader: Optionally loads roles that replace provider-issued roles.
+        dev_api_key_enabled: Determines whether the local development API-key bypass is enabled.
+        api_key_user_builder: Builds the development user selected by the API role header.
     """
     required_roles = config.policy_roles.get(policy)
 
@@ -713,6 +690,11 @@ def require_policy(
 
 
 def build_auth_runtime(runtime_config: AuthRuntimeConfig) -> AuthRuntime:
+    """Build an Azure scheme and policy helpers from application authentication wiring.
+
+    Missing Azure credentials warn in non-development environments. When explicitly enabled,
+    placeholder IDs let an unconfigured development app initialize its local API-key flow.
+    """
     settings = runtime_config.get_settings()
     warn_if_azure_ad_missing(settings)
     azure_settings = settings
@@ -753,6 +735,11 @@ def dev_api_key_enabled_for(
         *,
         allowed_environments: Collection[str],
 ) -> bool:
+    """Return whether a configured development API key is enabled in an allowed environment.
+
+    All three conditions—feature flag, nonempty secret, and case-insensitive environment
+    membership—must hold before `require_policy` can accept the local bypass.
+    """
     environment = (settings.environment or "").lower()
     return bool(
         settings.enable_dev_api_key

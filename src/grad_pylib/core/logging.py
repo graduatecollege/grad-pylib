@@ -8,10 +8,18 @@ from fastapi import Request, Response
 from grad_pylib.core.config import BaseAppSettings
 
 REQUEST_ID_HEADER = "X-Request-Id"
+"""Incoming header whose value is attached to logs produced while handling the request."""
 REQUEST_ID_FIELD = "x_request_id"
+"""Structured-log field used to record the incoming `REQUEST_ID_HEADER` value."""
 
 
 def configure_logging(settings: BaseAppSettings) -> None:
+    """Configure process-wide stdlib and structlog output from application settings.
+
+    Development uses human-readable console logs and retains Uvicorn access logs; other
+    environments emit JSON and suppress access logs. Call once during application startup, before
+    loggers are first used, because this replaces root and Uvicorn handlers.
+    """
     timestamper = structlog.processors.TimeStamper(fmt="iso")
     shared_processors = [
         structlog.contextvars.merge_contextvars,
@@ -64,8 +72,11 @@ async def bind_request_id_context(
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
-    """
-    Handles the binding of a request ID to the structured logging context.
+    """Bind an incoming request ID to structured logs for the lifetime of one request.
+
+    Install as FastAPI middleware. Existing context is cleared before and after `call_next` so
+    concurrent requests cannot inherit another request's correlation ID; absent headers simply
+    produce logs without `REQUEST_ID_FIELD`.
     """
     structlog.contextvars.clear_contextvars()
 

@@ -17,13 +17,10 @@ from tenacity import retry, retry_if_exception, stop_after_attempt, wait_increme
 
 
 def build_mssql_url(odbc_connection_string: str) -> str:
-    """
-    Build the connection URL for an MSSQL database using an ODBC connection string.
+    """Convert an ODBC connection string to the SQLAlchemy URL used by this library.
 
-    Arguments:
-    odbc_connection_string: str
-        The ODBC connection string containing the required connection parameters
-        such as driver, server, database, and authentication information.
+    The password is intentionally retained because SQLAlchemy passes the complete string to
+    `pyodbc`; avoid logging the returned URL or the source connection string.
     """
     return URL.create("mssql+pyodbc", query={"odbc_connect": odbc_connection_string}).render_as_string(
         hide_password=False
@@ -31,6 +28,11 @@ def build_mssql_url(odbc_connection_string: str) -> str:
 
 
 def resolve_database_url(settings: BaseAppSettings | None = None) -> str:
+    """Build the default database URL from settings or raise when it is not configured.
+
+    Passing settings supports scripts and tests; omitted settings come from the shared cached
+    application configuration used by the default single-database setup.
+    """
     settings = settings or get_settings()
     if settings.database_url:
         return build_mssql_url(settings.database_url)
@@ -38,6 +40,12 @@ def resolve_database_url(settings: BaseAppSettings | None = None) -> str:
 
 
 class DatabaseRuntime:
+    """Lazily create and share one SQLAlchemy engine and session factory for a database.
+
+    The URL resolver is invoked only when the engine is first needed, allowing application
+    settings to be registered before startup. Thread-safe initialization makes the runtime safe
+    to expose as an application-level singleton; sessions remain request or task scoped.
+    """
     def __init__(
             self,
             database_url_resolver: Callable[[], str],
@@ -56,6 +64,7 @@ class DatabaseRuntime:
         self._session_factory_lock = threading.Lock()
 
     def get_engine(self) -> Engine:
+        """Return the lazily created, pooled engine for this runtime."""
         if self._engine is None:
             with self._engine_lock:
                 if self._engine is None:
@@ -70,6 +79,11 @@ class DatabaseRuntime:
         return self._engine
 
     def get_session_factory(self) -> sessionmaker[Session]:
+        """Return the cached factory configured for explicit flush and transaction control.
+
+        Instances do not autoflush or expire committed objects, leaving transaction boundaries to
+        the caller while keeping returned ORM objects usable after a commit.
+        """
         if self._session_factory is None:
             with self._session_factory_lock:
                 if self._session_factory is None:
@@ -84,6 +98,10 @@ class DatabaseRuntime:
         return self._session_factory
 
     def session(self) -> Generator[Session]:
+        """Yield a FastAPI-compatible session and close it after the request dependency ends.
+
+        This manages resource cleanup only; handlers remain responsible for commit and rollback.
+        """
         session = self.get_session_factory()()
         try:
             yield session
@@ -92,6 +110,11 @@ class DatabaseRuntime:
 
     @contextmanager
     def background_session(self) -> Generator[Session]:
+        """Provide a context-managed session for scripts and background work.
+
+        Use `with runtime.background_session()` outside FastAPI; as with `session`, callers own
+        transaction handling and the context manager guarantees closing the session.
+        """
         session = self.get_session_factory()()
         try:
             yield session
@@ -117,21 +140,29 @@ def _settings_database_url_resolver(
 
 @dataclass(frozen=True, slots=True)
 class NamedDatabase:
-    """Bound helpers for one named database runtime."""
+    """Bound engine, session, and dependency helpers for one database in `NamedDatabases`.
+
+    Keep a named helper when a route or task always uses the same non-default database; it avoids
+    repeating the database name while retaining the owning application's explicit bootstrap.
+    """
 
     name: str
     runtime: DatabaseRuntime
 
     def get_engine(self) -> Engine:
+        """Return this named database's shared engine."""
         return self.runtime.get_engine()
 
     def get_session(self) -> Generator[Session]:
+        """Yield this named database's request-scoped session."""
         yield from self.runtime.session()
 
     def get_background_session(self) -> AbstractContextManager[Session]:
+        """Return a context manager for a session used outside request dependencies."""
         return self.runtime.background_session()
 
     def session_dependency(self) -> Any:
+        """Return the typed FastAPI dependency annotation for this database's session."""
         return Annotated[Session, Depends(self.get_session)]
 
 
@@ -212,6 +243,11 @@ class NamedDatabases:
             pool_size: int = 5,
             max_overflow: int = 20,
     ) -> Self:
+        """Build named runtimes whose URLs are read lazily from application settings.
+
+        `database_fields` maps public database names to settings attributes. The default MSSQL
+        URL builder can be replaced for tests or databases using another SQLAlchemy dialect.
+        """
         return cls(
             {
                 name: _settings_database_url_resolver(settings_provider, field_name, url_builder=url_builder)
@@ -225,19 +261,23 @@ class NamedDatabases:
 
     @property
     def names(self) -> tuple[str, ...]:
+        """Return configured database names in their registration order."""
         return tuple(self._databases)
 
     @property
     def default_name(self) -> str | None:
+        """Return the configured default name, if convenience helpers may use one."""
         return self._default_name
 
     @property
     def default(self) -> NamedDatabase:
+        """Return the default database or raise if none was configured."""
         if self._default_name is None:
             raise ValueError("No default database configured.")
         return self._databases[self._default_name]
 
     def __getitem__(self, name: str) -> NamedDatabase:
+        """Return the named database, supporting concise application bootstrap access."""
         return self.database(name)
 
     def _database_or_default(self, name: str | None) -> NamedDatabase:
@@ -246,28 +286,35 @@ class NamedDatabases:
         return self.database(name)
 
     def database(self, name: str) -> NamedDatabase:
+        """Return a configured database by normalized name or raise a descriptive `KeyError`."""
         try:
             return self._databases[name.strip()]
         except KeyError as exc:
             raise KeyError(f"Unknown database: {name!r}") from exc
 
     def get_runtime(self, name: str | None = None) -> DatabaseRuntime:
+        """Return the selected runtime, using the configured default when `name` is omitted."""
         return self._database_or_default(name).runtime
 
     def get_engine(self, name: str | None = None) -> Engine:
+        """Return the selected shared engine, defaulting to the configured application database."""
         return self._database_or_default(name).get_engine()
 
     def get_session(self, name: str | None = None) -> Generator[Session]:
+        """Yield a request-scoped session for the selected or default database."""
         yield from self._database_or_default(name).get_session()
 
     def get_background_session(self, name: str | None = None) -> AbstractContextManager[Session]:
+        """Return a context-managed session for selected database background work."""
         return self._database_or_default(name).get_background_session()
 
     def session_dependency(self, name: str | None = None) -> Any:
+        """Return the FastAPI session annotation for the selected or default database."""
         return self._database_or_default(name).session_dependency()
 
 
 class SqlServerErrorType(Enum):
+    """SQL Server conditions recognized by `parse_mssql_error` for application handling."""
     DEADLOCK = "deadlock"  # Code 1205
     LOCK_TIMEOUT = "lock_timeout"  # Code 1222
     DUPLICATE_KEY = "duplicate_key"  # Codes 2601, 2627
@@ -279,6 +326,11 @@ class SqlServerErrorType(Enum):
 
 @dataclass(frozen=True, slots=True)
 class ParsedSqlError:
+    """Structured SQL Server driver failure used to make retry and idempotency decisions.
+
+    `is_idempotency_hit` is true only for duplicate-key messages matching caller-provided markers;
+    it distinguishes an expected concurrent insert from an unrelated uniqueness failure.
+    """
     error_type: SqlServerErrorType
     native_code: int | None
     driver_message: str
@@ -286,9 +338,10 @@ class ParsedSqlError:
 
 
 def parse_mssql_error(e: DBAPIError, idempotency_markers: tuple[str, ...] = ()) -> ParsedSqlError:
-    """
-    Parses a pyodbc-based SQLAlchemy exception into a structured data object.
-    Safe for any framework, script, or retry loop.
+    """Classify a pyodbc SQLAlchemy error by SQL Server native code.
+
+    This defensive parser is safe for request handlers, scripts, and retry loops. Duplicate-key
+    errors count as idempotent only when their driver message contains a supplied marker.
     """
     if not e.orig or not hasattr(e.orig, "args") or len(e.orig.args) < 2:
         return ParsedSqlError(SqlServerErrorType.UNKNOWN, 0, '', False)
@@ -361,14 +414,24 @@ def _rollback_session_before_sleep(retry_state: RetryCallState):
         session.rollback()
 
 
-# Reusable decorator for retrying transient SQL Server contention errors
-retry_on_transient_conflict = retry(
-    retry=retry_if_exception(_is_transient_conflict),
-    stop=stop_after_attempt(3),
-    wait=wait_incrementing(start=0.05, increment=0.05),
-    before_sleep=_rollback_session_before_sleep,
-    reraise=True,
-)
+def retry_on_transient_conflict[**P, T](func: Callable[P, T]) -> Callable[P, T]:
+    """Retry an idempotent database operation after transient SQL Server contention.
+
+    Deadlocks, lock timeouts, and RCSI conflicts on concurrent transactions can prevent this
+    attempt from safely completing when the request itself may be valid. A short retry lets
+    the competing transaction finish and reruns the operation against current database state.
+    Decorated calls retry up to three times, waiting 50 then 100 milliseconds. Before each retry,
+    a passed `Session` is rolled back so it can be used again; the final database error is
+    re-raised. Use only for operations that are safe to repeat, and pass the session as an
+    argument so failed transactions are reset.
+    """
+    return retry(
+        retry=retry_if_exception(_is_transient_conflict),
+        stop=stop_after_attempt(3),
+        wait=wait_incrementing(start=0.05, increment=0.05),
+        before_sleep=_rollback_session_before_sleep,
+        reraise=True,
+    )(func)
 
 
 def _coerce_model_data(
@@ -396,10 +459,11 @@ def orm_upsert[ModelT: DeclarativeBase](
         *,
         insert_only: dict[str, Any] | BaseModel | DeclarativeBase | None = None,
 ) -> ModelT:
-    """
-    Universal, concurrency-safe ORM upsert for SQL Server under RCSI.
-    Accepts raw dicts, Pydantic models, or sqlacodegen DeclarativeBase instances.
-    `insert_only` fields are applied only when creating a new row.
+    """Insert or update a SQL Server ORM row by its complete primary key under RCSI.
+
+    The lookup uses update and hold locks to serialize competing upserts. Payloads may be dicts,
+    Pydantic models, or generated ORM objects; `insert_only` values are applied exclusively to
+    new rows and never overwrite an existing record. This flushes but does not commit.
     """
     # Inspect the core database model to find its primary keys
     mapper = inspect(model_cls)
@@ -457,9 +521,10 @@ def select_exclude[BaseT: DeclarativeBase | Table](
         model_or_table: type[BaseT] | Table,
         exclude: set[str]
 ) -> Select:
-    """
-    Constructs a select statement excluding specific columns.
-    Works seamlessly with both SQLAlchemy ORM Models and Core Tables.
+    """Build a select that omits named columns from a Core table or ORM model.
+
+    Core statements select only the retained columns. ORM statements return model instances with
+    excluded mapped columns deferred, preventing their data from being loaded until accessed.
     """
     # 1. Handle Core Table Objects
     if isinstance(model_or_table, Table):
