@@ -24,6 +24,38 @@ dependencies = [
     "tenacity==9.1.4",
 ]
 
+[dependency-groups]
+test = [
+    "pytest==9.1.1",
+    "pytest-xdist==3.8.0",
+    "httpx2==2.12.0",
+    "testcontainers[mssql]==4.15.0",
+    "pymssql==2.3.13",
+    "pytest-cov==7.1.0",
+]
+dev = [
+    "sqlacodegen==4.0.4",
+    "pymssql==2.3.13",
+    "ty==0.0.74",
+    "ruff==0.16.4",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest==9.1.1",
+    "pytest-xdist==3.8.0",
+    "httpx2==2.12.0",
+    "testcontainers[mssql]==4.15.0",
+    "pymssql==2.3.13",
+    "pytest-cov==7.1.0",
+]
+dev = [
+    "sqlacodegen==4.0.4",
+    "pymssql==2.3.13",
+    "ty==0.0.74",
+    "ruff==0.16.4",
+]
+
 [tool.uv]
 default-groups = ["dev", "test"]
 
@@ -63,21 +95,6 @@ source = "vcs"
 # Instead of tag_filter/tag_regex variables, explicitly tell Git how to search tags:
 git_describe_command = "git describe --dirty --tags --long --match 'v*'"
 
-[dependency-groups]
-test = [
-    "pytest==9.1.1",
-    "pytest-xdist==3.8.0",
-    "httpx2==2.12.0",
-    "testcontainers[mssql]==4.15.0",
-    "pymssql==2.3.13",
-    "pytest-cov==7.1.0",
-]
-dev = [
-    "sqlacodegen==4.0.4",
-    "pymssql==2.3.13",
-    "ty==0.0.74",
-    "ruff==0.16.4",
-]
 
 [tool.ruff.lint]
 select = [

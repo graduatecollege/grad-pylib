@@ -319,6 +319,22 @@ dependencies = [
     { name = "uvicorn", extra = ["standard"] },
 ]
 
+[package.optional-dependencies]
+dev = [
+    { name = "pymssql" },
+    { name = "ruff" },
+    { name = "sqlacodegen" },
+    { name = "ty" },
+]
+test = [
+    { name = "httpx2" },
+    { name = "pymssql" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "pytest-xdist" },
+    { name = "testcontainers", extra = ["mssql"] },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "pymssql" },
@@ -340,13 +356,24 @@ requires-dist = [
     { name = "fastapi", specifier = "==0.141.1" },
     { name = "fastapi-azure-auth", specifier = "==5.3.0" },
     { name = "httptools", specifier = "==0.8.0" },
+    { name = "httpx2", marker = "extra == 'test'", specifier = "==2.12.0" },
     { name = "pydantic-settings", specifier = "==2.15.0" },
+    { name = "pymssql", marker = "extra == 'dev'", specifier = "==2.3.13" },
+    { name = "pymssql", marker = "extra == 'test'", specifier = "==2.3.13" },
     { name = "pyodbc", specifier = "==5.3.0" },
+    { name = "pytest", marker = "extra == 'test'", specifier = "==9.1.1" },
+    { name = "pytest-cov", marker = "extra == 'test'", specifier = "==7.1.0" },
+    { name = "pytest-xdist", marker = "extra == 'test'", specifier = "==3.8.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = "==0.16.4" },
+    { name = "sqlacodegen", marker = "extra == 'dev'", specifier = "==4.0.4" },
     { name = "sqlalchemy", specifier = "==2.0.52" },
     { name = "structlog", specifier = "==26.1.0" },
     { name = "tenacity", specifier = "==9.1.4" },
+    { name = "testcontainers", extras = ["mssql"], marker = "extra == 'test'", specifier = "==4.15.0" },
+    { name = "ty", marker = "extra == 'dev'", specifier = "==0.0.74" },
     { name = "uvicorn", extras = ["standard"], specifier = "==0.52.4" },
 ]
+provides-extras = ["dev", "test"]
 
 [package.metadata.requires-dev]
 dev = [
