@@ -6,7 +6,8 @@ machinery here parses request parameters and applies the corresponding
 ``WHERE`` / ``ORDER BY`` clauses.
 
 Filtering parameters use a ``field`` or ``field__operator`` naming convention,
-e.g. ``status=submitted`` (equality) or ``requested_amount__gte=100``.
+e.g. ``status=submitted`` (equality), ``requested_amount__gte=100``, or
+``reviewed_at__isnull=true``.
 
 Sorting parameters are a comma separated list of fields, where a leading ``-``
 denotes descending order, e.g. ``sort=-submitted_at,department_code``.
@@ -51,6 +52,8 @@ _RAW_FILTER_OPERATORS: dict[str, str] = {
     "like": "LIKE",
     "ilike": "ILIKE",
 }
+
+_NULL_FILTER_OPERATORS = frozenset({"isnull", "notnull"})
 
 
 class QuerySpec:
@@ -131,6 +134,25 @@ def _coerce_in_values(value: Any) -> list[Any]:
     return coerced
 
 
+def _coerce_bool_filter(operator: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "f", "no", "n", "off"}:
+            return False
+    raise BadRequestError(
+        f"Filter operator '{operator}' requires a boolean value."
+    )
+
+
+def _matches_null(operator: str, value: Any) -> bool:
+    wants_null = _coerce_bool_filter(operator, value)
+    return wants_null if operator == "isnull" else not wants_null
+
+
 def apply_filters[T: tuple[Any, ...]](
         stmt: Select[T], spec: QuerySpec, filters: Mapping[str, Any] | None
 ) -> Select[T]:
@@ -156,6 +178,13 @@ def apply_filters[T: tuple[Any, ...]](
             continue
         field, operator = _parse_filter_key(key)
         column = spec.filterable[field]
+        if operator in _NULL_FILTER_OPERATORS:
+            stmt = stmt.where(
+                column.is_(None)
+                if _matches_null(operator, value)
+                else column.is_not(None)
+            )
+            continue
         if operator == "in":
             stmt = stmt.where(column.in_(_coerce_in_values(value)))
             continue
@@ -268,6 +297,12 @@ def build_where_clause(
 
         column_name = _raw_column_name(field, column)
         operator_sql = _RAW_FILTER_OPERATORS.get(operator)
+
+        if operator in _NULL_FILTER_OPERATORS:
+            clauses.append(
+                f"{column_name} {'IS NULL' if _matches_null(operator, value) else 'IS NOT NULL'}"
+            )
+            continue
 
         if operator_sql is not None:
             param_name = f"{field}_{index}"

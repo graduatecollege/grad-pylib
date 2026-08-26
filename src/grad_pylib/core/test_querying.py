@@ -63,6 +63,30 @@ def test_apply_filters_operator_suffix():
     assert "requested_amount >= 100" in _sql(stmt)
 
 
+def test_apply_filters_isnull_true_uses_is_null():
+    stmt = apply_filters(select(FooNomination), SPEC, {"requested_amount__isnull": True})
+    assert "requested_amount IS NULL" in _sql(stmt)
+
+
+def test_apply_filters_isnull_false_uses_is_not_null():
+    stmt = apply_filters(
+        select(FooNomination), SPEC, {"requested_amount__isnull": "false"}
+    )
+    assert "requested_amount IS NOT NULL" in _sql(stmt)
+
+
+def test_apply_filters_notnull_true_uses_is_not_null():
+    stmt = apply_filters(
+        select(FooNomination), SPEC, {"requested_amount__notnull": "true"}
+    )
+    assert "requested_amount IS NOT NULL" in _sql(stmt)
+
+
+def test_apply_filters_null_operators_require_boolean_values():
+    with pytest.raises(BadRequestError, match="requires a boolean value"):
+        apply_filters(select(FooNomination), SPEC, {"requested_amount__isnull": "maybe"})
+
+
 def test_apply_filters_unknown_field_raises():
     with pytest.raises(BadRequestError):
         apply_filters(select(FooNomination), SPEC, {"uin": "123"})
@@ -183,6 +207,25 @@ def test_build_where_clause_in_operator():
     assert clause.sql == "WHERE department_code IN :department_code_1"
     assert clause.params == {"department_code_1": ["1227", "1234"]}
     assert clause.expanding_params == ("department_code_1",)
+
+
+def test_build_where_clause_isnull_true():
+    clause = build_where_clause(SPEC, {"requested_amount__isnull": True})
+    assert clause.sql == "WHERE requested_amount IS NULL"
+    assert clause.params == {}
+    assert clause.expanding_params == ()
+
+
+def test_build_where_clause_notnull_true():
+    clause = build_where_clause(SPEC, {"requested_amount__notnull": "true"})
+    assert clause.sql == "WHERE requested_amount IS NOT NULL"
+    assert clause.params == {}
+    assert clause.expanding_params == ()
+
+
+def test_build_where_clause_null_operators_require_boolean_values():
+    with pytest.raises(BadRequestError, match="requires a boolean value"):
+        build_where_clause(SPEC, {"requested_amount__notnull": "sometimes"})
 
 
 def test_build_where_clause_composes_fixed_clauses():
