@@ -9,9 +9,16 @@ Filtering parameters use a `field` or `field__operator` naming convention:
 - `status=submitted`
 - `requested_amount__gte=100`
 - `department__in=["AA", "BB"]`
+- `reviewed_at__isnull=true`
+- `reviewed_at__notnull=true`
 
 Supported filter operators are `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `like`,
-`ilike`, and `in`.
+`ilike`, `in`, `isnull`, and `notnull`.
+
+`isnull` and `notnull` expect a boolean value. For example,
+`reviewed_at__isnull=true` produces `reviewed_at IS NULL`, while
+`reviewed_at__isnull=false` and `reviewed_at__notnull=true` both produce
+`reviewed_at IS NOT NULL`.
 
 Sorting uses a comma-separated list of public field names. Prefix a field with
 `-` for descending order, for example `sort=-submitted_at,department_code`.
@@ -42,7 +49,11 @@ spec = QuerySpec(
 stmt = apply_query(
     select(Award),
     spec,
-    filters={"department_code": "1227", "requested_amount__gte": 100},
+    filters={
+        "department_code": "1227",
+        "requested_amount__gte": 100,
+        "reviewed_at__notnull": True,
+    },
     sort="department_code",
     limit=25,
     offset=0,
@@ -74,6 +85,8 @@ if programs:
     filters["degree_program__in"] = programs
 elif departments:
     filters["department__in"] = departments
+elif require_reviewed is not None:
+    filters["reviewed_at__notnull"] = require_reviewed
 
 where = build_where_clause(
     lookup_spec,
