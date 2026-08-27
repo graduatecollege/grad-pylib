@@ -6,7 +6,7 @@ import pytest
 from pydantic import BaseModel, ValidationError, field_validator
 
 from grad_pylib.core.schemas import (
-    CamelModel, DataResponse, ItemResponse, ListResponse, MetaResponse, StatusResponse, build_status_response)
+    BaseDto, DataResponse, ItemResponse, ListResponse, MetaResponse, StatusResponse, build_status_response)
 from grad_pylib.core.schemas import (
     normalize_email_list,
     parse_comma_separated_strings,
@@ -101,26 +101,26 @@ def test_parse_validated_comma_separated_strings_keeps_business_rules_local() ->
         _DepartmentCodesModel(department_codes="1234,AB12")
 
 
-class UserDto(CamelModel):
+class UserDto(BaseDto):
     user_netid: str
     full_name: str
 
 
-class ListMeta(CamelModel):
+class ListMeta(BaseDto):
     total_count: int
     next_cursor: str | None = None
 
 
-def test_data_response_validates_nested_camel_case_payload() -> None:
+def test_data_response_validates_nested_snake_case_payload() -> None:
     response = DataResponse[UserDto].model_validate(
-        {"data": {"userNetid": "ada", "fullName": "Ada Lovelace"}},
+        {"data": {"user_netid": "ada", "full_name": "Ada Lovelace"}},
     )
 
     assert response.data.user_netid == "ada"
-    assert response.model_dump(by_alias=True) == {
+    assert response.model_dump() == {
         "data": {
-            "userNetid": "ada",
-            "fullName": "Ada Lovelace",
+            "user_netid": "ada",
+            "full_name": "Ada Lovelace",
         },
     }
 
@@ -128,17 +128,17 @@ def test_data_response_validates_nested_camel_case_payload() -> None:
 def test_item_and_list_responses_keep_canonical_data_envelope() -> None:
     user = UserDto(user_netid="ada", full_name="Ada Lovelace")
 
-    assert ItemResponse[UserDto](data=user).model_dump(by_alias=True) == {
+    assert ItemResponse[UserDto](data=user).model_dump() == {
         "data": {
-            "userNetid": "ada",
-            "fullName": "Ada Lovelace",
+            "user_netid": "ada",
+            "full_name": "Ada Lovelace",
         },
     }
-    assert ListResponse[UserDto](data=[user]).model_dump(by_alias=True) == {
+    assert ListResponse[UserDto](data=[user]).model_dump() == {
         "data": [
             {
-                "userNetid": "ada",
-                "fullName": "Ada Lovelace",
+                "user_netid": "ada",
+                "full_name": "Ada Lovelace",
             },
         ],
     }
@@ -147,39 +147,39 @@ def test_item_and_list_responses_keep_canonical_data_envelope() -> None:
 def test_meta_response_serializes_sibling_meta_object() -> None:
     response = MetaResponse[list[UserDto], ListMeta].model_validate(
         {
-            "data": [{"userNetid": "ada", "fullName": "Ada Lovelace"}],
-            "meta": {"totalCount": 1, "nextCursor": "cursor-1"},
+            "data": [{"user_netid": "ada", "full_name": "Ada Lovelace"}],
+            "meta": {"total_count": 1, "next_cursor": "cursor-1"},
         },
     )
 
-    assert response.model_dump(by_alias=True) == {
+    assert response.model_dump() == {
         "data": [
             {
-                "userNetid": "ada",
-                "fullName": "Ada Lovelace",
+                "user_netid": "ada",
+                "full_name": "Ada Lovelace",
             },
         ],
         "meta": {
-            "totalCount": 1,
-            "nextCursor": "cursor-1",
+            "total_count": 1,
+            "next_cursor": "cursor-1",
         },
     }
 
 
-def test_status_response_supports_camel_case_and_json_serialization() -> None:
+def test_status_response_supports_snake_case_and_json_serialization() -> None:
     parsed = StatusResponse.model_validate(
         {
             "status": "ok",
-            "appName": "grad-service",
+            "app_name": "grad-service",
             "version": "1.2.3",
             "timestamp": "2026-08-03T23:00:00",
         },
     )
 
     assert parsed.app_name == "grad-service"
-    assert json.loads(parsed.model_dump_json(by_alias=True, exclude_none=True)) == {
+    assert json.loads(parsed.model_dump_json(exclude_none=True)) == {
         "status": "ok",
-        "appName": "grad-service",
+        "app_name": "grad-service",
         "version": "1.2.3",
         "timestamp": "2026-08-03T23:00:00",
     }

@@ -18,7 +18,7 @@ class Base(DeclarativeBase):
     pass
 
 
-class CamelModel(BaseModel):
+class AliasGeneratorModel(BaseModel):
     model_config = ConfigDict(
         alias_generator=to_camel,
         populate_by_name=True,
@@ -33,7 +33,7 @@ class CamelCaseExample(Base):
     is_active: Mapped[bool] = mapped_column(nullable=False)
 
 
-class CamelCaseExampleDto(CamelModel):
+class CamelCaseExampleDto(AliasGeneratorModel):
     user_netid: str
     updated_at: datetime
     is_active: bool
@@ -56,7 +56,7 @@ class ValidationAliasExampleDto(BaseModel):
 table_only_example = Table.to_metadata(ValidationAliasExample.__table__, MetaData())
 
 
-def test_assert_models_align_accepts_camel_case_alias_generator() -> None:
+def test_assert_models_align_accepts_alias_generator() -> None:
     assert_models_align(CamelCaseExample, CamelCaseExampleDto)
 
 

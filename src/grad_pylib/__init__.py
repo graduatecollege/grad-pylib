@@ -11,7 +11,7 @@ from grad_pylib.core.logging import REQUEST_ID_HEADER, REQUEST_ID_FIELD, configu
 from grad_pylib.core.multiquery import qualified_columns, section_columns, split_row_sections, read_all_result_sets, cursor_rows_to_dicts, map_row_to_pydantic
 from grad_pylib.core.params import TermCodePath, TermCodeQuery, DepartmentCodePath, DepartmentCodeQuery, UniqueHashPath, SnakeCaseNamePath, TermCode, DepartmentCode, UniqueHash, SnakeCaseName
 from grad_pylib.core.querying import QuerySpec, RawWhereClause, apply_filters, apply_sort, bind_expanding_params, build_where_clause, build_order_by_clause, apply_pagination, apply_query
-from grad_pylib.core.schemas import parse_comma_separated_strings, validate_string_items, parse_validated_comma_separated_strings, parse_json_blob, normalize_email_list, CamelModel, DataResponse, ItemResponse, ListResponse, MetaResponse, StatusResponse, build_status_response
+from grad_pylib.core.schemas import parse_comma_separated_strings, validate_string_items, parse_validated_comma_separated_strings, parse_json_blob, normalize_email_list, BaseDto, DataResponse, ItemResponse, ListResponse, MetaResponse, StatusResponse, build_status_response
 from grad_pylib.core.time import utc_now, utc_from_millis
 from grad_pylib.sqlserver_container import DEFAULT_SQL_SERVER_IMAGE, DEFAULT_SQL_SERVER_CONTAINER_MEMORY_LIMIT, DEFAULT_SQL_SERVER_MEMORY_LIMIT_MB, build_sql_server_container_kwargs
 
@@ -25,8 +25,8 @@ __all__ = [
     "AuthUser",
     "BadRequestError",
     "BaseAppSettings",
+    "BaseDto",
     "BaseUser",
-    "CamelModel",
     "ConflictError",
     "DEFAULT_SQL_SERVER_CONTAINER_MEMORY_LIMIT",
     "DEFAULT_SQL_SERVER_IMAGE",

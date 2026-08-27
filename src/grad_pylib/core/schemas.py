@@ -3,7 +3,6 @@ from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone, UTC
 
 from pydantic import BaseModel, ConfigDict, Field
-from pydantic.alias_generators import to_camel
 
 
 from grad_pylib.core.time import utc_now
@@ -101,16 +100,14 @@ def normalize_email_list(
     return parsed
 
 
-class CamelModel(BaseModel):
+class BaseDto(BaseModel):
     model_config = ConfigDict(
-        alias_generator=to_camel,
-        populate_by_name=True,
         from_attributes=True,
         extra="ignore",
     )
 
 
-class DataResponse[T](CamelModel):
+class DataResponse[T](BaseDto):
     data: T
 
 
@@ -126,7 +123,7 @@ class MetaResponse[T, M](DataResponse[T]):
     meta: M
 
 
-class StatusResponse(CamelModel):
+class StatusResponse(BaseDto):
     status: str = "ok"
     app_name: str | None = None
     version: str | None = None

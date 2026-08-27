@@ -26,10 +26,10 @@ named subclass even when it has no additional fields.
 ### Single-item response
 
 ```python
-from grad_pylib.core.schemas import CamelModel, ItemResponse
+from grad_pylib.core.schemas import BaseDto, ItemResponse
 
 
-class UserDto(CamelModel):
+class UserDto(BaseDto):
     user_netid: str
     full_name: str
 
@@ -53,10 +53,10 @@ class UsersResponse(ListResponse[UserDto]):
 If the list needs metadata, prefer a sibling `meta` object instead of inventing more top-level keys:
 
 ```python
-from grad_pylib.core.schemas import CamelModel, MetaResponse
+from grad_pylib.core.schemas import BaseDto, MetaResponse
 
 
-class UsersMeta(CamelModel):
+class UsersMeta(BaseDto):
     total_count: int
     next_cursor: str | None = None
 
