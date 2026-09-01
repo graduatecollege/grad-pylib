@@ -36,8 +36,8 @@ test = [
 dev = [
     "sqlacodegen==4.0.4",
     "pymssql==2.3.13",
-    "ty==0.0.74",
-    "ruff==0.16.4",
+    "ty==0.0.75",
+    "ruff==0.16.5",
 ]
 
 [project.optional-dependencies]
@@ -52,8 +52,8 @@ test = [
 dev = [
     "sqlacodegen==4.0.4",
     "pymssql==2.3.13",
-    "ty==0.0.74",
-    "ruff==0.16.4",
+    "ty==0.0.75",
+    "ruff==0.16.5",
 ]
 
 [tool.uv]
