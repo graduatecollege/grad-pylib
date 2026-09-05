@@ -1,8 +1,9 @@
 from collections.abc import Generator
 from dataclasses import dataclass
+from typing import Annotated, Any
 
 import pytest
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 from sqlalchemy import Integer, String, create_engine, inspect as sa_inspect
@@ -227,11 +228,11 @@ def test_named_databases_registers_and_looks_up_runtimes(runtime_spy: RuntimeSpy
     assert databases.default_name == "app"
     assert databases.default is databases["app"]
     assert databases.database(" app ") is databases["app"]
-    assert databases.get_runtime() is databases.get_runtime("app")
-    assert isinstance(databases.get_runtime("app"), DatabaseRuntime)
+    assert databases.get_runtime() is databases["app"].runtime
+    assert isinstance(databases["app"].runtime, DatabaseRuntime)
 
     app_engine = databases.get_engine()
-    codebook_engine = databases.get_engine("codebook")
+    codebook_engine = databases["codebook"].get_engine()
 
     assert app_engine is databases["app"].get_engine()
     assert codebook_engine is databases["codebook"].get_engine()
@@ -316,21 +317,82 @@ def test_named_databases_get_background_session_closes_session(runtime_spy: Runt
     assert session_obj.closed
 
 
-def test_named_databases_session_dependency_works_with_fastapi(runtime_spy: RuntimeSpy) -> None:
-    databases = NamedDatabases({"app": lambda: "mssql+pyodbc://example"}, default_name="app")
-    DbSession = databases.session_dependency()
+@pytest.mark.parametrize("database_name", [None, "codebook"])
+def test_named_databases_session_dependency_works_with_fastapi(
+        runtime_spy: RuntimeSpy, database_name: str | None,
+) -> None:
+    databases = NamedDatabases(
+        {"app": lambda: "mssql+pyodbc://app", "codebook": lambda: "mssql+pyodbc://codebook"},
+        default_name="app",
+    )
+    DbSession = databases.session_dependency(database_name)
     app = FastAPI()
 
     @app.get("/")
+    @app.get("/{name}")
     def read_root(session: DbSession) -> dict[str, bool]:
         return {"is_dummy_session": isinstance(session, DummySession)}
 
     with TestClient(app) as client:
-        response = client.get("/")
+        for url in ("/", "/?name=app", "/?name=codebook", "/?name=missing", "/missing"):
+            response = client.get(url)
+            assert response.status_code == 200
+            assert response.json() == {"is_dummy_session": True}
 
-    assert response.status_code == 200
-    assert response.json() == {"is_dummy_session": True}
-    assert runtime_spy.sessions[0].closed
+    operation = app.openapi()["paths"]["/"]["get"]
+    assert not operation.get("parameters")
+    assert "requestBody" not in operation
+    assert len(runtime_spy.create_engine_calls) == 1
+    assert runtime_spy.create_engine_calls[0][0] == f"mssql+pyodbc://{database_name or 'app'}"
+    assert all(session.closed for session in runtime_spy.sessions)
+
+
+@pytest.mark.parametrize(
+    ("database_name", "getter"),
+    [
+        (None, "get_runtime"),
+        (None, "get_engine"),
+        (None, "get_session"),
+        (None, "get_background_session"),
+        ("codebook", "get_engine"),
+        ("codebook", "get_session"),
+        ("codebook", "get_background_session"),
+    ],
+)
+def test_database_getters_do_not_accept_request_parameters(
+        runtime_spy: RuntimeSpy, getter: str, database_name: str | None,
+) -> None:
+    databases = NamedDatabases(
+        {"app": lambda: "mssql+pyodbc://app", "codebook": lambda: "mssql+pyodbc://codebook"},
+        default_name="app",
+    )
+    target = databases if database_name is None else databases[database_name]
+    dependency = getattr(target, getter)
+    DatabaseDependency = Annotated[Any, Depends(dependency)]
+    app = FastAPI()
+
+    @app.get("/")
+    @app.get("/{name}")
+    def read_root(value: DatabaseDependency) -> dict[str, bool]:
+        if getter == "get_runtime":
+            value.get_engine()
+        elif getter == "get_background_session":
+            with value as session:
+                assert isinstance(session, DummySession)
+        return {"resolved": True}
+
+    with TestClient(app) as client:
+        for url in ("/", "/?name=app", "/?name=codebook", "/?name=missing", "/missing"):
+            response = client.get(url)
+            assert response.status_code == 200
+            assert response.json() == {"resolved": True}
+
+    operation = app.openapi()["paths"]["/"]["get"]
+    assert not operation.get("parameters")
+    assert "requestBody" not in operation
+    assert len(runtime_spy.create_engine_calls) == 1
+    assert runtime_spy.create_engine_calls[0][0] == f"mssql+pyodbc://{database_name or 'app'}"
+    assert all(session.closed for session in runtime_spy.sessions)
 
 
 def test_orm_upsert_applies_insert_only_fields_on_insert(session: Session) -> None:

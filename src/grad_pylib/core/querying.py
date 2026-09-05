@@ -57,6 +57,15 @@ _NULL_FILTER_OPERATORS = frozenset({"isnull", "notnull"})
 _GENERATED_PARAM_PREFIX = "__grad_pylib_filter_"
 
 
+@dataclass(frozen=True, slots=True)
+class _NormalizedFilter:
+    index: int
+    field: str
+    column: Column
+    operator: str
+    value: Any
+
+
 class QuerySpec:
     """Declares which columns may be filtered and sorted for an endpoint/service.
 
@@ -99,19 +108,24 @@ class RawWhereClause:
         """Bind this clause's parameters onto ``query``.
 
         Any ``IN`` parameters produced by :func:`build_where_clause` are marked as
-        SQLAlchemy expanding parameters automatically.
+        SQLAlchemy expanding parameters automatically. Existing values or
+        callables for generated parameters raise ``ValueError``.
         """
-        query = bind_expanding_params(query, self.expanding_params)
-        existing_bindparams = query._bindparams
+        # Expansion replaces bind parameters, so inspect the original bindings first.
         collisions = {
             name
-            for name in self.params
-            if name in existing_bindparams
-            and existing_bindparams[name].value is not None
+            for name, parameter in query._bindparams.items()
+            if name in self.params
+            and (
+                not parameter.required
+                or parameter.value is not None
+                or parameter.callable is not None
+            )
         }
         if collisions:
             names = ", ".join(sorted(collisions))
             raise ValueError(f"Generated query parameters already have values: {names}.")
+        query = bind_expanding_params(query, self.expanding_params)
         return query.params(**self.params)
 
 
@@ -130,10 +144,6 @@ def _validate_requested_fields(
     for field in unique_fields:
         if field not in allowed_fields:
             raise BadRequestError(f"{action} by '{field}' is not supported.")
-    if len(unique_fields) > len(allowed_fields):
-        raise BadRequestError(
-            f"Too many {action.lower()} fields requested; at most {len(allowed_fields)} field(s) are allowed."
-        )
     return unique_fields
 
 
@@ -164,17 +174,10 @@ def _matches_null(operator: str, value: Any) -> bool:
     return wants_null if operator == "isnull" else not wants_null
 
 
-def apply_filters[T: tuple[Any, ...]](
-        stmt: Select[T], spec: QuerySpec, filters: Mapping[str, Any] | None
-) -> Select[T]:
-    """Apply ``WHERE`` clauses for the supplied filters.
-
-    Filter keys use a ``field`` or ``field__operator`` convention. Values that
-    are ``None`` are ignored so callers may pass optional query parameters
-    directly. Unknown fields or operators raise :class:`BadRequestError`.
-    """
-    if not filters:
-        return stmt
+def _normalize_filters(
+        spec: QuerySpec, filters: Mapping[str, Any] | None
+) -> Iterator[_NormalizedFilter]:
+    filters = filters or {}
     _validate_requested_fields(
         (
             _parse_filter_key(key)[0]
@@ -184,24 +187,45 @@ def apply_filters[T: tuple[Any, ...]](
         spec.filterable,
         action="Filtering",
     )
-    for key, value in filters.items():
+    # Keep original positions for raw bind names, including skipped None values.
+    for index, (key, value) in enumerate(filters.items(), start=1):
         if value is None:
             continue
         field, operator = _parse_filter_key(key)
-        column = spec.filterable[field]
+        if operator in _NULL_FILTER_OPERATORS:
+            operator = "isnull" if _matches_null(operator, value) else "notnull"
+            value = None
+        elif operator == "in":
+            value = _coerce_in_values(value)
+        elif operator not in _COLUMN_FILTER_OPERATORS:
+            raise BadRequestError(f"Filter operator '{operator}' is not supported.")
+        yield _NormalizedFilter(index, field, spec.filterable[field], operator, value)
+
+
+def apply_filters[T: tuple[Any, ...]](
+        stmt: Select[T], spec: QuerySpec, filters: Mapping[str, Any] | None
+) -> Select[T]:
+    """Apply ``WHERE`` clauses for the supplied filters.
+
+    Filter keys use a ``field`` or ``field__operator`` convention. Values that
+    are ``None`` are ignored so callers may pass optional query parameters
+    directly. Unknown fields or operators raise :class:`BadRequestError`.
+    """
+    for normalized in _normalize_filters(spec, filters):
+        column, operator, value = (
+            normalized.column, normalized.operator, normalized.value
+        )
         if operator in _NULL_FILTER_OPERATORS:
             stmt = stmt.where(
                 column.is_(None)
-                if _matches_null(operator, value)
+                if operator == "isnull"
                 else column.is_not(None)
             )
             continue
         if operator == "in":
-            stmt = stmt.where(column.in_(_coerce_in_values(value)))
+            stmt = stmt.where(column.in_(value))
             continue
-        builder = _COLUMN_FILTER_OPERATORS.get(operator)
-        if builder is None:
-            raise BadRequestError(f"Filter operator '{operator}' is not supported.")
+        builder = _COLUMN_FILTER_OPERATORS[operator]
         stmt = stmt.where(builder(column, value))
     return stmt
 
@@ -283,7 +307,6 @@ def build_where_clause(
     fragments. ``IN`` filters always use expanding parameters so callers can bind
     the returned clause directly via :meth:`RawWhereClause.bind`.
     """
-    filters = filters or {}
     clauses = [clause.strip() for clause in fixed_clauses if clause.strip()]
     if any(_GENERATED_PARAM_PREFIX in clause for clause in clauses):
         raise ValueError(
@@ -293,47 +316,26 @@ def build_where_clause(
     if not filters and not clauses:
         return RawWhereClause("", {})
 
-    _validate_requested_fields(
-        (
-            _parse_filter_key(key)[0]
-            for key, value in filters.items()
-            if value is not None
-        ),
-        spec.filterable,
-        action="Filtering",
-    )
-
     params: dict[str, Any] = {}
     expanding_params: list[str] = []
-    for index, (key, value) in enumerate(filters.items(), start=1):
-        if value is None:
-            continue
-        field, operator = _parse_filter_key(key)
-        column = spec.filterable[field]
-
-        column_name = _raw_column_name(field, column)
-        operator_sql = _RAW_FILTER_OPERATORS.get(operator)
-
+    for normalized in _normalize_filters(spec, filters):
+        column_name = _raw_column_name(normalized.field, normalized.column)
+        operator = normalized.operator
         if operator in _NULL_FILTER_OPERATORS:
             clauses.append(
-                f"{column_name} {'IS NULL' if _matches_null(operator, value) else 'IS NOT NULL'}"
+                f"{column_name} {'IS NULL' if operator == 'isnull' else 'IS NOT NULL'}"
             )
             continue
 
-        if operator_sql is not None:
-            param_name = f"{_GENERATED_PARAM_PREFIX}{index}"
-            clauses.append(f"{column_name} {operator_sql} :{param_name}")
-            params[param_name] = value
-            continue
-
+        param_name = f"{_GENERATED_PARAM_PREFIX}{normalized.index}"
+        params[param_name] = normalized.value
         if operator == "in":
-            param_name = f"{_GENERATED_PARAM_PREFIX}{index}"
             clauses.append(f"{column_name} IN :{param_name}")
-            params[param_name] = _coerce_in_values(value)
             expanding_params.append(param_name)
-            continue
-
-        raise BadRequestError(f"Filter operator '{operator}' is not supported.")
+        else:
+            clauses.append(
+                f"{column_name} {_RAW_FILTER_OPERATORS[operator]} :{param_name}"
+            )
 
     if not clauses:
         return RawWhereClause("", {})

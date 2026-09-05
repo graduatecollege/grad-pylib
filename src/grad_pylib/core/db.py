@@ -292,24 +292,24 @@ class NamedDatabases:
         except KeyError as exc:
             raise KeyError(f"Unknown database: {name!r}") from exc
 
-    def get_runtime(self, name: str | None = None) -> DatabaseRuntime:
-        """Return the selected runtime, using the configured default when `name` is omitted."""
-        return self._database_or_default(name).runtime
+    def get_runtime(self) -> DatabaseRuntime:
+        """Return the default runtime without accepting request-bound parameters."""
+        return self.default.runtime
 
-    def get_engine(self, name: str | None = None) -> Engine:
-        """Return the selected shared engine, defaulting to the configured application database."""
-        return self._database_or_default(name).get_engine()
+    def get_engine(self) -> Engine:
+        """Return the default engine without accepting request-bound parameters."""
+        return self.default.get_engine()
 
-    def get_session(self, name: str | None = None) -> Generator[Session]:
-        """Yield a request-scoped session for the selected or default database."""
-        yield from self._database_or_default(name).get_session()
+    def get_session(self) -> Generator[Session]:
+        """Yield a default database session without accepting request-bound parameters."""
+        yield from self.default.get_session()
 
-    def get_background_session(self, name: str | None = None) -> AbstractContextManager[Session]:
-        """Return a context-managed session for selected database background work."""
-        return self._database_or_default(name).get_background_session()
+    def get_background_session(self) -> AbstractContextManager[Session]:
+        """Return a default database session context manager with no request-bound parameters."""
+        return self.default.get_background_session()
 
     def session_dependency(self, name: str | None = None) -> Any:
-        """Return the FastAPI session annotation for the selected or default database."""
+        """Bind a database at setup time and return its parameterless FastAPI session annotation."""
         return self._database_or_default(name).session_dependency()
 
 

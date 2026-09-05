@@ -15,6 +15,13 @@ Filtering parameters use a `field` or `field__operator` naming convention:
 Supported filter operators are `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `like`,
 `ilike`, `in`, `isnull`, and `notnull`.
 
+Both query paths share filter normalization: field/operator validation, skipping
+`None` values, coercing scalar or collection `in` values to nonempty lists, and
+coercing null-check booleans. SQL rendering stays backend-specific: Core builds
+SQLAlchemy expressions compiled for the selected dialect; raw SQL emits explicit
+SQL operators and bound parameters (including literal `ILIKE`, which requires
+database support).
+
 `isnull` and `notnull` expect a boolean value. For example,
 `reviewed_at__isnull=true` produces `reviewed_at IS NULL`, while
 `reviewed_at__isnull=false` and `reviewed_at__notnull=true` both produce
@@ -38,6 +45,7 @@ spec = QuerySpec(
     filterable={
         "department_code": Award.department_code,
         "requested_amount": Award.requested_amount,
+        "reviewed_at": Award.reviewed_at,
     },
     sortable={
         "department_code": Award.department_code,
@@ -77,6 +85,7 @@ lookup_spec = QuerySpec(
     filterable={
         "department": awards.c.department,
         "degree_program": awards.c.degree_program,
+        "reviewed_at": awards.c.reviewed_at,
     },
 )
 
@@ -98,7 +107,7 @@ query = where.bind(
     text(
         f"""
         SELECT degree_program, department
-        FROM degree_program_lookup
+        FROM awards
         {where.sql}
         """
     )
@@ -114,7 +123,14 @@ query = where.bind(
 
 Use `fixed_clauses=` for developer-authored predicates that should always be
 included while preserving the convenience of getting either `""` or a complete
-`WHERE ...` clause back.
+`WHERE ...` clause back. Each predicate is parenthesized before joining with
+`AND`, so predicates containing `OR` retain their grouping.
+
+Parameter names beginning with `__grad_pylib_filter_` are reserved for generated
+filters; do not use them in fixed predicates or surrounding SQL. `bind(query)`
+rejects generated parameters that already have a value (including `None`) or a
+callable, before installing expanding parameters. Fixed parameters with distinct
+names may be bound before or after calling `bind(query)`.
 
 Keep domain decisions in the application layer, outside `grad_pylib`, such as:
 
