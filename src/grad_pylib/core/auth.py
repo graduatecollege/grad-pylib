@@ -7,10 +7,12 @@ from typing import Annotated, Any, Protocol, Self
 
 import structlog
 from fastapi import Depends, HTTPException, Request, Security, status
+from fastapi.security import SecurityScopes
 from fastapi_azure_auth import SingleTenantAzureAuthorizationCodeBearer
 from fastapi_azure_auth.user import User as AzureUser
 from pydantic import AfterValidator, BaseModel, ConfigDict, ValidationInfo
 from sqlalchemy.orm import Session
+from starlette.requests import HTTPConnection
 
 from grad_pylib.core.config import BaseAppSettings
 
@@ -329,6 +331,23 @@ def with_azure_development_placeholders[SettingsT: BaseAppSettings](
     })
 
 
+class _AuditedAzureAuthorizationCodeBearer(SingleTenantAzureAuthorizationCodeBearer):
+    # The upstream bearer validator is async; application policy dependencies stay synchronous.
+    async def __call__(self, request: HTTPConnection, security_scopes: SecurityScopes) -> AzureUser | None:
+        try:
+            return await super().__call__(request, security_scopes)
+        except HTTPException as error:
+            _audit_logger.warning(
+                "auth.failed",
+                mechanism=MECHANISM_AZURE_AD,
+                reason="azure_authentication_rejected",
+                status_code=error.status_code,
+                client_host=client_host(request),
+                **_request_fields(request),
+            )
+            raise
+
+
 def build_azure_scheme(settings: BaseAppSettings) -> SingleTenantAzureAuthorizationCodeBearer:
     """Build the single-tenant Azure AD bearer scheme from configured application settings.
 
@@ -340,7 +359,7 @@ def build_azure_scheme(settings: BaseAppSettings) -> SingleTenantAzureAuthorizat
         raise ValueError(
             "Azure AD client ID and tenant ID must be set in the environment or settings."
         )
-    return SingleTenantAzureAuthorizationCodeBearer(
+    return _AuditedAzureAuthorizationCodeBearer(
         app_client_id=settings.azure_ad_client_id,
         tenant_id=settings.azure_ad_tenant_id,
         auto_error=not settings.is_development,
@@ -488,7 +507,7 @@ def azure_user_to_current_user(
     return claims_to_user(claims)
 
 
-def client_host(request: Request) -> str | None:
+def client_host(request: HTTPConnection) -> str | None:
     """Return the direct peer address, deliberately ignoring forwarding headers."""
     client = request.scope.get("client")
     if not client:
@@ -536,7 +555,7 @@ def subject_of(user: AuthUser) -> str | None:
     return getattr(user, "netid", None) or getattr(user, "email", None) or None
 
 
-def _request_fields(request: Request) -> dict[str, Any]:
+def _request_fields(request: HTTPConnection) -> dict[str, Any]:
     return {
         "http_method": request.scope.get("method"),
         "http_path": request.scope.get("path"),
@@ -599,9 +618,9 @@ def require_policy(
 ):
     """Build a FastAPI dependency that authenticates a request and enforces `policy`.
 
-    Azure AD users are converted to the application's immutable user model and optionally
-    role-overridden before authorization. Every grant, denial, and authentication failure is
-    audited through `grad_pylib.audit.auth`.
+    Azure AD tokens must contain every configured delegated scope before users are converted
+    to the application's immutable user model and optionally role-overridden for authorization.
+    Every grant, denial, and authentication failure is audited through `grad_pylib.audit.auth`.
 
     The development API key is a loopback-only, caller-role-selected bypass intended only for
     development and automated tests. It is enabled only when the application says so in a
@@ -625,6 +644,8 @@ def require_policy(
 
     if required_roles is None:
         raise ValueError(f"Policy '{policy}' is not configured.")
+
+    required_scope = get_settings().azure_ad_scope_description
 
     def authenticate_with_api_key(request: Request, session: Any, api_key: str) -> AuthUser:
         settings = get_settings()
@@ -665,7 +686,7 @@ def require_policy(
     def dependency(
             request: Request,
             session: Annotated[Session, Depends(get_session)],
-            azure_user: Annotated[AzureUser | None, Security(azure_scheme)],
+            azure_user: Annotated[AzureUser | None, Security(azure_scheme, scopes=[required_scope])],
     ) -> AuthUser:
         api_key = request.headers.get(config.api_key_header)
 

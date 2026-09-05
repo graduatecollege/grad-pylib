@@ -33,11 +33,18 @@ CodebookDbSession = codebook_db.session_dependency()
 get_codebook_background_session = codebook_db.get_background_session
 ```
 
-`default_name` is optional. When it is set, the instance-level convenience helpers use that
-database by default, which keeps FastAPI wiring terse without relying on a hidden library-global
-singleton. For named access, keep using `databases["codebook"]` or pass the name directly to
-`get_engine()`, `get_session()`, `get_background_session()`, `get_runtime()`, and
-`session_dependency()`.
+`default_name` is optional. When it is set, the instance-level `get_*` helpers always use that
+database. These helpers are parameterless so FastAPI cannot bind query or path parameters to
+database selection, including when using `Depends(databases.get_session)` directly.
+
+Select other databases explicitly in application setup with `databases["codebook"]`. Use its
+`get_engine()`, `get_session()`, `get_background_session()`, or `runtime` attribute. Alternatively,
+`databases.session_dependency("codebook")` creates a session annotation bound to that database at
+setup time; it does not accept database selection from the request.
+
+Calls such as `databases.get_session("codebook")` are no longer supported. Replace them with
+`databases["codebook"].get_session()`; use the same pattern for engine and background-session
+getters, and replace `databases.get_runtime("codebook")` with `databases["codebook"].runtime`.
 
 That maps well to a typical FastAPI module layout:
 
