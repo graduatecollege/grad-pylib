@@ -342,23 +342,25 @@ def parse_mssql_error(e: DBAPIError, idempotency_markers: tuple[str, ...] = ()) 
 
     This defensive parser is safe for request handlers, scripts, and retry loops. Duplicate-key
     errors count as idempotent only when their driver message contains a supplied marker.
+    The first native diagnostic code takes precedence over subsequent informational diagnostics.
     """
     if not e.orig or not hasattr(e.orig, "args") or len(e.orig.args) < 2:
         return ParsedSqlError(SqlServerErrorType.UNKNOWN, 0, '', False)
 
-    # FIX 1: Extract ONLY the text payload element, not the entire tuple string representation
     driver_message = str(e.orig.args[1])
     sql_state = str(e.orig.args[0])
 
-    # Extract the native trailing token: "(ErrorNumber) (CursorFunction)"
-    match = re.search(r"\((\d+)\)\s+\([A-Za-z0-9_]+\)$", driver_message)
+    # ODBC may append more diagnostics after the primary error, such as SQL Server code 3621.
+    match = re.search(
+        r"\((\d+)\)(?:\s+\(SQL[A-Za-z0-9_]+\))?\s*(?=;\s*\[[A-Z0-9]{5}]|\Z)",
+        driver_message,
+    )
     native_code = int(match.group(1)) if match else None
 
-    # Check for transient conditions (Both should be retried!)
     if native_code == 1205:
         return ParsedSqlError(SqlServerErrorType.DEADLOCK, native_code, driver_message, False)
 
-    if native_code == 1222:  # <-- Added lock timeout handling
+    if native_code == 1222:
         return ParsedSqlError(SqlServerErrorType.LOCK_TIMEOUT, native_code, driver_message, False)
 
     if native_code == 3960:
@@ -367,7 +369,6 @@ def parse_mssql_error(e: DBAPIError, idempotency_markers: tuple[str, ...] = ()) 
     if sql_state != '23000':
         return ParsedSqlError(SqlServerErrorType.UNKNOWN, native_code, driver_message, False)
 
-    # 4. Determine structural constraint classification
     if native_code in (2601, 2627):
         is_idempotent = any(marker in driver_message for marker in idempotency_markers)
         return ParsedSqlError(SqlServerErrorType.DUPLICATE_KEY, native_code, driver_message, is_idempotent)
@@ -388,11 +389,6 @@ def _is_transient_conflict(exc: BaseException) -> bool:
 
     error = parse_mssql_error(exc)
 
-    if error.error_type == SqlServerErrorType.DUPLICATE_KEY:
-        # ONLY retry if the duplicate error happened on our specific high-race critical table
-        return error.is_idempotency_hit
-
-    # Retrying both isolation locks AND concurrent race states
     return error.error_type in {
         SqlServerErrorType.DEADLOCK,
         SqlServerErrorType.LOCK_TIMEOUT,
@@ -420,7 +416,7 @@ def retry_on_transient_conflict[**P, T](func: Callable[P, T]) -> Callable[P, T]:
     Deadlocks, lock timeouts, and RCSI conflicts on concurrent transactions can prevent this
     attempt from safely completing when the request itself may be valid. A short retry lets
     the competing transaction finish and reruns the operation against current database state.
-    Decorated calls retry up to three times, waiting 50 then 100 milliseconds. Before each retry,
+    Decorated calls make up to three attempts, waiting 50 then 100 milliseconds. Before each retry,
     a passed `Session` is rolled back so it can be used again; the final database error is
     re-raised. Use only for operations that are safe to repeat, and pass the session as an
     argument so failed transactions are reset.
@@ -437,19 +433,19 @@ def retry_on_transient_conflict[**P, T](func: Callable[P, T]) -> Callable[P, T]:
 def _coerce_model_data(
         data_source: dict[str, Any] | BaseModel | DeclarativeBase,
         *,
-        all_columns: list[str],
+        attribute_names: set[str],
         parameter_name: str,
 ) -> dict[str, Any]:
     if isinstance(data_source, BaseModel):
         data = data_source.model_dump(exclude_unset=True)
     elif isinstance(data_source, DeclarativeBase):
-        data = {key: value for key, value in data_source.__dict__.items() if key in all_columns}
+        data = data_source.__dict__
     elif isinstance(data_source, dict):
         data = data_source
     else:
         raise TypeError(f"{parameter_name} must be a dict, Pydantic model, or DeclarativeBase instance")
 
-    return {key: value for key, value in data.items() if key in all_columns}
+    return {key: value for key, value in data.items() if key in attribute_names}
 
 
 def orm_upsert[ModelT: DeclarativeBase](
@@ -464,15 +460,15 @@ def orm_upsert[ModelT: DeclarativeBase](
     The lookup uses update and hold locks to serialize competing upserts. Payloads may be dicts,
     Pydantic models, or generated ORM objects; `insert_only` values are applied exclusively to
     new rows and never overwrite an existing record. This flushes but does not commit.
+    Payload keys must use mapped ORM attribute names, not physical database column names.
     """
-    # Inspect the core database model to find its primary keys
     mapper = inspect(model_cls)
-    pk_names = [col.name for col in mapper.primary_key]
-    all_columns = [col.name for col in mapper.columns]
+    pk_names = [mapper.get_property_by_column(col).key for col in mapper.primary_key]
+    attribute_names = {prop.key for prop in mapper.column_attrs}
 
     data = _coerce_model_data(
         data_source,
-        all_columns=all_columns,
+        attribute_names=attribute_names,
         parameter_name="data_source",
     )
     insert_only_data = (
@@ -480,7 +476,7 @@ def orm_upsert[ModelT: DeclarativeBase](
         if insert_only is None
         else _coerce_model_data(
             insert_only,
-            all_columns=all_columns,
+            attribute_names=attribute_names,
             parameter_name="insert_only",
         )
     )
@@ -512,7 +508,6 @@ def orm_upsert[ModelT: DeclarativeBase](
         record = model_cls(**data, **insert_only_data)
         db.add(record)
 
-    # Roundtrip 2: Commit changes securely
     db.flush()
     return record
 
@@ -525,6 +520,7 @@ def select_exclude[BaseT: DeclarativeBase | Table](
 
     Core statements select only the retained columns. ORM statements return model instances with
     excluded mapped columns deferred, preventing their data from being loaded until accessed.
+    Raises `ValueError` if no columns remain. ORM deferral is not a data-redaction boundary.
     """
     # 1. Handle Core Table Objects
     if isinstance(model_or_table, Table):
@@ -532,6 +528,8 @@ def select_exclude[BaseT: DeclarativeBase | Table](
             col for col in model_or_table.c
             if col.name not in exclude
         ]
+        if not columns_to_select:
+            raise ValueError("select_exclude must retain at least one column.")
         return select(*columns_to_select)
 
     # 2. Handle ORM Model Classes
@@ -541,5 +539,7 @@ def select_exclude[BaseT: DeclarativeBase | Table](
         for col in all_columns
         if col.key not in exclude
     ]
+    if not include_attrs:
+        raise ValueError("select_exclude must retain at least one column.")
 
     return select(model_or_table).options(load_only(*include_attrs))
