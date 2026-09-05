@@ -1,10 +1,15 @@
 import asyncio
 import dataclasses
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Annotated
+from unittest.mock import AsyncMock
 
+import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI, HTTPException
+from fastapi.security import SecurityScopes
 from fastapi.testclient import TestClient
 from fastapi_azure_auth import SingleTenantAzureAuthorizationCodeBearer
 from pydantic import ValidationError
@@ -580,6 +585,127 @@ def test_auth_runtime_depends_on_works_in_fastapi_routes() -> None:
         "effective_roles": ["Auditor"],
         "request_state_email": "user@illinois.edu",
     }
+
+
+@pytest.mark.parametrize(
+    ("scopes", "roles", "token_kind", "expected_status"),
+    [
+        (None, ["Auditor"], "signed", 403),
+        ("Other.Access", ["Auditor"], "signed", 403),
+        ("Hooding.Access.Extra", ["Auditor"], "signed", 403),
+        ("api://client-id/Hooding.Access", ["Auditor"], "signed", 403),
+        (["Hooding.Access"], ["Auditor"], "signed", 403),
+        ("Hooding.Access", ["Auditor"], "signed", 200),
+        ("Other.Access Hooding.Access", ["Auditor"], "signed", 200),
+        ("Hooding.Access", ["Department"], "signed", 403),
+        ("Hooding.Access", ["Auditor"], "missing", 401),
+        ("Hooding.Access", ["Auditor"], "malformed", 401),
+        ("Hooding.Access", ["Auditor"], "expired", 401),
+    ],
+)
+def test_auth_runtime_enforces_configured_scopes_and_roles(
+    scopes: str | list[str] | None,
+    roles: list[str],
+    token_kind: str,
+    expected_status: int,
+    monkeypatch: pytest.MonkeyPatch,
+    audit_recorder: _AuditRecorder,
+) -> None:
+    settings = BaseAppSettings(
+        environment="production",
+        azure_ad_client_id="client-id",
+        azure_ad_tenant_id="tenant-id",
+        azure_ad_scope_description="Hooding.Access",
+    )
+    auth = AuthAppFactory.configure(
+        config=_CONFIG,
+        get_settings=lambda: settings,
+        get_session=lambda: None,
+        forbidden_error_factory=lambda detail: HTTPException(status_code=403, detail=detail),
+        claims_to_user=lambda claims: default_claims_to_user(claims, _CONFIG.valid_roles),
+    ).runtime()
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    issuer = "https://login.microsoftonline.com/tenant-id/v2.0"
+    auth.azure_scheme.openid_config.issuer = issuer
+    auth.azure_scheme.openid_config.signing_keys = {"test-key": key.public_key()}
+    monkeypatch.setattr(auth.azure_scheme.openid_config, "load_config", AsyncMock())
+    now = datetime.now(UTC)
+    claims: dict[str, object] = {
+        "iss": issuer,
+        "aud": "client-id",
+        "sub": "test-user",
+        "iat": now - timedelta(minutes=10),
+        "nbf": now - timedelta(minutes=10),
+        "exp": now + timedelta(minutes=-5 if token_kind == "expired" else 5),
+        "ver": "2.0",
+        "upn": "user@illinois.edu",
+        "roles": roles,
+    }
+    if scopes is not None:
+        claims["scp"] = scopes
+
+    token = jwt.encode(claims, key, algorithm="RS256", headers={"kid": "test-key"})
+    if token_kind == "malformed":
+        token = "not-a-jwt"
+    headers = {} if token_kind == "missing" else {"Authorization": f"Bearer {token}"}
+    app = FastAPI()
+
+    @app.get("/me")
+    def read_me(user: Annotated[BaseUser, auth.depends_on("Auditor")]) -> dict[str, str]:
+        return {"email": user.email}
+
+    with TestClient(app) as client:
+        response = client.get("/me", headers=headers)
+
+    assert response.status_code == expected_status
+    assert auth.azure_scheme.auto_error is True
+    azure_rejected = expected_status != 200 and roles == ["Auditor"]
+    failures = [fields for _, event, fields in audit_recorder.events if event == "auth.failed"]
+    if azure_rejected:
+        assert failures == [{
+            "mechanism": "azure_ad",
+            "reason": "azure_authentication_rejected",
+            "status_code": expected_status,
+            "client_host": "testclient",
+            "http_method": "GET",
+            "http_path": "/me",
+        }]
+        assert response.headers["www-authenticate"].startswith("Bearer")
+    else:
+        assert failures == []
+    schema = app.openapi()
+    flow = schema["components"]["securitySchemes"][auth.azure_scheme.scheme_name]["flows"]["authorizationCode"]
+    assert flow["scopes"] == {"api://client-id/Hooding.Access": "Hooding.Access"}
+    assert schema["paths"]["/me"]["get"]["security"] == [
+        {auth.azure_scheme.scheme_name: ["Hooding.Access"]},
+    ]
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403])
+def test_azure_audit_preserves_original_exception(
+    status_code: int,
+    monkeypatch: pytest.MonkeyPatch,
+    audit_recorder: _AuditRecorder,
+) -> None:
+    error = HTTPException(
+        status_code=status_code,
+        detail={"error": "original-error"},
+        headers={"WWW-Authenticate": "Bearer original-challenge"},
+    )
+    monkeypatch.setattr(SingleTenantAzureAuthorizationCodeBearer, "__call__", AsyncMock(side_effect=error))
+    scheme = auth_module.build_azure_scheme(BaseAppSettings(
+        environment="production",
+        azure_ad_client_id="client-id",
+        azure_ad_tenant_id="tenant-id",
+    ))
+
+    with pytest.raises(HTTPException) as raised:
+        asyncio.run(scheme(_request(api_key=None), SecurityScopes(scopes=["Hooding.Access"])))
+
+    assert raised.value is error
+    assert len(audit_recorder.events) == 1
+    assert audit_recorder.events[0][1] == "auth.failed"
+    assert audit_recorder.events[0][2]["status_code"] == status_code
 
 
 def test_auth_app_factory_supports_override_aware_and_override_free_runtimes() -> None:

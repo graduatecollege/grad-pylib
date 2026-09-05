@@ -9,6 +9,18 @@ repetitive pieces most services expose from `core/auth.py`:
 * `require_policy(...)`
 * typed dependencies such as `Annotated[CurrentUser, auth.depends_on("Admin")]`
 
+Azure requests must satisfy both the configured delegated scope and the selected role policy.
+`azure_ad_scope_description` is the short scope name (for example, `Hooding.Access`) required
+in the token's space-separated `scp` claim. `azure_ad_scopes` supplies the full URI for OAuth
+configuration. Scope checks run before application role overrides, so overrides
+cannot compensate for a missing scope. The development API-key bypass is unchanged.
+
+Production keeps Azure's `auto_error=True`. The runtime's bearer validator records rejected
+requests as `auth.failed` events with the HTTP status, method, path, and client host, then
+re-raises the original exception without changing its response. These events omit policy
+and identity fields because rejection occurs before application policy evaluation; they
+do not include tokens, claims, or exception details.
+
 #### Simple one-runtime app
 
 ```python
