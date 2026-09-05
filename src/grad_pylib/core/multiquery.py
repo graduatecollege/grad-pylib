@@ -75,7 +75,7 @@ def map_row_to_pydantic[T: BaseModel](
     Generically maps an un-aliased SQLAlchemy Core Row into a nested Pydantic model.
     Guaranteed collision-proof when multiple tables share duplicate column names.
     """
-    payload = {}
+    payload: dict[str, Any] = {}
     model_fields = target_model.model_fields
 
     # 1. Extract data safely on a per-table basis using table schema boundaries
@@ -113,10 +113,25 @@ def map_row_to_pydantic[T: BaseModel](
         else:
             payload[field_name] = None
 
-    # 2. Extract leftover unmapped columns directly to the root payload (if any)
+    # 2. Extract only result columns outside nested table schemas into the root payload.
     all_mapped_cols = {col for table in nest_mappings.values() for col in table.c}
-    for col, value in row._mapping.items():
-        if col not in all_mapped_cols and hasattr(col, 'name'):
-            payload[col.name] = value
+    result_keys = tuple(row._parent.keys)
+    processed_indexes = set()
+    for result_metadata in row._parent._keymap.values():
+        index = result_metadata[0]
+        if index in processed_indexes:
+            continue
+        processed_indexes.add(index)
+
+        source_keys = result_metadata[2]
+        if any(source_key in all_mapped_cols for source_key in source_keys):
+            continue
+
+        source_key = next(
+            (source_key for source_key in source_keys if source_key in row._mapping),
+            None,
+        )
+        if source_key is not None:
+            payload[result_keys[index]] = row._mapping[source_key]
 
     return target_model.model_validate(payload)
