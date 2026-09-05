@@ -197,28 +197,28 @@ def test_build_where_clause_equality_and_operator_suffix():
     )
     assert (
         where
-        == "WHERE department_code = :department_code_1 AND requested_amount >= :requested_amount_2"
+        == "WHERE (department_code = :__grad_pylib_filter_1) AND (requested_amount >= :__grad_pylib_filter_2)"
     )
-    assert params == {"department_code_1": "1227", "requested_amount_2": 100}
+    assert params == {"__grad_pylib_filter_1": "1227", "__grad_pylib_filter_2": 100}
 
 
 def test_build_where_clause_in_operator():
     clause = build_where_clause(SPEC, {"department_code__in": ["1227", "1234"]})
-    assert clause.sql == "WHERE department_code IN :department_code_1"
-    assert clause.params == {"department_code_1": ["1227", "1234"]}
-    assert clause.expanding_params == ("department_code_1",)
+    assert clause.sql == "WHERE (department_code IN :__grad_pylib_filter_1)"
+    assert clause.params == {"__grad_pylib_filter_1": ["1227", "1234"]}
+    assert clause.expanding_params == ("__grad_pylib_filter_1",)
 
 
 def test_build_where_clause_isnull_true():
     clause = build_where_clause(SPEC, {"requested_amount__isnull": True})
-    assert clause.sql == "WHERE requested_amount IS NULL"
+    assert clause.sql == "WHERE (requested_amount IS NULL)"
     assert clause.params == {}
     assert clause.expanding_params == ()
 
 
 def test_build_where_clause_notnull_true():
     clause = build_where_clause(SPEC, {"requested_amount__notnull": "true"})
-    assert clause.sql == "WHERE requested_amount IS NOT NULL"
+    assert clause.sql == "WHERE (requested_amount IS NOT NULL)"
     assert clause.params == {}
     assert clause.expanding_params == ()
 
@@ -235,15 +235,29 @@ def test_build_where_clause_composes_fixed_clauses():
         fixed_clauses=("term_code = :term_code", "status = :status"),
     )
     assert clause.sql == (
-        "WHERE term_code = :term_code AND status = :status AND department_code = :department_code_1"
+        "WHERE (term_code = :term_code) AND (status = :status) AND (department_code = :__grad_pylib_filter_1)"
     )
-    assert clause.params == {"department_code_1": "1227"}
+    assert clause.params == {"__grad_pylib_filter_1": "1227"}
     assert clause.expanding_params == ()
+
+
+def test_build_where_clause_groups_fixed_or_predicates():
+    clause = build_where_clause(
+        SPEC,
+        None,
+        fixed_clauses=(
+            "owner_id = :user OR is_public = 1",
+            "tenant_id = :tenant",
+        ),
+    )
+    assert clause.sql == (
+        "WHERE (owner_id = :user OR is_public = 1) AND (tenant_id = :tenant)"
+    )
 
 
 def test_build_where_clause_supports_fixed_clauses_without_filters():
     clause = build_where_clause(SPEC, None, fixed_clauses=("term_code = :term_code",))
-    assert clause.sql == "WHERE term_code = :term_code"
+    assert clause.sql == "WHERE (term_code = :term_code)"
     assert clause.params == {}
     assert clause.expanding_params == ()
 
@@ -253,8 +267,38 @@ def test_raw_where_clause_bind_marks_text_clause_for_postcompile_expansion():
     stmt = clause.bind(
         text(f"SELECT department_code FROM foo_nominations {clause.sql}")
     )
-    assert "__[POSTCOMPILE_department_code_1]" in str(stmt)
-    assert stmt.compile().params == {"department_code_1": ["1227", "1234"]}
+    assert "__[POSTCOMPILE___grad_pylib_filter_1]" in str(stmt)
+    assert stmt.compile().params == {"__grad_pylib_filter_1": ["1227", "1234"]}
+
+
+def test_raw_where_clause_bind_preserves_prebound_scope_values():
+    clause = build_where_clause(SPEC, {"department_code": "1227"})
+    stmt = clause.bind(
+        text(f"SELECT * FROM foo_nominations WHERE tenant_id = :tenant_id_1 {clause.sql}")
+        .bindparams(tenant_id_1="trusted-tenant")
+    )
+
+    assert stmt.compile().params == {
+        "tenant_id_1": "trusted-tenant",
+        "__grad_pylib_filter_1": "1227",
+    }
+
+
+def test_raw_where_clause_bind_rejects_generated_parameter_collision():
+    clause = build_where_clause(SPEC, {"department_code": "1227"})
+    stmt = text(clause.sql).bindparams(__grad_pylib_filter_1="trusted-value")
+
+    with pytest.raises(ValueError, match="already have values"):
+        clause.bind(stmt)
+
+
+def test_build_where_clause_rejects_reserved_parameter_namespace():
+    with pytest.raises(ValueError, match="reserved parameter namespace"):
+        build_where_clause(
+            SPEC,
+            {"department_code": "1227"},
+            fixed_clauses=("tenant_id = :__grad_pylib_filter_scope",),
+        )
 
 
 def test_bind_expanding_params_marks_text_clause_for_postcompile_expansion():
@@ -283,8 +327,8 @@ def test_build_where_clause_prefers_database_column_names():
         filterable={"public_name": AliasedColumnModel.python_name},
     )
     clause = build_where_clause(aliased_spec, {"public_name": "value"})
-    assert clause.sql == "WHERE db_name = :public_name_1"
-    assert clause.params == {"public_name_1": "value"}
+    assert clause.sql == "WHERE (db_name = :__grad_pylib_filter_1)"
+    assert clause.params == {"__grad_pylib_filter_1": "value"}
 
 
 def test_build_order_by_clause_multiple_fields():

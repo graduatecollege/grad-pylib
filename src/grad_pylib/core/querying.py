@@ -54,6 +54,7 @@ _RAW_FILTER_OPERATORS: dict[str, str] = {
 }
 
 _NULL_FILTER_OPERATORS = frozenset({"isnull", "notnull"})
+_GENERATED_PARAM_PREFIX = "__grad_pylib_filter_"
 
 
 class QuerySpec:
@@ -101,6 +102,16 @@ class RawWhereClause:
         SQLAlchemy expanding parameters automatically.
         """
         query = bind_expanding_params(query, self.expanding_params)
+        existing_bindparams = query._bindparams
+        collisions = {
+            name
+            for name in self.params
+            if name in existing_bindparams
+            and existing_bindparams[name].value is not None
+        }
+        if collisions:
+            names = ", ".join(sorted(collisions))
+            raise ValueError(f"Generated query parameters already have values: {names}.")
         return query.params(**self.params)
 
 
@@ -274,6 +285,11 @@ def build_where_clause(
     """
     filters = filters or {}
     clauses = [clause.strip() for clause in fixed_clauses if clause.strip()]
+    if any(_GENERATED_PARAM_PREFIX in clause for clause in clauses):
+        raise ValueError(
+            f"Fixed clauses must not use the reserved parameter namespace "
+            f"'{_GENERATED_PARAM_PREFIX}'."
+        )
     if not filters and not clauses:
         return RawWhereClause("", {})
 
@@ -305,13 +321,13 @@ def build_where_clause(
             continue
 
         if operator_sql is not None:
-            param_name = f"{field}_{index}"
+            param_name = f"{_GENERATED_PARAM_PREFIX}{index}"
             clauses.append(f"{column_name} {operator_sql} :{param_name}")
             params[param_name] = value
             continue
 
         if operator == "in":
-            param_name = f"{field}_{index}"
+            param_name = f"{_GENERATED_PARAM_PREFIX}{index}"
             clauses.append(f"{column_name} IN :{param_name}")
             params[param_name] = _coerce_in_values(value)
             expanding_params.append(param_name)
@@ -322,7 +338,9 @@ def build_where_clause(
     if not clauses:
         return RawWhereClause("", {})
     return RawWhereClause(
-        f"WHERE {' AND '.join(clauses)}", params, tuple(expanding_params)
+        f"WHERE {' AND '.join(f'({clause})' for clause in clauses)}",
+        params,
+        tuple(expanding_params),
     )
 
 
