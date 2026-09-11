@@ -1,4 +1,5 @@
 import argparse
+import re
 from collections.abc import Callable
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -15,6 +16,10 @@ from grad_pylib.core.db import resolve_database_url
 _GENERATOR_OPTIONS = {"use_inflect", "nojoined"}
 _DEFAULT_IGNORED_TABLES = {"schema_migrations"}
 _DEFAULT_STRING_COLLATION = "SQL_Latin1_General_CP1_CI_AS"
+_SQL_SERVER_SYSTEM_CONSTRAINT_NAME = re.compile(
+    r"^(?:CK|DF|FK|PK|UQ)__.*__[0-9A-F]{8}(?:[0-9A-F]{8})?$",
+    re.IGNORECASE,
+)
 
 
 class _ColumnRenderer(Protocol):
@@ -52,6 +57,16 @@ def normalize_default_collations(metadata: MetaData, default_string_collation: s
             collation = getattr(column.type, "collation", None)
             if collation == default_string_collation:
                 column.type.collation = None
+
+
+def normalize_sql_server_system_constraint_names(metadata: MetaData) -> None:
+    for table in metadata.tables.values():
+        for constraint in table.constraints:
+            if (
+                    isinstance(constraint.name, str)
+                    and _SQL_SERVER_SYSTEM_CONSTRAINT_NAME.fullmatch(constraint.name)
+            ):
+                constraint.name = None
 
 
 def should_render_non_autoincrement_primary_key(column: object) -> bool:
@@ -173,6 +188,7 @@ def generate_models(
         generator = generator_class(metadata, engine, opts)
         metadata.reflect(engine, None, generator.views_supported, should_reflect_table(effective_ignored_tables))
         normalize_default_collations(metadata, default_string_collation)
+        normalize_sql_server_system_constraint_names(metadata)
         target_path.write_text(generator.generate(), encoding="utf-8")
     finally:
         engine.dispose()

@@ -1,10 +1,22 @@
-from sqlalchemy import Column, ForeignKeyConstraint, Integer, MetaData, String, Table, create_engine
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    ForeignKeyConstraint,
+    Integer,
+    MetaData,
+    PrimaryKeyConstraint,
+    String,
+    Table,
+    UniqueConstraint,
+    create_engine,
+)
 from sqlacodegen.models import ColumnAttribute, ModelClass, RelationshipAttribute, RelationshipType
 from sqlacodegen.generators import DeclarativeGenerator
 
 from grad_pylib.tools.generate_models import (
     generator_with_non_autoincrement_primary_keys,
     mark_secondary_overlapping_relationships_viewonly,
+    normalize_sql_server_system_constraint_names,
 )
 
 
@@ -38,6 +50,33 @@ def test_render_column_skips_autoincrement_false_for_identity_primary_key() -> N
     assert generator.render_column(column, show_name=True, is_table=True) == (
         "Column('id', Integer, primary_key=True, autoincrement=True)"
     )
+
+
+def test_normalize_sql_server_system_constraint_names_removes_generated_suffixes() -> None:
+    metadata = MetaData()
+    Table("parents", metadata, Column("id", Integer, primary_key=True))
+    system_primary_key = Table(
+        "system_primary_key",
+        metadata,
+        Column("id", Integer),
+        PrimaryKeyConstraint("id", name="PK__system_p__3213E83F83C16480"),
+    )
+    children = Table(
+        "children",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("parent_id", Integer),
+        Column("sequence", Integer),
+        ForeignKeyConstraint(["parent_id"], ["parents.id"], name="FK__children__parent__A1B2C3D4"),
+        UniqueConstraint("parent_id", "sequence", name="UQ__children__paren__11223344"),
+        CheckConstraint("sequence > 0", name="CK__children__seque__55667788"),
+        CheckConstraint("id > 0", name="positive_child_id"),
+    )
+
+    normalize_sql_server_system_constraint_names(metadata)
+
+    assert {constraint.name for constraint in children.constraints} == {None, "positive_child_id"}
+    assert system_primary_key.primary_key.name is None
 
 
 def test_mark_secondary_overlapping_relationships_viewonly_prefers_fuller_foreign_key() -> None:
