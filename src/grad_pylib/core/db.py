@@ -319,9 +319,29 @@ class SqlServerErrorType(Enum):
     LOCK_TIMEOUT = "lock_timeout"  # Code 1222
     DUPLICATE_KEY = "duplicate_key"  # Codes 2601, 2627
     FOREIGN_KEY_VIOLATION = "foreign_key"  # Code 547
+    CHECK_CONSTRAINT_VIOLATION = "check_constraint"  # Code 547
     NOT_NULL_VIOLATION = "not_null"  # Code 515
+    DATA_TRUNCATION = "data_truncation"  # Codes 2628, 8152
+    DATA_CONVERSION = "data_conversion"  # Codes 241, 245, 8114
+    ARITHMETIC_OVERFLOW = "arithmetic_overflow"  # Codes 220, 8115
+    DIVIDE_BY_ZERO = "divide_by_zero"  # Code 8134
     RCSI_CONFLICT = "rcsi_conflict"  # Code 3960
+    INVALID_COLUMN = "invalid_column"  # Code 207
+    INVALID_OBJECT = "invalid_object"  # Code 208
+    PERMISSION_DENIED = "permission_denied"  # Code 229
+    LOGIN_FAILED = "login_failed"  # Code 18456
     UNKNOWN = "unknown"
+
+
+_BAD_DATA_ERROR_TYPES = frozenset({
+    SqlServerErrorType.DUPLICATE_KEY,
+    SqlServerErrorType.FOREIGN_KEY_VIOLATION,
+    SqlServerErrorType.CHECK_CONSTRAINT_VIOLATION,
+    SqlServerErrorType.NOT_NULL_VIOLATION,
+    SqlServerErrorType.DATA_TRUNCATION,
+    SqlServerErrorType.DATA_CONVERSION,
+    SqlServerErrorType.ARITHMETIC_OVERFLOW,
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,19 +356,24 @@ class ParsedSqlError:
     driver_message: str
     is_idempotency_hit: bool
 
+    @property
+    def is_data_validation_error(self) -> bool:
+        """Return whether SQL Server rejected invalid or unpersistable data."""
+        return self.error_type in _BAD_DATA_ERROR_TYPES
+
 
 def parse_mssql_error(e: DBAPIError, idempotency_markers: tuple[str, ...] = ()) -> ParsedSqlError:
     """Classify a pyodbc SQLAlchemy error by SQL Server native code.
 
     This defensive parser is safe for request handlers, scripts, and retry loops. Duplicate-key
     errors count as idempotent only when their driver message contains a supplied marker.
-    The first native diagnostic code takes precedence over subsequent informational diagnostics.
+    The first native diagnostic code takes precedence over subsequent informational diagnostics;
+    classification uses native codes because ODBC SQL states vary by driver and error category.
     """
     if not e.orig or not hasattr(e.orig, "args") or len(e.orig.args) < 2:
         return ParsedSqlError(SqlServerErrorType.UNKNOWN, 0, '', False)
 
     driver_message = str(e.orig.args[1])
-    sql_state = str(e.orig.args[0])
 
     # ODBC may append more diagnostics after the primary error, such as SQL Server code 3621.
     match = re.search(
@@ -366,18 +391,41 @@ def parse_mssql_error(e: DBAPIError, idempotency_markers: tuple[str, ...] = ()) 
     if native_code == 3960:
         return ParsedSqlError(SqlServerErrorType.RCSI_CONFLICT, native_code, driver_message, False)
 
-    if sql_state != '23000':
-        return ParsedSqlError(SqlServerErrorType.UNKNOWN, native_code, driver_message, False)
-
     if native_code in (2601, 2627):
         is_idempotent = any(marker in driver_message for marker in idempotency_markers)
         return ParsedSqlError(SqlServerErrorType.DUPLICATE_KEY, native_code, driver_message, is_idempotent)
 
-    elif native_code == 547:
+    if native_code == 547:
+        if "CHECK constraint" in driver_message:
+            return ParsedSqlError(SqlServerErrorType.CHECK_CONSTRAINT_VIOLATION, native_code, driver_message, False)
         return ParsedSqlError(SqlServerErrorType.FOREIGN_KEY_VIOLATION, native_code, driver_message, False)
 
-    elif native_code == 515:
+    if native_code == 515:
         return ParsedSqlError(SqlServerErrorType.NOT_NULL_VIOLATION, native_code, driver_message, False)
+
+    if native_code in (2628, 8152):
+        return ParsedSqlError(SqlServerErrorType.DATA_TRUNCATION, native_code, driver_message, False)
+
+    if native_code in (241, 245, 8114):
+        return ParsedSqlError(SqlServerErrorType.DATA_CONVERSION, native_code, driver_message, False)
+
+    if native_code in (220, 8115):
+        return ParsedSqlError(SqlServerErrorType.ARITHMETIC_OVERFLOW, native_code, driver_message, False)
+
+    if native_code == 8134:
+        return ParsedSqlError(SqlServerErrorType.DIVIDE_BY_ZERO, native_code, driver_message, False)
+
+    if native_code == 207:
+        return ParsedSqlError(SqlServerErrorType.INVALID_COLUMN, native_code, driver_message, False)
+
+    if native_code == 208:
+        return ParsedSqlError(SqlServerErrorType.INVALID_OBJECT, native_code, driver_message, False)
+
+    if native_code == 229:
+        return ParsedSqlError(SqlServerErrorType.PERMISSION_DENIED, native_code, driver_message, False)
+
+    if native_code == 18456:
+        return ParsedSqlError(SqlServerErrorType.LOGIN_FAILED, native_code, driver_message, False)
 
     return ParsedSqlError(SqlServerErrorType.UNKNOWN, native_code, driver_message, False)
 

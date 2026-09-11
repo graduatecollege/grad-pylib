@@ -16,6 +16,7 @@ from grad_pylib.core.config import BaseAppSettings
 from grad_pylib.core.db import (
     DatabaseRuntime,
     NamedDatabases,
+    ParsedSqlError,
     SqlServerErrorType,
     build_mssql_url,
     orm_upsert,
@@ -546,7 +547,33 @@ def test_orm_upsert_rejects_duplicate_renamed_attributes(session: Session) -> No
         ),
         ("23000", sql_server_message("Duplicate key", 2601), SqlServerErrorType.DUPLICATE_KEY, 2601, False),
         ("23000", sql_server_message("Foreign key violation", 547), SqlServerErrorType.FOREIGN_KEY_VIOLATION, 547, False),
+        (
+            "23000",
+            sql_server_message("The INSERT statement conflicted with the CHECK constraint 'CK_status'", 547),
+            SqlServerErrorType.CHECK_CONSTRAINT_VIOLATION,
+            547,
+            False,
+        ),
         ("23000", sql_server_message("Cannot insert NULL", 515), SqlServerErrorType.NOT_NULL_VIOLATION, 515, False),
+        (
+            "42000",
+            "[42000] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]"
+            "String or binary data would be truncated in table 'Hooding.dbo.student_institutional_overrides', "
+            "column 'college_5'. Truncated value: 'EDUCf'. (2628) (SQLExecDirectW)",
+            SqlServerErrorType.DATA_TRUNCATION,
+            2628,
+            False,
+        ),
+        ("22001", sql_server_message("String or binary data would be truncated", 8152), SqlServerErrorType.DATA_TRUNCATION, 8152, False),
+        ("22007", sql_server_message("Conversion failed when converting date and/or time", 241), SqlServerErrorType.DATA_CONVERSION, 241, False),
+        ("22018", sql_server_message("Conversion failed when converting the varchar value to data type int", 245), SqlServerErrorType.DATA_CONVERSION, 245, False),
+        ("22018", sql_server_message("Error converting data type varchar to numeric", 8114), SqlServerErrorType.DATA_CONVERSION, 8114, False),
+        ("22003", sql_server_message("Arithmetic overflow error converting expression", 8115), SqlServerErrorType.ARITHMETIC_OVERFLOW, 8115, False),
+        ("22012", sql_server_message("Divide by zero error encountered", 8134), SqlServerErrorType.DIVIDE_BY_ZERO, 8134, False),
+        ("42S22", sql_server_message("Invalid column name 'missing_column'", 207), SqlServerErrorType.INVALID_COLUMN, 207, False),
+        ("42S02", sql_server_message("Invalid object name 'missing_table'", 208), SqlServerErrorType.INVALID_OBJECT, 208, False),
+        ("42000", sql_server_message("The SELECT permission was denied on the object", 229), SqlServerErrorType.PERMISSION_DENIED, 229, False),
+        ("28000", sql_server_message("Login failed for user 'app_user'", 18456), SqlServerErrorType.LOGIN_FAILED, 18456, False),
         ("42000", sql_server_message("Syntax error", 50000), SqlServerErrorType.UNKNOWN, 50000, False),
         ("23000", "Duplicate key (2627)", SqlServerErrorType.DUPLICATE_KEY, 2627, False),
         (
@@ -606,6 +633,26 @@ def test_parse_mssql_error_handles_malformed_driver_errors() -> None:
     assert parsed.native_code == 0
     assert parsed.driver_message == ""
     assert parsed.is_idempotency_hit is False
+
+
+def test_parsed_sql_error_identifies_data_validation_error_types() -> None:
+    bad_data_types = {
+        SqlServerErrorType.DUPLICATE_KEY,
+        SqlServerErrorType.FOREIGN_KEY_VIOLATION,
+        SqlServerErrorType.CHECK_CONSTRAINT_VIOLATION,
+        SqlServerErrorType.NOT_NULL_VIOLATION,
+        SqlServerErrorType.DATA_TRUNCATION,
+        SqlServerErrorType.DATA_CONVERSION,
+        SqlServerErrorType.ARITHMETIC_OVERFLOW,
+    }
+
+    identified_types = {
+        error_type
+        for error_type in SqlServerErrorType
+        if ParsedSqlError(error_type, None, "", False).is_data_validation_error
+    }
+
+    assert identified_types == bad_data_types
 
 
 @pytest.mark.parametrize(
