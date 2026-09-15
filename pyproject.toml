@@ -30,14 +30,14 @@ test = [
     "pytest-xdist==3.8.0",
     "httpx2==2.12.0",
     "testcontainers[mssql]==4.15.0",
-    "pymssql==2.3.13",
+    "pymssql==2.4.1",
     "pytest-cov==7.1.0",
 ]
 dev = [
     "sqlacodegen==4.0.4",
-    "pymssql==2.3.13",
-    "ty==0.0.74",
-    "ruff==0.16.4",
+    "pymssql==2.4.1",
+    "ty==0.0.80",
+    "ruff==0.16.7",
 ]
 
 [project.optional-dependencies]
@@ -46,14 +46,14 @@ test = [
     "pytest-xdist==3.8.0",
     "httpx2==2.12.0",
     "testcontainers[mssql]==4.15.0",
-    "pymssql==2.3.13",
+    "pymssql==2.4.1",
     "pytest-cov==7.1.0",
 ]
 dev = [
     "sqlacodegen==4.0.4",
-    "pymssql==2.3.13",
-    "ty==0.0.74",
-    "ruff==0.16.4",
+    "pymssql==2.4.1",
+    "ty==0.0.80",
+    "ruff==0.16.7",
 ]
 
 [tool.uv]
