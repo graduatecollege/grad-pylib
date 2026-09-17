@@ -1,6 +1,7 @@
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from uuid import uuid4
 
 import structlog
 from fastapi import Request, Response
@@ -26,6 +27,7 @@ def configure_logging(settings: BaseAppSettings) -> None:
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
         timestamper,
+        structlog.processors.format_exc_info,
     ]
     renderer = structlog.dev.ConsoleRenderer() if settings.is_development else structlog.processors.JSONRenderer()
     formatter = structlog.stdlib.ProcessorFormatter(
@@ -72,21 +74,15 @@ async def bind_request_id_context(
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
-    """Bind an incoming request ID to structured logs for the lifetime of one request.
+    """Bind a request ID to structured logs for the lifetime of one request.
 
-    Install as FastAPI middleware. Existing context is cleared before and after `call_next` so
-    concurrent requests cannot inherit another request's correlation ID; absent headers simply
-    produce logs without `REQUEST_ID_FIELD`.
+    Install as FastAPI middleware. Existing context is cleared before binding so concurrent
+    requests cannot inherit another request's correlation ID. The context remains bound after
+    `call_next` so the ASGI server can include it when logging an escaped exception.
     """
     structlog.contextvars.clear_contextvars()
 
-    request_id = request.headers.get(REQUEST_ID_HEADER)
-    if request_id:
-        structlog.contextvars.bind_contextvars(**{REQUEST_ID_FIELD: request_id})
+    request_id = request.headers.get(REQUEST_ID_HEADER) or str(uuid4())
+    structlog.contextvars.bind_contextvars(**{REQUEST_ID_FIELD: request_id})
 
-    try:
-        response = await call_next(request)
-
-        return response
-    finally:
-        structlog.contextvars.clear_contextvars()
+    return await call_next(request)
