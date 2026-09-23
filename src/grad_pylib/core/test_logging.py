@@ -33,7 +33,7 @@ def log_output() -> Iterator[io.StringIO]:
     }
     output = io.StringIO()
 
-    configure_logging(BaseAppSettings(environment="production"))
+    configure_logging(BaseAppSettings(environment="production", enable_dev_api_key=False))
     handler = root.handlers[0]
     assert isinstance(handler, logging.StreamHandler)
     handler.setStream(output)

@@ -6,13 +6,6 @@ updates:
     schedule:
       interval: "weekly"
     groups:
-      test-and-tool-dependencies:
-        dependency-type: "development"
+      all:
         patterns:
           - "*"
-      production-patch-dependencies:
-        dependency-type: "production"
-        patterns:
-          - "*"
-        update-types:
-          - "patch"
