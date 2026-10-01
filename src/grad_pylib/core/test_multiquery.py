@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import Column, Executable, Integer, MetaData, String, Table, create_engine, literal, select, text
-from sqlalchemy.engine import Connection, CursorResult
+from sqlalchemy.engine import Connection, CursorResult, Result
 from sqlalchemy.orm import DeclarativeBase
 
 from grad_pylib.core.multiquery import (
@@ -140,14 +140,15 @@ def connection() -> Iterator[Connection]:
 @pytest.fixture
 def cursor_result(
     connection: Connection, monkeypatch: pytest.MonkeyPatch,
-) -> Iterator[tuple[CursorResult[*tuple[Any, ...]], _Cursor]]:
+) -> Iterator[tuple[Result[*tuple[Any, ...]], _Cursor]]:
     cursor = _Cursor((
         (("id", "name"), [(1, "Name"), (2, None)]),
         (None, []),
         (("empty",), []),
         (("total",), [(2,)]),
     ))
-    with connection.exec_driver_sql("SELECT 1") as result:
+    with connection.execute(text("SELECT 1")) as result:
+        assert isinstance(result, CursorResult)
         assert result.cursor is not None
         result.cursor.close()
         monkeypatch.setattr(result, "cursor", cursor)
@@ -155,7 +156,7 @@ def cursor_result(
 
 
 def test_read_all_result_sets_reads_all_sets_and_closes_cursor(
-    cursor_result: tuple[CursorResult[*tuple[Any, ...]], _Cursor],
+    cursor_result: tuple[Result[*tuple[Any, ...]], _Cursor],
 ) -> None:
     result, cursor = cursor_result
 
@@ -172,7 +173,7 @@ def test_read_all_result_sets_reads_all_sets_and_closes_cursor(
 
 @pytest.mark.parametrize("operation", ["fetchall", "nextset"])
 def test_read_all_result_sets_closes_cursor_on_driver_errors(
-    cursor_result: tuple[CursorResult[*tuple[Any, ...]], _Cursor],
+    cursor_result: tuple[Result[*tuple[Any, ...]], _Cursor],
     monkeypatch: pytest.MonkeyPatch,
     operation: str,
 ) -> None:
@@ -189,6 +190,15 @@ def test_read_all_result_sets_closes_cursor_on_driver_errors(
     assert caught.value is error
     assert result.closed
     assert cursor.closed
+
+
+def test_read_all_result_sets_rejects_non_cursor_results(connection: Connection) -> None:
+    result = connection.execute(select(parent.c.id)).freeze()()
+
+    with pytest.raises(TypeError, match="Expected a CursorResult"):
+        read_all_result_sets(result)
+
+    assert result.closed
 
 
 def test_read_all_result_sets_rejects_missing_cursor(connection: Connection) -> None:
@@ -230,7 +240,7 @@ def test_cursor_rows_to_dicts_does_not_advance_or_close(
 
 
 def test_read_all_result_sets_closes_cursor_on_invalid_row_width(
-    cursor_result: tuple[CursorResult[*tuple[Any, ...]], _Cursor],
+    cursor_result: tuple[Result[*tuple[Any, ...]], _Cursor],
 ) -> None:
     result, cursor = cursor_result
     cursor.result_sets = ((("id", "name"), [(1,)]),)

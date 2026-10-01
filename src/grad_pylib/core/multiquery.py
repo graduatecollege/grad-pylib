@@ -3,7 +3,7 @@ from typing import Any, Protocol, Union, get_args, get_origin
 
 from pydantic import BaseModel
 from sqlalchemy import Table
-from sqlalchemy.engine import CursorResult
+from sqlalchemy.engine import CursorResult, Result
 from sqlalchemy.engine import Row
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.sql.selectable import FromClause
@@ -82,15 +82,25 @@ def split_row_sections(
     return tuple(results)
 
 
-def read_all_result_sets(result: CursorResult[*tuple[Any, ...]]) -> list[list[dict[str, Any]]]:
+def read_all_result_sets(result: Result[*tuple[Any, ...]]) -> list[list[dict[str, Any]]]:
     """Read an unconsumed ``CursorResult`` using a driver supporting ``nextset``.
+
+    Accepts ``Result`` because ``Connection.execute``/``Session.execute`` are
+    typed that way; the runtime object must be a ``CursorResult`` (as for Core
+    and textual statements), otherwise ``TypeError`` is raised, e.g. for ORM
+    entity results.
 
     Each result set becomes a list of dictionaries keyed by cursor column names;
     sets without a description or rows become empty lists. The result is always
     closed, including on driver errors. A missing/closed cursor raises
-    ``ValueError``. ORM ``Result`` objects are not supported.
+    ``ValueError``.
     """
     try:
+        if not isinstance(result, CursorResult):
+            raise TypeError(
+                f"Expected a CursorResult, got {type(result).__name__}; "
+                "ORM entity results are not supported."
+            )
         cursor: _MultiResultCursor | None = result.cursor
         if cursor is None:
             raise ValueError("Result has no active cursor.")

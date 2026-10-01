@@ -131,26 +131,17 @@ For raw SQL, keep the actual SQL visible in a Python 3.14 template string and le
 return fragments to interpolate into SQLAlchemy's `tstring(...)`:
 
 ```python
-from sqlalchemy import table, column, tstring
+from sqlalchemy import tstring
 
 from grad_pylib.core.querying import QuerySpec, order_by_fragment, where_fragment
 
-a = table(
-    "awards",
-    column("term"),
-    column("department"),
-    column("degree_program"),
-    column("reviewed_at"),
-    column("submitted_at"),
-).alias("a")
-
 lookup_spec = QuerySpec(
     filterable={
-        "department": a.c.department,
-        "degree_program": a.c.degree_program,
-        "reviewed_at": a.c.reviewed_at,
+        "department": Award.department_code,
+        "degree_program": Award.degree_program,
+        "reviewed_at": Award.reviewed_at,
     },
-    sortable={"department": a.c.department, "submitted_at": a.c.submitted_at},
+    sortable={"department": Award.department_code, "submitted_at": Award.submitted_at},
     default_sort="-submitted_at",
 )
 
@@ -162,13 +153,13 @@ elif departments:
 elif require_reviewed is not None:
     filters["reviewed_at__notnull"] = require_reviewed
 
-where = where_fragment(lookup_spec, filters, tstring(t"a.term = {term}"))
+where = where_fragment(lookup_spec, filters, Award.term_code == term)
 order_by = order_by_fragment(lookup_spec, sort)
 
 query = tstring(
     t"""
-    SELECT a.degree_program, a.department
-    FROM awards AS a
+    SELECT awards.degree_program, awards.department_code
+    FROM {Award.__table__}
     {where}
     {order_by}
     """
@@ -177,26 +168,75 @@ query = tstring(
 
 - `where_fragment(spec, filters, *conditions)` renders either nothing or a
   complete `WHERE ...` clause. `conditions` are fixed, developer-authored
-  predicates, either Core expressions (`a.c.term == term`) or `tstring(...)`
-  fragments; they come first and are joined with the filters using `AND`.
-  Template fragments are parenthesized so predicates containing `OR` keep their
-  grouping.
+  predicates, either Core expressions (`Award.term_code == term`) or
+  `tstring(...)` fragments; they come first and are joined with the filters
+  using `AND`. Template fragments are parenthesized so predicates containing
+  `OR` keep their grouping.
 - `order_by_fragment(spec, sort)` renders either nothing or a complete
   `ORDER BY ...` clause, falling back to `spec.default_sort`.
 
 Values interpolated with `{...}` become bound parameters, and `IN` filters use
 expanding parameters automatically, so there are no parameter names to manage.
 Statements with the same structure but different values share a statement-cache
-entry.
+entry. Interpolating `{Award.__table__}` renders the table name, keeping the SQL
+tied to the model.
 
-Columns render exactly as SQLAlchemy renders them, including their table or
-alias qualifier and dialect quoting. Build the spec from columns that match the
-`FROM` clause: `alias.c.x` for an aliased table, the model or table column for an
-unaliased one, or an unbound `column("x")` for an unqualified name.
+Do not use `:name` parameters inside a template string. SQLAlchemy 2.1.0 and
+2.1.1 still treat `:name` in template text as a bind parameter, but later
+releases render it literally.
 
-Interpolate values with `{...}`; do not use `:name` parameters inside a template
-string. SQLAlchemy 2.1.0 and 2.1.1 still treat `:name` in template text as a bind
-parameter, but later releases render it literally.
+### Choosing spec columns
+
+Columns render exactly as SQLAlchemy renders them, including their table
+qualifier and dialect quoting, so spec columns must match the query's `FROM`
+clause. Aliases are only needed where the SQL already uses one:
+
+| Spec column | Renders as | Matching `FROM` |
+|---|---|---|
+| `Award.department_code` | `awards.department_code` | `FROM awards` |
+| `table_with_schema.c.department` | `dbo.awards.department` | `FROM dbo.awards` |
+| `column("department")` | `department` | any |
+| `aliased(Award, name="a").department_code` | `a.department_code` | `FROM awards AS a` |
+
+- **Generated models (default).** Use `Model.column` and write the real table
+  name (or `{Model.__table__}`) in the SQL. Nothing new to declare.
+- **Unbound `column("x")`.** Renders bare names like the `text(...)` helpers, so
+  existing SQL works unchanged. Avoid it when a join makes a column name
+  ambiguous; SQL Server will reject the query.
+- **Aliases only where the SQL needs one**, such as self-joins or short names:
+  `a = aliased(Award, name="a")`, matching `AS a` in the SQL.
+
+Do not mix styles: a model column (`awards.x`) in a query that says
+`FROM awards AS a` fails on SQL Server.
+
+### Migrating from `text(...)`
+
+The `text(...)` helpers below remain supported, so queries can be migrated one at
+a time.
+
+```python
+# before
+where = build_where_clause(spec, filters, fixed_clauses=("term_code = :term",))
+order_by = build_order_by_clause(spec, sort)
+query = where.bind(
+    text(f"SELECT ... FROM awards {where.sql} {order_by}")
+).params(term=term)
+
+# after
+where = where_fragment(spec, filters, Award.term_code == term)
+order_by = order_by_fragment(spec, sort)
+query = tstring(t"SELECT ... FROM {Award.__table__} {where} {order_by}")
+```
+
+1. Point the spec at columns that match the `FROM` clause (see above).
+2. Replace `fixed_clauses=` with condition arguments, either model expressions or
+   `tstring(t"...")` fragments.
+3. Replace every `:name` plus `.params(...)` with a `{value}` interpolation.
+4. Remove `bind_expanding_params`, `.bindparams(...)` for `IN` lists, and any
+   handling of the reserved `__grad_pylib_filter_` names.
+5. Drop any workarounds for `ilike`, which now renders portably on SQL Server.
+6. Run the query's tests; a qualifier that does not match the `FROM` clause
+   fails on first execution.
 
 ## Raw SQL with `text(...)`
 
