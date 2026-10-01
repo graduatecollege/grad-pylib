@@ -8,6 +8,7 @@ from sqlalchemy.orm import Mapped, declarative_base, mapped_column
 
 from grad_pylib.core.exceptions import BadRequestError
 from grad_pylib.core.querying import (
+    escape_like,
     QuerySpec,
     apply_filters,
     apply_pagination,
@@ -573,3 +574,26 @@ def test_build_order_by_clause_rejects_non_identifier_column_name():
     )
     with pytest.raises(BadRequestError, match="Unable to build SQL"):
         build_order_by_clause(malicious_spec, "term_code")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("plain", "plain"),
+        ("50%", "50/%"),
+        ("a_b", "a/_b"),
+        ("[x]", "/[x]"),
+        ("a/b", "a//b"),
+    ],
+)
+def test_escape_like(value: str, expected: str):
+    assert escape_like(value) == expected
+
+
+def test_escape_like_custom_escape_character():
+    assert escape_like("50%!", escape="!") == "50!%!!"
+
+
+def test_escape_like_rejects_multi_character_escape():
+    with pytest.raises(ValueError):
+        escape_like("x", escape="//")

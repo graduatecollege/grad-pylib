@@ -129,6 +129,22 @@ class RawWhereClause:
         return query.params(**self.params)
 
 
+_LIKE_SPECIAL_CHARS_RE = re.compile(r"[%_\[]")
+
+
+def escape_like(value: str, escape: str = "/") -> str:
+    """Escape ``LIKE`` wildcards in ``value`` so it matches literally.
+
+    Escapes ``%``, ``_``, and SQL Server's ``[`` character class opener. Pass the
+    same ``escape`` character to SQLAlchemy, e.g.
+    ``column.like(f"%{escape_like(term)}%", escape="/")``.
+    """
+    if len(escape) != 1:
+        raise ValueError("escape must be a single character.")
+    escaped = value.replace(escape, escape * 2)
+    return _LIKE_SPECIAL_CHARS_RE.sub(lambda match: f"{escape}{match.group(0)}", escaped)
+
+
 def _parse_filter_key(key: str) -> tuple[str, str]:
     field, _, operator = key.partition("__")
     return field, operator or "eq"

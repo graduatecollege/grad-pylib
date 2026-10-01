@@ -71,6 +71,58 @@ stmt = apply_query(
 `None` filter values are ignored, so request query parameters can usually be
 passed through directly after any application-specific normalization.
 
+## Declaring filters on request models
+
+Use `grad_pylib.core.filtering` to declare which operators each filter field
+accepts. Every operator is listed explicitly (`eq` is exposed as the bare field
+name), so the request model and OpenAPI spec contain only what the endpoint
+supports, with typed values.
+
+```python
+from datetime import date
+from typing import Annotated
+
+from fastapi import Query
+
+from grad_pylib.core.filtering import FilterField, create_filter_model, filter_values
+
+AwardFilters = create_filter_model(
+    "AwardFilters",
+    {
+        "department_code": FilterField(str, "eq", "in"),
+        "submitted_at": FilterField(date, "gte", "lte"),
+        "reviewed_at": FilterField(date, "isnull"),
+    },
+)
+
+
+class AwardListRequest(AwardFilters):
+    sort: str | None = None
+
+
+@router.get("/awards")
+def list_awards(session: DbSession, request: Annotated[AwardListRequest, Query()]):
+    stmt = apply_query(
+        select(Award),
+        spec,
+        filters=filter_values(request, AwardFilters),
+        sort=request.sort,
+    )
+```
+
+This declares `department_code`, `department_code__in`, `submitted_at__gte`,
+`submitted_at__lte`, and `reviewed_at__isnull`. `in` fields are lists (repeated
+query parameters, or a JSON array in a body), `isnull`/`notnull` are booleans, and
+`like`/`ilike` are only allowed on `str` fields. `filter_values()` dumps only the
+non-`None` filter fields, leaving out other request fields such as `sort`.
+
+Use `escape_like()` when building a `LIKE` pattern from user text that should
+match literally, e.g. a "contains" search:
+
+```python
+column.like(f"%{escape_like(term)}%", escape="/")
+```
+
 ## Raw SQL helpers
 
 For raw SQL, keep the actual SQL visible and let `QuerySpec` own the generic
