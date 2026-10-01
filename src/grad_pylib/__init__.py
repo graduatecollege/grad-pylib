@@ -11,7 +11,7 @@ from grad_pylib.core.filtering import FilterField, filter_key, filter_field_defi
 from grad_pylib.core.logging import REQUEST_ID_HEADER, REQUEST_ID_FIELD, configure_logging, bind_request_id_context
 from grad_pylib.core.multiquery import qualified_columns, section_columns, split_row_sections, read_all_result_sets, cursor_rows_to_dicts, map_row_to_pydantic
 from grad_pylib.core.params import TermCodePath, TermCodeQuery, DepartmentCodePath, DepartmentCodeQuery, UniqueHashPath, SnakeCaseNamePath, TermCode, DepartmentCode, UniqueHash, SnakeCaseName
-from grad_pylib.core.querying import QuerySpec, RawWhereClause, escape_like, apply_filters, apply_sort, bind_expanding_params, build_where_clause, build_order_by_clause, apply_pagination, apply_query
+from grad_pylib.core.querying import QuerySpec, RawWhereClause, escape_like, apply_filters, apply_sort, where_fragment, order_by_fragment, bind_expanding_params, build_where_clause, build_order_by_clause, apply_pagination, apply_query
 from grad_pylib.core.schemas import parse_comma_separated_strings, validate_string_items, parse_validated_comma_separated_strings, parse_json_blob, normalize_email_list, BaseDto, DataResponse, ItemResponse, ListResponse, MetaResponse, StatusResponse, build_status_response
 from grad_pylib.core.time import utc_now, utc_from_millis
 from grad_pylib.sqlserver_container import DEFAULT_SQL_SERVER_IMAGE, DEFAULT_SQL_SERVER_CONTAINER_MEMORY_LIMIT, DEFAULT_SQL_SERVER_MEMORY_LIMIT_MB, build_sql_server_container_kwargs
@@ -110,6 +110,7 @@ __all__ = [
     "netid_from_email",
     "normalize_email_list",
     "normalize_role",
+    "order_by_fragment",
     "orm_upsert",
     "parse_comma_separated_strings",
     "parse_distinct_strings",
@@ -133,5 +134,6 @@ __all__ = [
     "utc_now",
     "validate_string_items",
     "warn_if_azure_ad_missing",
+    "where_fragment",
     "with_azure_development_placeholders",
 ]

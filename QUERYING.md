@@ -17,10 +17,11 @@ Supported filter operators are `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `like`,
 
 Both query paths share filter normalization: field/operator validation, skipping
 `None` values, coercing scalar or collection `in` values to nonempty lists, and
-coercing null-check booleans. SQL rendering stays backend-specific: Core builds
-SQLAlchemy expressions compiled for the selected dialect; raw SQL emits explicit
-SQL operators and bound parameters (including literal `ILIKE`, which requires
-database support).
+coercing null-check booleans. Core `select(...)` queries and template-string
+fragments build SQLAlchemy expressions compiled for the selected dialect (so
+`ilike` becomes `lower(x) LIKE lower(y)` on SQL Server). The older string-based
+raw SQL helpers emit explicit SQL operators and bound parameters (including
+literal `ILIKE`, which SQL Server does not support).
 
 `isnull` and `notnull` expect a boolean value. For example,
 `reviewed_at__isnull=true` produces `reviewed_at IS NULL`, while
@@ -123,10 +124,83 @@ match literally, e.g. a "contains" search:
 column.like(f"%{escape_like(term)}%", escape="/")
 ```
 
-## Raw SQL helpers
+## Raw SQL with template strings
 
-For raw SQL, keep the actual SQL visible and let `QuerySpec` own the generic
-allowlist and parameter-building mechanics.
+For raw SQL, keep the actual SQL visible in a Python 3.14 template string and let
+`QuerySpec` own the allowlist. `where_fragment()` and `order_by_fragment()`
+return fragments to interpolate into SQLAlchemy's `tstring(...)`:
+
+```python
+from sqlalchemy import table, column, tstring
+
+from grad_pylib.core.querying import QuerySpec, order_by_fragment, where_fragment
+
+a = table(
+    "awards",
+    column("term"),
+    column("department"),
+    column("degree_program"),
+    column("reviewed_at"),
+    column("submitted_at"),
+).alias("a")
+
+lookup_spec = QuerySpec(
+    filterable={
+        "department": a.c.department,
+        "degree_program": a.c.degree_program,
+        "reviewed_at": a.c.reviewed_at,
+    },
+    sortable={"department": a.c.department, "submitted_at": a.c.submitted_at},
+    default_sort="-submitted_at",
+)
+
+filters: dict[str, object] = {}
+if programs:
+    filters["degree_program__in"] = programs
+elif departments:
+    filters["department__in"] = departments
+elif require_reviewed is not None:
+    filters["reviewed_at__notnull"] = require_reviewed
+
+where = where_fragment(lookup_spec, filters, tstring(t"a.term = {term}"))
+order_by = order_by_fragment(lookup_spec, sort)
+
+query = tstring(
+    t"""
+    SELECT a.degree_program, a.department
+    FROM awards AS a
+    {where}
+    {order_by}
+    """
+)
+```
+
+- `where_fragment(spec, filters, *conditions)` renders either nothing or a
+  complete `WHERE ...` clause. `conditions` are fixed, developer-authored
+  predicates, either Core expressions (`a.c.term == term`) or `tstring(...)`
+  fragments; they come first and are joined with the filters using `AND`.
+  Template fragments are parenthesized so predicates containing `OR` keep their
+  grouping.
+- `order_by_fragment(spec, sort)` renders either nothing or a complete
+  `ORDER BY ...` clause, falling back to `spec.default_sort`.
+
+Values interpolated with `{...}` become bound parameters, and `IN` filters use
+expanding parameters automatically, so there are no parameter names to manage.
+Statements with the same structure but different values share a statement-cache
+entry.
+
+Columns render exactly as SQLAlchemy renders them, including their table or
+alias qualifier and dialect quoting. Build the spec from columns that match the
+`FROM` clause: `alias.c.x` for an aliased table, the model or table column for an
+unaliased one, or an unbound `column("x")` for an unqualified name.
+
+Interpolate values with `{...}`; do not use `:name` parameters inside a template
+string. SQLAlchemy 2.1.0 and 2.1.1 still treat `:name` in template text as a bind
+parameter, but later releases render it literally.
+
+## Raw SQL with `text(...)`
+
+The string-based helpers remain available for existing `text(...)` queries.
 
 ```python
 from sqlalchemy import text

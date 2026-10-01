@@ -12,10 +12,12 @@ e.g. ``status=submitted`` (equality), ``requested_amount__gte=100``, or
 Sorting parameters are a comma separated list of fields, where a leading ``-``
 denotes descending order, e.g. ``sort=-submitted_at,department_code``.
 
-For raw ``text(...)`` queries, :func:`build_where_clause` can also compose
-developer-supplied fixed predicates with request-driven filters while keeping
-values parameterized and reporting any ``IN`` parameters that should be bound as
-SQLAlchemy expanding parameters.
+For raw SQL, :func:`where_fragment` and :func:`order_by_fragment` build
+fragments for Python 3.14 template-string queries (``tstring(t"...")``) from the
+same SQLAlchemy expressions used for ``select`` statements. The older
+:func:`build_where_clause` composes string ``WHERE`` clauses for ``text(...)``
+queries while keeping values parameterized and reporting any ``IN`` parameters
+that should be bound as SQLAlchemy expanding parameters.
 """
 
 import re
@@ -24,9 +26,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from grad_pylib.core.exceptions import BadRequestError
-from sqlalchemy import Select, bindparam
+from sqlalchemy import Select, and_, bindparam, tstring
 from sqlalchemy.orm import InstrumentedAttribute
-from sqlalchemy.sql.elements import ColumnElement, TextClause
+from sqlalchemy.sql.elements import ClauseList, ColumnElement, TextClause, TString
 
 type Column = ColumnElement[Any] | InstrumentedAttribute[Any]
 type FilterOperator = Callable[[Column, Any], ColumnElement[bool]]
@@ -219,6 +221,25 @@ def _normalize_filters(
         yield _NormalizedFilter(index, field, spec.filterable[field], operator, value)
 
 
+def _filter_conditions(
+        spec: QuerySpec, filters: Mapping[str, Any] | None
+) -> list[ColumnElement[bool]]:
+    conditions: list[ColumnElement[bool]] = []
+    for normalized in _normalize_filters(spec, filters):
+        column, operator, value = (
+            normalized.column, normalized.operator, normalized.value
+        )
+        if operator == "isnull":
+            conditions.append(column.is_(None))
+        elif operator == "notnull":
+            conditions.append(column.is_not(None))
+        elif operator == "in":
+            conditions.append(column.in_(value))
+        else:
+            conditions.append(_COLUMN_FILTER_OPERATORS[operator](column, value))
+    return conditions
+
+
 def apply_filters[*Ts](
         stmt: Select[*Ts], spec: QuerySpec, filters: Mapping[str, Any] | None
 ) -> Select[*Ts]:
@@ -228,23 +249,8 @@ def apply_filters[*Ts](
     are ``None`` are ignored so callers may pass optional query parameters
     directly. Unknown fields or operators raise :class:`BadRequestError`.
     """
-    for normalized in _normalize_filters(spec, filters):
-        column, operator, value = (
-            normalized.column, normalized.operator, normalized.value
-        )
-        if operator in _NULL_FILTER_OPERATORS:
-            stmt = stmt.where(
-                column.is_(None)
-                if operator == "isnull"
-                else column.is_not(None)
-            )
-            continue
-        if operator == "in":
-            stmt = stmt.where(column.in_(value))
-            continue
-        builder = _COLUMN_FILTER_OPERATORS[operator]
-        stmt = stmt.where(builder(column, value))
-    return stmt
+    conditions = _filter_conditions(spec, filters)
+    return stmt.where(*conditions) if conditions else stmt
 
 
 def _parse_sort(sort: str | Sequence[str]) -> list[tuple[str, bool]]:
@@ -260,6 +266,22 @@ def _parse_sort(sort: str | Sequence[str]) -> list[tuple[str, bool]]:
     return parsed
 
 
+def _sort_clauses(
+        spec: QuerySpec, sort: str | Sequence[str] | None
+) -> list[ColumnElement[Any]]:
+    effective = sort if sort else spec.default_sort
+    if not effective:
+        return []
+    requested_fields = _parse_sort(effective)
+    _validate_requested_fields(
+        (field for field, _ in requested_fields), spec.sortable, action="Sorting"
+    )
+    return [
+        spec.sortable[field].desc() if descending else spec.sortable[field].asc()
+        for field, descending in requested_fields
+    ]
+
+
 def apply_sort[*Ts](
         stmt: Select[*Ts], spec: QuerySpec, sort: str | Sequence[str] | None
 ) -> Select[*Ts]:
@@ -268,17 +290,47 @@ def apply_sort[*Ts](
     Falls back to ``spec.default_sort`` when ``sort`` is empty. Unknown fields
     raise :class:`BadRequestError`.
     """
-    effective = sort if sort else spec.default_sort
-    if not effective:
-        return stmt
-    requested_fields = _parse_sort(effective)
-    _validate_requested_fields(
-        (field for field, _ in requested_fields), spec.sortable, action="Sorting"
-    )
-    for field, descending in requested_fields:
-        column = spec.sortable[field]
-        stmt = stmt.order_by(column.desc() if descending else column.asc())
-    return stmt
+    clauses = _sort_clauses(spec, sort)
+    return stmt.order_by(*clauses) if clauses else stmt
+
+
+def where_fragment(
+        spec: QuerySpec,
+        filters: Mapping[str, Any] | None,
+        *conditions: ColumnElement[bool] | TString,
+) -> TString:
+    """Build a ``WHERE`` fragment to interpolate into a ``tstring(...)`` query.
+
+    Renders as ``""`` when there are no conditions, otherwise as a complete
+    ``WHERE ...`` clause. ``conditions`` are fixed, developer-authored predicates
+    such as ``awards.c.term == term`` or ``tstring(t"a.term = {term}")``; they
+    precede the request-driven ``filters`` and are joined with ``AND``. Filters
+    share the validation and operators of :func:`apply_filters`, so columns render
+    as SQLAlchemy renders them, including their table or alias qualifier.
+    """
+    # Text fragments are not grouped by and_(), so an OR inside one would bind
+    # across the other predicates without explicit parentheses.
+    grouped = [
+        tstring(t"({condition})") if isinstance(condition, TString) else condition
+        for condition in conditions
+    ]
+    combined = [*grouped, *_filter_conditions(spec, filters)]
+    if not combined:
+        return tstring(t"")
+    return tstring(t"WHERE {and_(*combined)}")
+
+
+def order_by_fragment(spec: QuerySpec, sort: str | Sequence[str] | None) -> TString:
+    """Build an ``ORDER BY`` fragment to interpolate into a ``tstring(...)`` query.
+
+    Renders as ``""`` when neither ``sort`` nor ``spec.default_sort`` is set,
+    otherwise as a complete ``ORDER BY ...`` clause. Sort parsing and validation
+    match :func:`apply_sort`.
+    """
+    clauses = _sort_clauses(spec, sort)
+    if not clauses:
+        return tstring(t"")
+    return tstring(t"ORDER BY {ClauseList(*clauses)}")
 
 
 # A SQL identifier (optionally schema/table qualified, e.g. ``dbo.table.column``).

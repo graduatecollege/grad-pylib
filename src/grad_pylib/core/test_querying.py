@@ -2,8 +2,8 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
-from sqlalchemy import Select, String, bindparam, select, text
-from sqlalchemy.dialects import postgresql
+from sqlalchemy import Select, String, bindparam, column, create_engine, select, table, text, tstring
+from sqlalchemy.dialects import mssql, postgresql
 from sqlalchemy.orm import Mapped, declarative_base, mapped_column
 
 from grad_pylib.core.exceptions import BadRequestError
@@ -17,6 +17,8 @@ from grad_pylib.core.querying import (
     bind_expanding_params,
     build_order_by_clause,
     build_where_clause,
+    order_by_fragment,
+    where_fragment,
 )
 from grad_pylib.testing.fake_models import FooNomination, t_foo_view
 
@@ -50,14 +52,17 @@ def _sql(stmt: Select[*tuple[Any, ...]]) -> str:
 type FilterRenderer = Callable[[dict[str, Any] | None], tuple[str, list[Any]]]
 
 
-@pytest.fixture(params=["core", "raw"])
+@pytest.fixture(params=["core", "raw", "tstring"])
 def render_filters(request: pytest.FixtureRequest) -> FilterRenderer:
     def render(filters: dict[str, Any] | None) -> tuple[str, list[Any]]:
         if request.param == "core":
             stmt = apply_filters(select(FooNomination), SPEC, filters)
-        else:
+        elif request.param == "raw":
             clause = build_where_clause(SPEC, filters)
             stmt = clause.bind(text(f"SELECT * FROM foo_nominations {clause.sql}"))
+        else:
+            where = where_fragment(SPEC, filters)
+            stmt = tstring(t"SELECT * FROM foo_nominations {where}")
         compiled = stmt.compile(dialect=postgresql.dialect())
         return str(compiled).partition("WHERE")[2], list(compiled.params.values())
 
@@ -589,6 +594,157 @@ def test_build_order_by_clause_rejects_non_identifier_column_name():
     )
     with pytest.raises(BadRequestError, match="Unable to build SQL"):
         build_order_by_clause(malicious_spec, "term_code")
+
+
+AWARDS = table(
+    "awards",
+    column("term", String),
+    column("department", String),
+    column("program", String),
+    column("submitted_at", String),
+)
+A = AWARDS.alias("a")
+FRAGMENT_SPEC = QuerySpec(
+    filterable={"department": A.c.department, "program": A.c.program},
+    sortable={"department": A.c.department, "submitted_at": A.c.submitted_at},
+    default_sort="-submitted_at",
+)
+
+
+def _mssql(stmt: Any) -> tuple[str, dict[str, Any]]:
+    compiled = stmt.compile(dialect=mssql.dialect())
+    return " ".join(str(compiled).split()), compiled.params
+
+
+def test_where_fragment_renders_empty_without_conditions():
+    where = where_fragment(FRAGMENT_SPEC, {"department": None})
+    assert _mssql(tstring(t"SELECT a.term FROM awards AS a {where}")) == (
+        "SELECT a.term FROM awards AS a", {}
+    )
+
+
+def test_where_fragment_combines_fixed_conditions_before_filters():
+    term = "120258"
+    where = where_fragment(
+        FRAGMENT_SPEC,
+        {"department__in": ["AA", "BB"], "program__isnull": False},
+        tstring(t"a.term = {term}"),
+        A.c.program != "XX",
+    )
+    sql, params = _mssql(tstring(t"SELECT a.term FROM awards AS a {where}"))
+    assert sql == (
+        "SELECT a.term FROM awards AS a WHERE (a.term = :param_1) "
+        "AND a.program != :program_1 "
+        "AND a.department IN (__[POSTCOMPILE_department_1]) "
+        "AND a.program IS NOT NULL"
+    )
+    assert params == {"param_1": term, "program_1": "XX", "department_1": ["AA", "BB"]}
+
+
+def test_where_fragment_groups_fixed_or_text_conditions():
+    user, tenant = "u1", "t1"
+    where = where_fragment(
+        FRAGMENT_SPEC,
+        {"department": "AA"},
+        tstring(t"a.owner_id = {user} OR a.is_public = 1"),
+        tstring(t"a.tenant_id = {tenant}"),
+    )
+    sql, _ = _mssql(tstring(t"SELECT 1 FROM awards AS a {where}"))
+    assert sql.endswith(
+        "WHERE (a.owner_id = :param_1 OR a.is_public = 1) "
+        "AND (a.tenant_id = :param_2) AND a.department = :department_1"
+    )
+
+
+def test_where_fragment_supports_fixed_conditions_without_filters():
+    where = where_fragment(FRAGMENT_SPEC, None, A.c.term == "120258")
+    sql, params = _mssql(tstring(t"SELECT 1 FROM awards AS a {where}"))
+    assert sql.endswith("WHERE a.term = :term_1")
+    assert params == {"term_1": "120258"}
+
+
+def test_where_fragment_renders_ilike_portably_for_sql_server():
+    where = where_fragment(FRAGMENT_SPEC, {"department__ilike": "%aa%"})
+    sql, _ = _mssql(tstring(t"SELECT 1 FROM awards AS a {where}"))
+    assert sql.endswith("WHERE lower(a.department) LIKE lower(:department_1)")
+
+
+def test_where_fragment_quotes_column_names_instead_of_rejecting_them():
+    unusual_spec = QuerySpec(
+        filterable={"term_code": column("term_code; DROP TABLE nominations", String)},
+    )
+    where = where_fragment(unusual_spec, {"term_code": "120251"})
+    sql, params = _mssql(tstring(t"SELECT 1 FROM nominations {where}"))
+    assert "WHERE [term_code; DROP TABLE nominations] = :" in sql
+    assert list(params.values()) == ["120251"]
+
+
+def test_where_fragment_unknown_field_raises():
+    with pytest.raises(BadRequestError, match="Filtering by 'uin' is not supported"):
+        where_fragment(FRAGMENT_SPEC, {"uin": "123"})
+
+
+def test_order_by_fragment_multiple_fields():
+    order_by = order_by_fragment(FRAGMENT_SPEC, "department,-submitted_at")
+    sql, _ = _mssql(tstring(t"SELECT 1 FROM awards AS a {order_by}"))
+    assert sql.endswith("ORDER BY a.department ASC, a.submitted_at DESC")
+
+
+def test_order_by_fragment_uses_default_when_empty():
+    sql, _ = _mssql(tstring(t"SELECT 1 FROM awards AS a {order_by_fragment(FRAGMENT_SPEC, None)}"))
+    assert sql.endswith("ORDER BY a.submitted_at DESC")
+
+
+def test_order_by_fragment_renders_empty_without_sort():
+    order_by = order_by_fragment(QuerySpec(), None)
+    assert _mssql(tstring(t"SELECT 1 FROM awards AS a {order_by}")) == (
+        "SELECT 1 FROM awards AS a", {}
+    )
+
+
+def test_order_by_fragment_unknown_field_raises():
+    with pytest.raises(BadRequestError, match="Sorting by 'uin' is not supported"):
+        order_by_fragment(FRAGMENT_SPEC, "uin")
+
+
+def test_fragments_share_cache_key_across_values():
+    def build(term: str, departments: list[str]) -> Any:
+        where = where_fragment(
+            FRAGMENT_SPEC, {"department__in": departments}, tstring(t"a.term = {term}")
+        )
+        order_by = order_by_fragment(FRAGMENT_SPEC, None)
+        return tstring(t"SELECT a.term FROM awards AS a {where} {order_by}")
+
+    first = build("120258", ["AA"])._generate_cache_key()
+    second = build("120261", ["BB", "CC"])._generate_cache_key()
+    assert first is not None and second is not None
+    assert first.key == second.key
+
+
+def test_fragments_execute_with_sqlite():
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE awards (term TEXT, department TEXT, program TEXT, submitted_at TEXT)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO awards VALUES "
+            "('120258', 'AA', 'P1', '2026-01-01'), "
+            "('120258', 'BB', NULL, '2026-02-01'), "
+            "('120258', 'CC', 'P3', '2026-03-01'), "
+            "('120261', 'AA', 'P4', '2026-04-01')"
+        )
+        term = "120258"
+        where = where_fragment(
+            FRAGMENT_SPEC,
+            {"department__in": ["AA", "BB", "CC"], "program__notnull": True},
+            tstring(t"a.term = {term}"),
+        )
+        order_by = order_by_fragment(FRAGMENT_SPEC, None)
+        rows = conn.execute(
+            tstring(t"SELECT a.department FROM awards AS a {where} {order_by}")
+        ).scalars().all()
+    assert rows == ["CC", "AA"]
 
 
 @pytest.mark.parametrize(
