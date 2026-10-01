@@ -112,6 +112,7 @@ class RawWhereClause:
         callables for generated parameters raise ``ValueError``.
         """
         # Expansion replaces bind parameters, so inspect the original bindings first.
+        # Values from ``params()`` are stored on the statement, not its bind parameters.
         collisions = {
             name
             for name, parameter in query._bindparams.items()
@@ -121,7 +122,7 @@ class RawWhereClause:
                 or parameter.value is not None
                 or parameter.callable is not None
             )
-        }
+        } | (query._params.keys() & self.params.keys())
         if collisions:
             names = ", ".join(sorted(collisions))
             raise ValueError(f"Generated query parameters already have values: {names}.")
@@ -218,9 +219,9 @@ def _normalize_filters(
         yield _NormalizedFilter(index, field, spec.filterable[field], operator, value)
 
 
-def apply_filters[T: tuple[Any, ...]](
-        stmt: Select[T], spec: QuerySpec, filters: Mapping[str, Any] | None
-) -> Select[T]:
+def apply_filters[*Ts](
+        stmt: Select[*Ts], spec: QuerySpec, filters: Mapping[str, Any] | None
+) -> Select[*Ts]:
     """Apply ``WHERE`` clauses for the supplied filters.
 
     Filter keys use a ``field`` or ``field__operator`` convention. Values that
@@ -259,9 +260,9 @@ def _parse_sort(sort: str | Sequence[str]) -> list[tuple[str, bool]]:
     return parsed
 
 
-def apply_sort[T: tuple[Any, ...]](
-        stmt: Select[T], spec: QuerySpec, sort: str | Sequence[str] | None
-) -> Select[T]:
+def apply_sort[*Ts](
+        stmt: Select[*Ts], spec: QuerySpec, sort: str | Sequence[str] | None
+) -> Select[*Ts]:
     """Apply ``ORDER BY`` clauses for the requested sort expression.
 
     Falls back to ``spec.default_sort`` when ``sort`` is empty. Unknown fields
@@ -395,12 +396,12 @@ def _coerce_int(name: str, value: int | str | None) -> int | None:
         raise BadRequestError(f"'{name}' must be an integer.") from exc
 
 
-def apply_pagination[T: tuple[Any, ...]](
-        stmt: Select[T],
+def apply_pagination[*Ts](
+        stmt: Select[*Ts],
         *,
         limit: int | str | None = None,
         offset: int | str | None = None,
-) -> Select[T]:
+) -> Select[*Ts]:
     """Apply ``LIMIT``/``OFFSET`` clauses.
 
     ``limit`` must be a positive integer when provided. ``offset`` must be a
@@ -420,15 +421,15 @@ def apply_pagination[T: tuple[Any, ...]](
     return stmt
 
 
-def apply_query[T: tuple[Any, ...]](
-        stmt: Select[T],
+def apply_query[*Ts](
+        stmt: Select[*Ts],
         spec: QuerySpec,
         *,
         filters: Mapping[str, Any] | None = None,
         sort: str | Sequence[str] | None = None,
         limit: int | str | None = None,
         offset: int | str | None = None,
-) -> Select[T]:
+) -> Select[*Ts]:
     """Apply filtering, sorting, and pagination to ``stmt`` based on ``spec``."""
     stmt = apply_filters(stmt, spec, filters)
     stmt = apply_sort(stmt, spec, sort)

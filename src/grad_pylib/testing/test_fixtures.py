@@ -280,7 +280,7 @@ def test_create_db_session_fixture_rolls_back_changes_cleans_tables_and_runs_hoo
     def after_test() -> None:
         events.append("after")
         with engine.connect() as conn:
-            row_counts_after_cleanup.append(conn.exec_driver_sql("SELECT COUNT(*) FROM widgets").scalar())
+            row_counts_after_cleanup.append(conn.exec_driver_sql("SELECT COUNT(*) FROM widgets").scalar_one())
 
     generator = create_db_session_fixture(
         engine,

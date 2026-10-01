@@ -43,7 +43,7 @@ SPEC = QuerySpec(
 )
 
 
-def _sql(stmt: Select[Any]) -> str:
+def _sql(stmt: Select[*tuple[Any, ...]]) -> str:
     return str(stmt.compile(compile_kwargs={"literal_binds": True}))
 
 
@@ -450,6 +450,21 @@ def test_raw_where_clause_bind_preserves_prebound_scope_values(operator: str):
 def test_raw_where_clause_bind_rejects_generated_parameter_collision():
     clause = build_where_clause(SPEC, {"department_code": "1227"})
     stmt = text(clause.sql).bindparams(__grad_pylib_filter_1="trusted-value")
+
+    with pytest.raises(ValueError, match="already have values"):
+        clause.bind(stmt)
+
+
+@pytest.mark.parametrize("operator", ["eq", "in"])
+@pytest.mark.parametrize("trusted_value", [None, "trusted-value"])
+def test_raw_where_clause_bind_rejects_params_collision(
+    operator: str, trusted_value: str | None
+):
+    value = ["1227"] if operator == "in" else "1227"
+    clause = build_where_clause(SPEC, {f"department_code__{operator}": value})
+    stmt = text(f"SELECT * FROM foo_nominations {clause.sql}").params(
+        __grad_pylib_filter_1=trusted_value
+    )
 
     with pytest.raises(ValueError, match="already have values"):
         clause.bind(stmt)

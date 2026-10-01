@@ -13,9 +13,9 @@ dynamic = [
 requires-python = ">=3.14,<3.15"
 readme = "README.md"
 dependencies = [
-    "fastapi==0.141.1",
-    "uvicorn[standard]==0.53.0",
-    "sqlalchemy==2.0.54",
+    "fastapi==0.142.2",
+    "uvicorn[standard]==0.54.0",
+    "sqlalchemy==2.1.1",
     "fastapi-azure-auth==5.3.0",
     "pydantic-settings==2.15.0",
     "pyodbc==5.3.0",

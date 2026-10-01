@@ -82,7 +82,7 @@ def split_row_sections(
     return tuple(results)
 
 
-def read_all_result_sets(result: CursorResult[Any]) -> list[list[dict[str, Any]]]:
+def read_all_result_sets(result: CursorResult[*tuple[Any, ...]]) -> list[list[dict[str, Any]]]:
     """Read an unconsumed ``CursorResult`` using a driver supporting ``nextset``.
 
     Each result set becomes a list of dictionaries keyed by cursor column names;
@@ -131,7 +131,7 @@ def _resolve_nested_model(field_name: str, annotation: object) -> type[BaseModel
 
 
 def map_row_to_pydantic[T: BaseModel](
-        row: Row[Any],
+        row: Row[*tuple[Any, ...]],
         target_model: type[T],
         nest_mappings: Mapping[str, FromClause],
 ) -> T:

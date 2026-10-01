@@ -140,7 +140,7 @@ def connection() -> Iterator[Connection]:
 @pytest.fixture
 def cursor_result(
     connection: Connection, monkeypatch: pytest.MonkeyPatch,
-) -> Iterator[tuple[CursorResult[Any], _Cursor]]:
+) -> Iterator[tuple[CursorResult[*tuple[Any, ...]], _Cursor]]:
     cursor = _Cursor((
         (("id", "name"), [(1, "Name"), (2, None)]),
         (None, []),
@@ -155,7 +155,7 @@ def cursor_result(
 
 
 def test_read_all_result_sets_reads_all_sets_and_closes_cursor(
-    cursor_result: tuple[CursorResult[Any], _Cursor],
+    cursor_result: tuple[CursorResult[*tuple[Any, ...]], _Cursor],
 ) -> None:
     result, cursor = cursor_result
 
@@ -172,7 +172,7 @@ def test_read_all_result_sets_reads_all_sets_and_closes_cursor(
 
 @pytest.mark.parametrize("operation", ["fetchall", "nextset"])
 def test_read_all_result_sets_closes_cursor_on_driver_errors(
-    cursor_result: tuple[CursorResult[Any], _Cursor],
+    cursor_result: tuple[CursorResult[*tuple[Any, ...]], _Cursor],
     monkeypatch: pytest.MonkeyPatch,
     operation: str,
 ) -> None:
@@ -230,7 +230,7 @@ def test_cursor_rows_to_dicts_does_not_advance_or_close(
 
 
 def test_read_all_result_sets_closes_cursor_on_invalid_row_width(
-    cursor_result: tuple[CursorResult[Any], _Cursor],
+    cursor_result: tuple[CursorResult[*tuple[Any, ...]], _Cursor],
 ) -> None:
     result, cursor = cursor_result
     cursor.result_sets = ((("id", "name"), [(1,)]),)
