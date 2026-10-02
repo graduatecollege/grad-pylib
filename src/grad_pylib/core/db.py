@@ -39,12 +39,20 @@ def resolve_database_url(settings: BaseAppSettings | None = None) -> str:
     raise ValueError("DATABASE_URL must be set.")
 
 
+# Firewalls and NAT between the cluster and SQL Server silently drop idle TCP connections. A
+# pre-ping on such a connection blocks until the OS TCP timeout and can surface as ODBC 08S01
+# (TCP error 10060), so connections are replaced before checkout once they reach this age.
+DEFAULT_POOL_RECYCLE_SECONDS = 300
+
+
 class DatabaseRuntime:
     """Lazily create and share one SQLAlchemy engine and session factory for a database.
 
     The URL resolver is invoked only when the engine is first needed, allowing application
     settings to be registered before startup. Thread-safe initialization makes the runtime safe
     to expose as an application-level singleton; sessions remain request or task scoped.
+    `pool_recycle` replaces pooled connections older than the given number of seconds without
+    contacting the server, so long-idle connections are never pinged or reused; pass -1 to disable.
     """
     def __init__(
             self,
@@ -53,11 +61,13 @@ class DatabaseRuntime:
             pool_pre_ping: bool = True,
             pool_size: int = 5,
             max_overflow: int = 20,
+            pool_recycle: int = DEFAULT_POOL_RECYCLE_SECONDS,
     ) -> None:
         self._database_url_resolver = database_url_resolver
         self._pool_pre_ping = pool_pre_ping
         self._pool_size = pool_size
         self._max_overflow = max_overflow
+        self._pool_recycle = pool_recycle
         self._engine: Engine | None = None
         self._engine_lock = threading.Lock()
         self._session_factory: sessionmaker[Session] | None = None
@@ -73,6 +83,7 @@ class DatabaseRuntime:
                         pool_pre_ping=self._pool_pre_ping,
                         pool_size=self._pool_size,
                         max_overflow=self._max_overflow,
+                        pool_recycle=self._pool_recycle,
                     )
                     self._engine = engine
                     return engine
@@ -201,6 +212,7 @@ class NamedDatabases:
             pool_pre_ping: bool = True,
             pool_size: int = 5,
             max_overflow: int = 20,
+            pool_recycle: int = DEFAULT_POOL_RECYCLE_SECONDS,
     ) -> None:
         if not database_url_resolvers:
             raise ValueError("At least one named database must be configured.")
@@ -219,6 +231,7 @@ class NamedDatabases:
                 pool_pre_ping=pool_pre_ping,
                 pool_size=pool_size,
                 max_overflow=max_overflow,
+                pool_recycle=pool_recycle,
             )
             self._databases[normalized_name] = NamedDatabase(normalized_name, runtime)
 
@@ -242,6 +255,7 @@ class NamedDatabases:
             pool_pre_ping: bool = True,
             pool_size: int = 5,
             max_overflow: int = 20,
+            pool_recycle: int = DEFAULT_POOL_RECYCLE_SECONDS,
     ) -> Self:
         """Build named runtimes whose URLs are read lazily from application settings.
 
@@ -257,6 +271,7 @@ class NamedDatabases:
             pool_pre_ping=pool_pre_ping,
             pool_size=pool_size,
             max_overflow=max_overflow,
+            pool_recycle=pool_recycle,
         )
 
     @property

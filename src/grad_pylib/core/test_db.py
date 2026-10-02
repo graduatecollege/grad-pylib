@@ -158,6 +158,7 @@ def test_database_runtime_reuses_engine_and_session_factory(runtime_spy: Runtime
         pool_pre_ping=False,
         pool_size=7,
         max_overflow=11,
+        pool_recycle=60,
     )
 
     assert runtime.get_engine() is runtime_spy.engine
@@ -165,7 +166,7 @@ def test_database_runtime_reuses_engine_and_session_factory(runtime_spy: Runtime
     assert runtime_spy.create_engine_calls == [
         (
             "mssql+pyodbc://example",
-            {"pool_pre_ping": False, "pool_size": 7, "max_overflow": 11},
+            {"pool_pre_ping": False, "pool_size": 7, "max_overflow": 11, "pool_recycle": 60},
         )
     ]
 
@@ -257,11 +258,11 @@ def test_named_databases_registers_and_looks_up_runtimes(runtime_spy: RuntimeSpy
     assert runtime_spy.create_engine_calls == [
         (
             build_mssql_url("Driver={ODBC Driver 18 for SQL Server};Server=app"),
-            {"pool_pre_ping": True, "pool_size": 7, "max_overflow": 11},
+            {"pool_pre_ping": True, "pool_size": 7, "max_overflow": 11, "pool_recycle": 300},
         ),
         (
             build_mssql_url("Driver={ODBC Driver 18 for SQL Server};Server=codebook"),
-            {"pool_pre_ping": True, "pool_size": 7, "max_overflow": 11},
+            {"pool_pre_ping": True, "pool_size": 7, "max_overflow": 11, "pool_recycle": 300},
         ),
     ]
 
