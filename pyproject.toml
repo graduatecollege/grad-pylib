@@ -36,7 +36,7 @@ test = [
 dev = [
     "sqlacodegen==4.0.4",
     "pymssql==2.4.2",
-    "ty==0.0.84",
+    "ty==0.0.85",
     "ruff==0.16.10",
 ]
 
@@ -52,7 +52,7 @@ test = [
 dev = [
     "sqlacodegen==4.0.4",
     "pymssql==2.4.2",
-    "ty==0.0.84",
+    "ty==0.0.85",
     "ruff==0.16.10",
 ]
 
