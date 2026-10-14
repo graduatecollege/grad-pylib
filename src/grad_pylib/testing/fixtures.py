@@ -455,7 +455,7 @@ def create_e2e_database_bundle(
         *,
         app_database_name: str | None = None,
 ) -> Generator[ManagedE2eDatabases]:
-    from testcontainers.mssql import SqlServerContainer
+    from testcontainers.community.mssql import SqlServerContainer
 
     database_name = app_database_name or f"{fixture_config.database_prefix}_e2e"
     with SqlServerContainer(**build_sql_server_container_kwargs(

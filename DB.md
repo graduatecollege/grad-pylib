@@ -73,3 +73,45 @@ from app.db import DbSession
 def read_items(session: DbSession) -> list[dict[str, object]]:
     ...
 ```
+
+## Lost connections
+
+A pooled connection can be reset mid-request by the network or the server, surfacing as ODBC
+`08S01`. SQLAlchemy discards the connection and the pool recovers on its own, but the operation in
+flight fails. grad-pylib handles that failure at three levels:
+
+* **Reads:** add `@retry_on_disconnect` below the route decorator of each endpoint that only
+  reads. The endpoint runs once more, after its sessions are rolled back so they reconnect.
+  This works for any HTTP method, such as a search sent as POST to keep its criteria out of URLs.
+  A connection lost inside a FastAPI dependency is not retried, because dependencies run before
+  the endpoint.
+
+  ```python
+  @router.get("/items")
+  @retry_on_disconnect
+  def read_items(session: DbSession) -> ItemsResponse:
+      ...
+  ```
+
+* **Writes:** `retry_on_transient_conflict` retries a lost connection along with deadlocks, lock
+  timeouts, and RCSI conflicts. Use it on operations that are safe to repeat; never use
+  `retry_on_disconnect` on an endpoint that writes.
+* **Everything else:** `register_exception_handlers` answers a lost connection with HTTP 503 and
+  `Retry-After: 1` instead of a 500. Clients should retry automatically only for safe methods.
+
+A connection lost during commit is never retried, because the commit may already have been
+applied. `is_retryable_disconnect` makes that distinction from the ODBC function pyodbc names in
+its error message.
+
+### Log events
+
+| Event                          | Level   | Meaning                                                               |
+|--------------------------------|---------|-----------------------------------------------------------------------|
+| `db.disconnect`                | warning | A connection was lost; includes `connection_age_seconds`              |
+| `db.disconnect.pre_ping`       | info    | Pre-ping found a dead pooled connection and replaced it transparently |
+| `db.retry`                     | warning | A decorated function is retrying; `reason` names the error type       |
+| `db.retry.succeeded`           | info    | A `retry_on_disconnect` retry succeeded                               |
+| `db.request_failed.disconnect` | warning | The request failed with 503; includes the traceback                   |
+
+Disconnect events carry `sqlstate`, `driver_message`, and `during_commit`; the SQL statement and
+its parameters are never logged.

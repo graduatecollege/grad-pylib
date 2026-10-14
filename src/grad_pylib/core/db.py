@@ -1,19 +1,25 @@
 from collections.abc import Callable, Generator, Mapping
 from contextlib import AbstractContextManager, contextmanager
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Self, TypeGuard
+import functools
 import re
 import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
+from inspect import iscoroutinefunction
 
+import structlog
 from fastapi import Depends
 from grad_pylib.core.config import BaseAppSettings, get_settings
 from pydantic import BaseModel
-from sqlalchemy import URL, create_engine, inspect, Table, Select, select
-from sqlalchemy.engine import Engine
+from sqlalchemy import URL, create_engine, event, inspect, Table, Select, select
+from sqlalchemy.engine import Engine, ExceptionContext
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, DeclarativeBase, load_only, sessionmaker
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_incrementing, RetryCallState
+
+_logger = structlog.get_logger(__name__)
 
 
 def build_mssql_url(odbc_connection_string: str) -> str:
@@ -43,6 +49,83 @@ def resolve_database_url(settings: BaseAppSettings | None = None) -> str:
 # pre-ping on such a connection blocks until the OS TCP timeout and can surface as ODBC 08S01
 # (TCP error 10060), so connections are replaced before checkout once they reach this age.
 DEFAULT_POOL_RECYCLE_SECONDS = 300
+
+# pyodbc ends each driver message with the failing ODBC function; SQLEndTran is the commit call.
+_COMMIT_DRIVER_FUNCTION = "(SQLEndTran"
+_CONNECTED_AT_INFO_KEY = "grad_pylib_connected_at"
+
+
+def is_disconnect_error(exc: BaseException) -> TypeGuard[DBAPIError]:
+    """Return whether SQLAlchemy discarded the connection because it was lost or unusable.
+
+    The pool replaces such connections automatically, so only the operation in flight failed.
+    """
+    return isinstance(exc, DBAPIError) and exc.connection_invalidated
+
+
+def is_retryable_disconnect(exc: BaseException) -> TypeGuard[DBAPIError]:
+    """Return whether a lost connection certainly left no committed work behind.
+
+    SQL Server rolls back an open transaction when its connection drops, so losing the connection
+    while connecting or executing a statement is safe to retry. Losing it during commit is not: the
+    commit may already have been applied. Detection relies on pyodbc naming the failing ODBC
+    function in its message, which holds for the `mssql+pyodbc` dialect this library targets.
+    """
+    return is_disconnect_error(exc) and _COMMIT_DRIVER_FUNCTION not in _driver_message(exc.orig)
+
+
+def describe_disconnect(exc: DBAPIError) -> dict[str, Any]:
+    """Return log fields describing a lost connection without the SQL statement or parameters."""
+    return _driver_error_fields(exc.orig)
+
+
+def _driver_message(driver_error: BaseException | None) -> str:
+    args = getattr(driver_error, "args", ())
+    return str(args[1]) if len(args) > 1 else ""
+
+
+def _driver_error_fields(driver_error: BaseException | None) -> dict[str, Any]:
+    args = getattr(driver_error, "args", ())
+    message = _driver_message(driver_error)
+    return {
+        "sqlstate": str(args[0]) if args else None,
+        "driver_message": message,
+        "during_commit": _COMMIT_DRIVER_FUNCTION in message,
+    }
+
+
+def _record_connect_time(_dbapi_connection: Any, connection_record: Any) -> None:
+    connection_record.info[_CONNECTED_AT_INFO_KEY] = time.monotonic()
+
+
+def _log_disconnect(context: ExceptionContext) -> None:
+    # An exception escaping a handle_error listener would replace the database error being raised.
+    try:
+        if not context.is_disconnect:
+            return
+
+        fields = _driver_error_fields(context.original_exception)
+        if context.is_pre_ping:
+            _logger.info("db.disconnect.pre_ping", **fields)
+            return
+
+        connection = context.connection
+        # Reading `info` from an invalidated Connection would make SQLAlchemy reconnect it.
+        has_live_connection = connection is not None and not connection.invalidated and not connection.closed
+        connected_at = connection.info.get(_CONNECTED_AT_INFO_KEY) if has_live_connection else None
+        connection_age = round(time.monotonic() - connected_at, 3) if connected_at is not None else None
+        _logger.warning("db.disconnect", connection_age_seconds=connection_age, **fields)
+    except Exception:
+        pass
+
+
+def _install_disconnect_logging(engine: Engine) -> None:
+    """Log each lost connection with its age so drops can be correlated with network events.
+
+    Pre-ping failures are logged at info level because the pool recovers from them transparently.
+    """
+    event.listen(engine, "connect", _record_connect_time)
+    event.listen(engine, "handle_error", _log_disconnect)
 
 
 class DatabaseRuntime:
@@ -85,6 +168,7 @@ class DatabaseRuntime:
                         max_overflow=self._max_overflow,
                         pool_recycle=self._pool_recycle,
                     )
+                    _install_disconnect_logging(engine)
                     self._engine = engine
                     return engine
         return self._engine
@@ -446,9 +530,12 @@ def parse_mssql_error(e: DBAPIError, idempotency_markers: tuple[str, ...] = ()) 
 
 
 def _is_transient_conflict(exc: BaseException) -> bool:
-    """Return True for transient SQL Server modifications or race conditions."""
+    """Return True for transient SQL Server contention or a lost connection that is safe to retry."""
     if not isinstance(exc, DBAPIError):
         return False
+
+    if is_retryable_disconnect(exc):
+        return True
 
     error = parse_mssql_error(exc)
 
@@ -459,38 +546,95 @@ def _is_transient_conflict(exc: BaseException) -> bool:
     }
 
 
-def _rollback_session_before_sleep(retry_state: RetryCallState):
-    """Automatically rolls back the DB session associated with the failed call."""
-    # Look for the 'db' or 'session' argument passed to the function
-    kwargs = retry_state.kwargs
-    args = retry_state.args
+def _log_retry(operation: Callable[..., Any] | None, attempt: int, exc: DBAPIError, next_wait: float) -> None:
+    if is_disconnect_error(exc):
+        reason_fields = {"reason": "connection_lost", **describe_disconnect(exc)}
+    else:
+        parsed = parse_mssql_error(exc)
+        reason_fields = {"reason": parsed.error_type.value, "native_code": parsed.native_code}
+    _logger.warning(
+        "db.retry",
+        operation=getattr(operation, "__qualname__", None),
+        attempt=attempt,
+        next_wait_seconds=next_wait,
+        **reason_fields,
+    )
 
-    session = next((arg for arg in args if isinstance(arg, Session)), None)
-    if not session:
-        session = next((val for val in kwargs.values() if isinstance(val, Session)), None)
 
-    if session:
-        session.rollback()
+def _rollback_sessions(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> None:
+    """Roll back every `Session` passed to a failed call so the retry can use it again."""
+    for value in (*args, *kwargs.values()):
+        if isinstance(value, Session):
+            value.rollback()
+
+
+def _before_retry_sleep(retry_state: RetryCallState) -> None:
+    """Log the retry, then roll back the DB sessions passed to the failed call."""
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    if isinstance(exc, DBAPIError):
+        _log_retry(retry_state.fn, retry_state.attempt_number, exc, retry_state.upcoming_sleep)
+    _rollback_sessions(retry_state.args, retry_state.kwargs)
 
 
 def retry_on_transient_conflict[**P, T](func: Callable[P, T]) -> Callable[P, T]:
-    """Retry an idempotent database operation after transient SQL Server contention.
+    """Retry an idempotent database operation after transient SQL Server contention or a lost connection.
 
     Deadlocks, lock timeouts, and RCSI conflicts on concurrent transactions can prevent this
     attempt from safely completing when the request itself may be valid. A short retry lets
     the competing transaction finish and reruns the operation against current database state.
-    Decorated calls make up to three attempts, waiting 50 then 100 milliseconds. Before each retry,
-    a passed `Session` is rolled back so it can be used again; the final database error is
-    re-raised. Use only for operations that are safe to repeat, and pass the session as an
-    argument so failed transactions are reset.
+    A connection lost while connecting or executing a statement is retried the same way, since
+    SQL Server rolled the transaction back; one lost during commit is re-raised because the commit
+    may have been applied (see `is_retryable_disconnect`).
+
+    Decorated calls make up to three attempts, waiting 50 then 100 milliseconds, and log each retry
+    as `db.retry`. Before each retry, a passed `Session` is rolled back so it can be used again; the
+    final database error is re-raised. Use only for operations that are safe to repeat, and pass
+    the session as an argument so failed transactions are reset. Commit at most once per call:
+    a retry after an earlier commit in the same call would repeat the committed work.
     """
     return retry(
         retry=retry_if_exception(_is_transient_conflict),
         stop=stop_after_attempt(3),
         wait=wait_incrementing(start=0.05, increment=0.05),
-        before_sleep=_rollback_session_before_sleep,
+        before_sleep=_before_retry_sleep,
         reraise=True,
     )(func)
+
+
+def retry_on_disconnect[**P, T](func: Callable[P, T]) -> Callable[P, T]:
+    """Run a read-only function once more if its database connection is lost.
+
+    Intended for read endpoints, applied below the route decorator:
+
+        @router.get("/items")
+        @retry_on_disconnect
+        def read_items(session: DbSession) -> ...:
+
+    The pool replaces a lost connection, so the second attempt runs on a fresh one. Every `Session`
+    argument is rolled back first so it can be used again. Failures inside FastAPI dependencies
+    happen before the function runs and are not retried. Connections lost during commit are not
+    retried either (see `is_retryable_disconnect`), and neither is a second failure. Logs
+    `db.retry` before retrying and `db.retry.succeeded` when the retry works. Never apply to
+    functions that write; use `retry_on_transient_conflict` for operations safe to repeat.
+    """
+    if iscoroutinefunction(func):
+        raise TypeError("retry_on_disconnect supports synchronous functions only.")
+
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        try:
+            return func(*args, **kwargs)
+        except DBAPIError as exc:
+            if not is_retryable_disconnect(exc):
+                raise
+            _log_retry(func, 1, exc, 0.0)
+            _rollback_sessions(args, kwargs)
+
+        result = func(*args, **kwargs)
+        _logger.info("db.retry.succeeded", operation=getattr(func, "__qualname__", None))
+        return result
+
+    return wrapper
 
 
 def _coerce_model_data(

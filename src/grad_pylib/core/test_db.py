@@ -1,13 +1,15 @@
+import sqlite3
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated, Any
 
 import pytest
-from fastapi import Depends, FastAPI
+from fastapi import Body, Depends, FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
-from sqlalchemy import Integer, String, create_engine, inspect as sa_inspect
-from sqlalchemy.engine import make_url
+from sqlalchemy import Integer, String, create_engine, inspect as sa_inspect, text
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -101,7 +103,7 @@ def runtime_spy(monkeypatch: pytest.MonkeyPatch) -> RuntimeSpy:
     create_engine_calls: list[tuple[str, dict[str, object]]] = []
     sessionmaker_calls: list[dict[str, object]] = []
     sessions: list[DummySession] = []
-    engine = object()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
 
     def fake_create_engine(url: str, **kwargs: object) -> object:
         create_engine_calls.append((url, kwargs))
@@ -680,6 +682,353 @@ def test_is_transient_conflict_only_retries_known_transient_errors(
     expected: bool,
 ) -> None:
     assert db_module._is_transient_conflict(error) is expected
+
+
+LOST_CONNECTION_MESSAGE = "[Microsoft][ODBC Driver 18 for SQL Server]TCP Provider: Error code 0x68 (104)"
+
+
+def make_disconnect_error(driver_function: str, *, invalidated: bool = True) -> DBAPIError:
+    return DBAPIError(
+        "select 1",
+        {},
+        DummyDriverError("08S01", f"{LOST_CONNECTION_MESSAGE} ({driver_function})"),
+        connection_invalidated=invalidated,
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "disconnect", "retryable"),
+    [
+        (make_disconnect_error("SQLExecDirectW"), True, True),
+        (make_disconnect_error("SQLDriverConnect"), True, True),
+        (make_disconnect_error("SQLEndTran"), True, False),
+        (make_disconnect_error("SQLExecDirectW", invalidated=False), False, False),
+        (ValueError("not a db error"), False, False),
+    ],
+)
+def test_disconnect_classification_only_retries_connections_lost_before_commit(
+    error: BaseException,
+    disconnect: bool,
+    retryable: bool,
+) -> None:
+    assert db_module.is_disconnect_error(error) is disconnect
+    assert db_module.is_retryable_disconnect(error) is retryable
+    assert db_module._is_transient_conflict(error) is retryable
+
+
+def test_describe_disconnect_reports_driver_fields_without_statement() -> None:
+    fields = db_module.describe_disconnect(make_disconnect_error("SQLEndTran"))
+
+    assert fields == {
+        "sqlstate": "08S01",
+        "driver_message": f"{LOST_CONNECTION_MESSAGE} (SQLEndTran)",
+        "during_commit": True,
+    }
+
+
+class LogRecorder:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, dict[str, object]]] = []
+
+    def warning(self, event: str, /, **fields: object) -> None:
+        self.events.append(("warning", event, fields))
+
+    def info(self, event: str, /, **fields: object) -> None:
+        self.events.append(("info", event, fields))
+
+    def named(self, event: str) -> list[dict[str, object]]:
+        return [fields for _, name, fields in self.events if name == event]
+
+
+@pytest.fixture
+def db_logs(monkeypatch: pytest.MonkeyPatch) -> LogRecorder:
+    recorder = LogRecorder()
+    monkeypatch.setattr(db_module, "_logger", recorder)
+    return recorder
+
+
+@dataclass
+class FlakyEngine:
+    """SQLite engine that loses its connection on demand, as pyodbc reports it for SQL Server."""
+    engine: Engine
+    statement_failures: int = 0
+    commit_failures: int = 0
+
+
+@pytest.fixture
+def flaky_engine(monkeypatch: pytest.MonkeyPatch) -> Generator[FlakyEngine]:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    db_module._install_disconnect_logging(engine)
+    # Connect once so the dialect's first-connect initialization cannot consume a failure.
+    with engine.connect():
+        pass
+    flaky = FlakyEngine(engine)
+    dialect = engine.dialect
+    real_execute = dialect.do_execute
+    real_commit = dialect.do_commit
+
+    def lose_connection(driver_function: str) -> sqlite3.OperationalError:
+        return sqlite3.OperationalError("08S01", f"{LOST_CONNECTION_MESSAGE} ({driver_function})")
+
+    def do_execute(cursor: Any, statement: str, parameters: Any, context: Any = None) -> None:
+        if flaky.statement_failures:
+            flaky.statement_failures -= 1
+            raise lose_connection("SQLExecDirectW")
+        real_execute(cursor, statement, parameters, context)
+
+    def do_commit(dbapi_connection: Any) -> None:
+        if flaky.commit_failures:
+            flaky.commit_failures -= 1
+            raise lose_connection("SQLEndTran")
+        real_commit(dbapi_connection)
+
+    monkeypatch.setattr(dialect, "do_execute", do_execute)
+    monkeypatch.setattr(dialect, "do_commit", do_commit)
+    monkeypatch.setattr(dialect, "is_disconnect", lambda error, *_: error.args[:1] == ("08S01",))
+    yield flaky
+    engine.dispose()
+
+
+def test_retry_on_transient_conflict_retries_statement_lost_connection_on_fresh_connection(
+    flaky_engine: FlakyEngine,
+    db_logs: LogRecorder,
+) -> None:
+    attempts: list[int] = []
+
+    @db_module.retry_on_transient_conflict
+    def write(session: Session) -> int:
+        attempts.append(1)
+        value = session.execute(text("select 1")).scalar_one()
+        session.commit()
+        return value
+
+    flaky_engine.statement_failures = 1
+    with Session(flaky_engine.engine) as session:
+        assert write(session) == 1
+
+    assert len(attempts) == 2
+    [disconnect] = db_logs.named("db.disconnect")
+    assert disconnect["during_commit"] is False
+    assert isinstance(disconnect["connection_age_seconds"], float)
+    [retry_log] = db_logs.named("db.retry")
+    assert retry_log["reason"] == "connection_lost"
+    assert retry_log["attempt"] == 1
+    assert retry_log["sqlstate"] == "08S01"
+    assert str(retry_log["operation"]).endswith("write")
+
+
+def test_retry_on_transient_conflict_reraises_connection_lost_during_commit(
+    flaky_engine: FlakyEngine,
+    db_logs: LogRecorder,
+) -> None:
+    attempts: list[int] = []
+
+    @db_module.retry_on_transient_conflict
+    def write(session: Session) -> None:
+        attempts.append(1)
+        session.execute(text("select 1"))
+        session.commit()
+
+    flaky_engine.commit_failures = 1
+    with Session(flaky_engine.engine) as session, pytest.raises(DBAPIError) as raised:
+        write(session)
+
+    assert raised.value.connection_invalidated
+    assert len(attempts) == 1
+    assert db_logs.named("db.retry") == []
+    [disconnect] = db_logs.named("db.disconnect")
+    assert disconnect["during_commit"] is True
+
+
+def test_retry_on_transient_conflict_logs_contention_retries(db_logs: LogRecorder) -> None:
+    attempts: list[int] = []
+
+    @db_module.retry_on_transient_conflict
+    def write() -> str:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise make_sql_server_error("40001", sql_server_message("Transaction deadlocked", 1205))
+        return "done"
+
+    assert write() == "done"
+    [retry_log] = db_logs.named("db.retry")
+    assert retry_log["reason"] == "deadlock"
+    assert retry_log["native_code"] == 1205
+    assert "driver_message" not in retry_log
+
+
+def test_retry_on_disconnect_runs_again_on_a_fresh_connection(
+    flaky_engine: FlakyEngine,
+    db_logs: LogRecorder,
+) -> None:
+    attempts: list[int] = []
+
+    @db_module.retry_on_disconnect
+    def read(session: Session) -> int:
+        attempts.append(1)
+        return session.execute(text("select 1")).scalar_one()
+
+    flaky_engine.statement_failures = 1
+    with Session(flaky_engine.engine) as session:
+        assert read(session) == 1
+
+    assert len(attempts) == 2
+    assert [event for _, event, _ in db_logs.events] == ["db.disconnect", "db.retry", "db.retry.succeeded"]
+    [retry_log] = db_logs.named("db.retry")
+    assert retry_log["reason"] == "connection_lost"
+    assert retry_log["during_commit"] is False
+    assert str(retry_log["operation"]).endswith("read")
+
+
+def test_retry_on_disconnect_rolls_back_every_session_argument(flaky_engine: FlakyEngine) -> None:
+    healthy_engine = create_engine("sqlite+pysqlite:///:memory:")
+    attempts: list[int] = []
+
+    @db_module.retry_on_disconnect
+    def read(session: Session, *, other_session: Session) -> int:
+        attempts.append(1)
+        session.execute(text("select 1"))
+        return other_session.execute(text("select 2")).scalar_one()
+
+    with Session(healthy_engine) as session, Session(flaky_engine.engine) as other_session:
+        # Fail the second session's statement, after the first session has begun a transaction.
+        flaky_engine.statement_failures = 1
+        assert read(session, other_session=other_session) == 2
+
+    assert len(attempts) == 2
+    healthy_engine.dispose()
+
+
+def test_retry_on_disconnect_reraises_a_second_lost_connection(
+    flaky_engine: FlakyEngine,
+    db_logs: LogRecorder,
+) -> None:
+    attempts: list[int] = []
+
+    @db_module.retry_on_disconnect
+    def read(session: Session) -> None:
+        attempts.append(1)
+        session.execute(text("select 1"))
+
+    flaky_engine.statement_failures = 2
+    with Session(flaky_engine.engine) as session, pytest.raises(DBAPIError) as raised:
+        read(session)
+
+    assert raised.value.connection_invalidated
+    assert len(attempts) == 2
+    assert db_logs.named("db.retry.succeeded") == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        make_disconnect_error("SQLEndTran"),
+        make_sql_server_error("40001", sql_server_message("Transaction deadlocked", 1205)),
+    ],
+)
+def test_retry_on_disconnect_does_not_retry_other_errors(error: DBAPIError, db_logs: LogRecorder) -> None:
+    attempts: list[int] = []
+
+    @db_module.retry_on_disconnect
+    def read() -> None:
+        attempts.append(1)
+        raise error
+
+    with pytest.raises(DBAPIError):
+        read()
+
+    assert len(attempts) == 1
+    assert db_logs.events == []
+
+
+def test_retry_on_disconnect_rejects_async_functions() -> None:
+    async def read() -> None:
+        pass
+
+    with pytest.raises(TypeError, match="synchronous functions only"):
+        db_module.retry_on_disconnect(read)
+
+
+def test_retry_on_disconnect_keeps_fastapi_endpoint_parameters(flaky_engine: FlakyEngine) -> None:
+    def get_session() -> Generator[Session]:
+        with Session(flaky_engine.engine) as session:
+            yield session
+
+    app = FastAPI()
+
+    @app.post("/search")
+    @db_module.retry_on_disconnect
+    def search(session: Annotated[Session, Depends(get_session)], query: Annotated[str, Body(embed=True)]) -> dict[str, Any]:
+        return {"query": query, "value": session.execute(text("select 1")).scalar_one()}
+
+    flaky_engine.statement_failures = 1
+    response = TestClient(app).post("/search", json={"query": "smith"})
+
+    assert response.status_code == 200
+    assert response.json() == {"query": "smith", "value": 1}
+
+
+def test_disconnect_logging_reports_pre_ping_failures_at_info(
+    monkeypatch: pytest.MonkeyPatch,
+    db_logs: LogRecorder,
+) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", pool_pre_ping=True)
+    db_module._install_disconnect_logging(engine)
+    with engine.connect() as connection:
+        connection.execute(text("select 1"))
+
+    ping_failures = [1]
+    real_ping = engine.dialect.do_ping
+
+    def ping_once_failing(dbapi_connection: Any) -> bool:
+        if ping_failures:
+            ping_failures.pop()
+            raise sqlite3.OperationalError("08S01", f"{LOST_CONNECTION_MESSAGE} (SQLExecDirectW)")
+        return real_ping(dbapi_connection)
+
+    monkeypatch.setattr(engine.dialect, "do_ping", ping_once_failing)
+    monkeypatch.setattr(engine.dialect, "is_disconnect", lambda error, *_: error.args[:1] == ("08S01",))
+    with engine.connect() as connection:
+        connection.execute(text("select 1"))
+    engine.dispose()
+
+    assert db_logs.events == [
+        (
+            "info",
+            "db.disconnect.pre_ping",
+            {"sqlstate": "08S01", "driver_message": f"{LOST_CONNECTION_MESSAGE} (SQLExecDirectW)", "during_commit": False},
+        ),
+    ]
+
+
+def test_disconnect_logging_does_not_reconnect_an_invalidated_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    db_logs: LogRecorder,
+) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'reconnect.db'}")
+    db_module._install_disconnect_logging(engine)
+    connect_attempts: list[None] = []
+
+    def failing_connect(*_args: Any, **_kwargs: Any) -> None:
+        connect_attempts.append(None)
+        raise sqlite3.OperationalError("08S01", f"{LOST_CONNECTION_MESSAGE} (SQLDriverConnect)")
+
+    with engine.connect() as connection:
+        connection.execute(text("select 1"))
+        connection.invalidate()
+        connection.rollback()
+        monkeypatch.setattr(engine.dialect, "connect", failing_connect)
+        monkeypatch.setattr(engine.dialect, "is_disconnect", lambda error, *_: error.args[:1] == ("08S01",))
+
+        with pytest.raises(DBAPIError):
+            connection.execute(text("select 1"))
+    engine.dispose()
+
+    assert len(connect_attempts) == 1
+    [fields] = db_logs.named("db.disconnect")
+    assert fields["connection_age_seconds"] is None
+    assert fields["sqlstate"] == "08S01"
 
 
 def test_select_exclude_omits_columns_from_table_select(session: Session) -> None:
