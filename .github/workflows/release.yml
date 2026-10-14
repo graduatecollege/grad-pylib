@@ -96,7 +96,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Create Release
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # ratchet:softprops/action-gh-release@v2
+      - name: Build Changelog
+        id: build_changelog
+        uses: mikepenz/release-changelog-builder-action@c9bcd8238b6f41e05561348339429d360b1c0247 # ratchet:mikepenz/release-changelog-builder-action@v6
         with:
-          generate_release_notes: true
+          configuration: ".github/changelog_config.json"
+          mode: 'COMMIT'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Create Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # ratchet:softprops/action-gh-release@v3
+        with:
+          body: ${{ steps.build_changelog.outputs.changelog }}
+          draft: false
+          prerelease: false
