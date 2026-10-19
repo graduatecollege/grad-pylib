@@ -1,3 +1,24 @@
+# To v7
+
+## `retry_on_transient_conflict` owns the write transaction
+
+The decorator now begins the transaction on the decorated function's session, commits when the function returns, and rolls back when it raises. See [Retrying writes](DB.md#retrying-writes) for the full pattern.
+
+1. **Remove `commit()` calls from decorated functions.** A statement after an inner commit now raises `InvalidRequestError`.
+2. **Pass exactly one `Session`.** Decorated functions that take no session or more than one now raise `TypeError`. A function that reaches its session through a closure must take it as an argument instead.
+3. **Call decorated functions with no transaction in progress.** A call raises `RuntimeError` if the session already has a transaction, including one autobegun by an earlier read or write, an outer `with session.begin():`, or an enclosing decorated function.
+   - Move the reads that decide what to write into the decorated function, so a retry reruns them.
+   - If an earlier read does not affect the write, end its transaction with `session.rollback()` before the call.
+   - Work that must commit together with the write belongs in the same decorated function. Queries after the call are fine and run in a new transaction.
+   - Application dependencies that read through the request session before the endpoint runs need to roll it back.
+4. **Remove async usage.** Decorating a coroutine function now raises `TypeError`.
+
+## Role override loaders
+
+1. **Make loaders read-only.** The session is rolled back after `override_loader` returns or raises, so any writes are discarded. Do writes elsewhere, in their own transaction.
+2. **Return plain data.** The rollback expires ORM objects loaded through the session, so build the user from values such as role names rather than keeping ORM objects on it.
+3. **Optionally share the endpoint's session.** Pass `get_session=databases["app"].get_session` to the auth factory to reuse the session behind `DbSession`. `databases.get_session` is a different callable, so FastAPI opens a second session for the request.
+
 # To v6
 
 ## Migrating a project to SQLAlchemy 2.1
