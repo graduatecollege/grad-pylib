@@ -8,7 +8,7 @@ import pytest
 from fastapi import Body, Depends, FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
-from sqlalchemy import Integer, String, create_engine, inspect as sa_inspect, text
+from sqlalchemy import Integer, String, create_engine, inspect as sa_inspect, select, text
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -798,9 +798,7 @@ def test_retry_on_transient_conflict_retries_statement_lost_connection_on_fresh_
     @db_module.retry_on_transient_conflict
     def write(session: Session) -> int:
         attempts.append(1)
-        value = session.execute(text("select 1")).scalar_one()
-        session.commit()
-        return value
+        return session.execute(text("select 1")).scalar_one()
 
     flaky_engine.statement_failures = 1
     with Session(flaky_engine.engine) as session:
@@ -827,7 +825,6 @@ def test_retry_on_transient_conflict_reraises_connection_lost_during_commit(
     def write(session: Session) -> None:
         attempts.append(1)
         session.execute(text("select 1"))
-        session.commit()
 
     flaky_engine.commit_failures = 1
     with Session(flaky_engine.engine) as session, pytest.raises(DBAPIError) as raised:
@@ -840,21 +837,183 @@ def test_retry_on_transient_conflict_reraises_connection_lost_during_commit(
     assert disconnect["during_commit"] is True
 
 
-def test_retry_on_transient_conflict_logs_contention_retries(db_logs: LogRecorder) -> None:
+def deadlock() -> DBAPIError:
+    return make_sql_server_error("40001", sql_server_message("Transaction deadlocked", 1205))
+
+
+def stored_values(session: Session) -> list[str]:
+    with session.begin():
+        return list(session.scalars(select(ExampleUpsertModel.value).order_by(ExampleUpsertModel.id)))
+
+
+def test_retry_on_transient_conflict_logs_contention_retries(session: Session, db_logs: LogRecorder) -> None:
     attempts: list[int] = []
 
     @db_module.retry_on_transient_conflict
-    def write() -> str:
+    def write(session: Session) -> str:
         attempts.append(1)
         if len(attempts) == 1:
-            raise make_sql_server_error("40001", sql_server_message("Transaction deadlocked", 1205))
+            raise deadlock()
         return "done"
 
-    assert write() == "done"
+    assert write(session) == "done"
     [retry_log] = db_logs.named("db.retry")
     assert retry_log["reason"] == "deadlock"
     assert retry_log["native_code"] == 1205
+    assert str(retry_log["operation"]).endswith("write")
     assert "driver_message" not in retry_log
+
+
+def test_retry_on_transient_conflict_commits_only_the_successful_attempt(session: Session) -> None:
+    attempts: list[int] = []
+
+    @db_module.retry_on_transient_conflict
+    def write(session: Session) -> ExampleUpsertModel:
+        attempts.append(1)
+        row = ExampleUpsertModel(id=len(attempts), value=f"attempt {len(attempts)}")
+        session.add(row)
+        session.flush()
+        if len(attempts) == 1:
+            raise deadlock()
+        return row
+
+    row = write(session)
+
+    assert len(attempts) == 2
+    assert not session.in_transaction()
+    assert row.value == "attempt 2"
+    assert stored_values(session) == ["attempt 2"]
+
+
+def test_retry_on_transient_conflict_accepts_the_session_as_a_keyword_argument(session: Session) -> None:
+    @db_module.retry_on_transient_conflict
+    def write(value: str, *, session: Session) -> None:
+        session.add(ExampleUpsertModel(id=1, value=value))
+
+    write("kept", session=session)
+
+    assert stored_values(session) == ["kept"]
+
+
+def test_retry_on_transient_conflict_allows_queries_after_the_call(session: Session) -> None:
+    @db_module.retry_on_transient_conflict
+    def write(session: Session) -> None:
+        session.add(ExampleUpsertModel(id=1, value="written"))
+
+    write(session)
+
+    assert session.scalars(select(ExampleUpsertModel.value)).all() == ["written"]
+    session.rollback()
+    assert stored_values(session) == ["written"]
+
+
+def test_retry_on_transient_conflict_reraises_after_the_final_attempt(session: Session) -> None:
+    attempts: list[int] = []
+
+    @db_module.retry_on_transient_conflict
+    def write(session: Session) -> None:
+        attempts.append(1)
+        session.add(ExampleUpsertModel(id=len(attempts), value="lost"))
+        session.flush()
+        raise deadlock()
+
+    with pytest.raises(DBAPIError):
+        write(session)
+
+    assert len(attempts) == 3
+    assert not session.in_transaction()
+    assert stored_values(session) == []
+
+
+def test_retry_on_transient_conflict_rolls_back_without_retrying_other_errors(session: Session) -> None:
+    attempts: list[int] = []
+
+    @db_module.retry_on_transient_conflict
+    def write(session: Session) -> None:
+        attempts.append(1)
+        session.add(ExampleUpsertModel(id=1, value="lost"))
+        session.flush()
+        raise ValueError("invalid")
+
+    with pytest.raises(ValueError, match="invalid"):
+        write(session)
+
+    assert len(attempts) == 1
+    assert not session.in_transaction()
+    assert stored_values(session) == []
+
+
+@pytest.mark.parametrize("begin_transaction", [
+    pytest.param(lambda session: session.execute(text("select 1")), id="autobegun-by-read"),
+    pytest.param(lambda session: session.begin(), id="explicit-begin"),
+])
+def test_retry_on_transient_conflict_rejects_a_transaction_in_progress(
+    session: Session,
+    begin_transaction: Callable[[Session], object],
+) -> None:
+    attempts: list[int] = []
+
+    @db_module.retry_on_transient_conflict
+    def write(session: Session) -> None:
+        attempts.append(1)
+
+    begin_transaction(session)
+    with pytest.raises(RuntimeError, match="must own its transaction"):
+        write(session)
+
+    assert attempts == []
+    assert session.in_transaction()
+
+
+def test_retry_on_transient_conflict_rejects_a_transaction_from_the_callers_write(session: Session) -> None:
+    session.add(ExampleUpsertModel(id=1, value="caller"))
+    session.flush()
+
+    @db_module.retry_on_transient_conflict
+    def write(session: Session) -> None:
+        session.add(ExampleUpsertModel(id=2, value="decorated"))
+
+    with pytest.raises(RuntimeError, match="must own its transaction"):
+        write(session)
+
+    session.commit()
+    assert stored_values(session) == ["caller"]
+
+
+def test_retry_on_transient_conflict_rejects_nested_decorated_calls(session: Session) -> None:
+    @db_module.retry_on_transient_conflict
+    def inner(session: Session) -> None:
+        session.add(ExampleUpsertModel(id=2, value="inner"))
+
+    @db_module.retry_on_transient_conflict
+    def outer(session: Session) -> None:
+        session.add(ExampleUpsertModel(id=1, value="outer"))
+        inner(session)
+
+    with pytest.raises(RuntimeError, match="inner must own its transaction"):
+        outer(session)
+
+    assert not session.in_transaction()
+    assert stored_values(session) == []
+
+
+def test_retry_on_transient_conflict_requires_exactly_one_session(session: Session) -> None:
+    @db_module.retry_on_transient_conflict
+    def write(*sessions: Session) -> None:
+        pass
+
+    with pytest.raises(TypeError, match="exactly one Session argument .*; got 0"):
+        write()
+    with pytest.raises(TypeError, match="exactly one Session argument .*; got 2"):
+        write(session, session)
+
+
+def test_retry_on_transient_conflict_rejects_coroutine_functions() -> None:
+    async def write(session: Session) -> None:
+        pass
+
+    with pytest.raises(TypeError, match="synchronous functions only"):
+        db_module.retry_on_transient_conflict(write)
 
 
 def test_retry_on_disconnect_runs_again_on_a_fresh_connection(

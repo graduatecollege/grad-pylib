@@ -95,3 +95,14 @@ OverrideFreeUserPolicy = Annotated[CurrentUser, auth_without_override.depends_on
 
 This keeps application-specific roles, claims parsing, and override rules in the application while
 moving the bootstrap wiring into `grad-pylib`.
+
+Override loaders receive the session from `get_session`. The session is rolled back after the loader
+returns so the endpoint starts without a transaction in progress, as `retry_on_transient_conflict`
+requires (see [DB.md](DB.md)). Loaders must therefore only read, and should return plain data such
+as role names rather than ORM objects, which the rollback expires. Loaders that cache their results
+need no session calls on a cache hit.
+
+FastAPI shares a dependency within a request only when it is the same callable. Pass
+`get_session=databases["app"].get_session` to reuse the endpoint's `DbSession` (from
+`databases.session_dependency()`); `databases.get_session` is a different callable and opens a
+second session for the request.

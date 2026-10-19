@@ -568,37 +568,69 @@ def _rollback_sessions(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> None
             value.rollback()
 
 
-def _before_retry_sleep(retry_state: RetryCallState) -> None:
-    """Log the retry, then roll back the DB sessions passed to the failed call."""
+def _log_before_retry_sleep(operation: Callable[..., Any], retry_state: RetryCallState) -> None:
     exc = retry_state.outcome.exception() if retry_state.outcome else None
     if isinstance(exc, DBAPIError):
-        _log_retry(retry_state.fn, retry_state.attempt_number, exc, retry_state.upcoming_sleep)
-    _rollback_sessions(retry_state.args, retry_state.kwargs)
+        _log_retry(operation, retry_state.attempt_number, exc, retry_state.upcoming_sleep)
+
+
+def _transaction_session(func: Callable[..., Any], args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Session:
+    name = getattr(func, "__qualname__", repr(func))
+    sessions = [value for value in (*args, *kwargs.values()) if isinstance(value, Session)]
+    if len(sessions) != 1:
+        raise TypeError(
+            f"{name} must receive exactly one Session argument to run in a retryable "
+            f"transaction; got {len(sessions)}."
+        )
+    session = sessions[0]
+    if session.in_transaction():
+        raise RuntimeError(
+            f"{name} must own its transaction, but its session already has one in progress. "
+            "Commit or roll back earlier work before calling it, and move reads the write depends on "
+            "into the decorated function."
+        )
+    return session
 
 
 def retry_on_transient_conflict[**P, T](func: Callable[P, T]) -> Callable[P, T]:
-    """Retry an idempotent database operation after transient SQL Server contention or a lost connection.
+    """Run a database write in its own transaction, retrying it after transient SQL Server failures.
 
-    Deadlocks, lock timeouts, and RCSI conflicts on concurrent transactions can prevent this
-    attempt from safely completing when the request itself may be valid. A short retry lets
-    the competing transaction finish and reruns the operation against current database state.
-    A connection lost while connecting or executing a statement is retried the same way, since
-    SQL Server rolled the transaction back; one lost during commit is re-raised because the commit
-    may have been applied (see `is_retryable_disconnect`).
+    The decorated function receives exactly one `Session` argument; the decorator begins a
+    transaction on it, commits when the function returns, and rolls back if it raises. The
+    function must not commit. Each attempt is a complete transaction, so a retry reruns all of
+    the function's reads and writes against current database state.
 
-    Decorated calls make up to three attempts, waiting 50 then 100 milliseconds, and log each retry
-    as `db.retry`. Before each retry, a passed `Session` is rolled back so it can be used again; the
-    final database error is re-raised. Use only for operations that are safe to repeat, and pass
-    the session as an argument so failed transactions are reset. Commit at most once per call:
-    a retry after an earlier commit in the same call would repeat the committed work.
+    Deadlocks, lock timeouts, and RCSI conflicts with concurrent transactions are retried, as is a
+    connection lost while connecting or executing a statement. SQL Server aborts the whole
+    transaction on a deadlock or lost connection, so retrying is only correct when the decorated
+    function owns all of it. A connection lost during commit is re-raised because the commit may
+    have been applied (see `is_retryable_disconnect`).
+
+    Calls make up to three attempts, waiting 50 then 100 milliseconds, log each retry as
+    `db.retry`, and re-raise the final error. A `TypeError` is raised unless exactly one `Session`
+    is passed, and a `RuntimeError` is raised if that session already has a transaction in
+    progress, including one autobegun by an earlier read or by an enclosing decorated call.
     """
-    return retry(
+    if iscoroutinefunction(func):
+        raise TypeError("retry_on_transient_conflict supports synchronous functions only.")
+
+    @retry(
         retry=retry_if_exception(_is_transient_conflict),
         stop=stop_after_attempt(3),
         wait=wait_incrementing(start=0.05, increment=0.05),
-        before_sleep=_before_retry_sleep,
+        before_sleep=functools.partial(_log_before_retry_sleep, func),
         reraise=True,
-    )(func)
+    )
+    def attempt(session: Session, /, *args: P.args, **kwargs: P.kwargs) -> T:
+        with session.begin():
+            return func(*args, **kwargs)
+
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        session = _transaction_session(func, args, kwargs)
+        return attempt(session, *args, **kwargs)
+
+    return wrapper
 
 
 def retry_on_disconnect[**P, T](func: Callable[P, T]) -> Callable[P, T]:
@@ -615,7 +647,7 @@ def retry_on_disconnect[**P, T](func: Callable[P, T]) -> Callable[P, T]:
     happen before the function runs and are not retried. Connections lost during commit are not
     retried either (see `is_retryable_disconnect`), and neither is a second failure. Logs
     `db.retry` before retrying and `db.retry.succeeded` when the retry works. Never apply to
-    functions that write; use `retry_on_transient_conflict` for operations safe to repeat.
+    functions that write; use `retry_on_transient_conflict` for those.
     """
     if iscoroutinefunction(func):
         raise TypeError("retry_on_disconnect supports synchronous functions only.")

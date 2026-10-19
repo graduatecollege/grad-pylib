@@ -152,7 +152,11 @@ class AuthConfiguration(BaseModel):
 type ClaimsToUser = Callable[[dict[str, Any]], AuthUser]
 """Converts validated Azure AD claims into an application user."""
 type OverrideLoader = Callable[[AuthUser, Session], AuthUser]
-"""Loads application-specific authorization overrides for an authenticated user."""
+"""Loads application-specific authorization overrides for an authenticated user.
+
+The session is the one `get_session` provides, and it is rolled back after the loader returns, so loaders
+must only read, and must return plain data rather than ORM objects that the rollback expires.
+"""
 type ApiKeyUserBuilder = Callable[[str | None, Request], AuthUser]
 """Builds the development user selected by an API-key request's role header."""
 type SettingsProvider = Callable[[], BaseAppSettings]
@@ -586,7 +590,13 @@ def _apply_override(
 
     original_subject = subject_of(user)
     original_roles = tuple(getattr(user, "effective_roles", ()))
-    user = override_loader(user, session)
+    try:
+        user = override_loader(user, session)
+    finally:
+        # Overrides only read; ending the transaction they autobegan returns the connection to the
+        # pool and lets the endpoint's `retry_on_transient_conflict` writes own their transaction.
+        if isinstance(session, Session):
+            session.rollback()
     effective_roles = tuple(getattr(user, "effective_roles", ()))
     if effective_roles != original_roles:
         _audit_logger.warning(

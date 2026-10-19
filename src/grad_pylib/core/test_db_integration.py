@@ -1,3 +1,5 @@
+import threading
+import time
 from collections.abc import Generator
 
 import pytest
@@ -197,7 +199,6 @@ def test_retry_on_transient_conflict_reconnects_after_a_lost_connection(
         if len(attempts) == 1:
             kill_connection(session, mssql_databases.app_engine)
         session.execute(text("INSERT INTO dbo.lost_connection_writes (id) VALUES (1)"))
-        session.commit()
 
     with lost_connection_sessions() as session:
         insert_row(session)
@@ -205,3 +206,65 @@ def test_retry_on_transient_conflict_reconnects_after_a_lost_connection(
 
     assert len(attempts) == 2
     assert rows == [1]
+
+
+@pytest.fixture
+def contended_sessions(mssql_databases: ManagedE2eDatabases) -> Generator[sessionmaker[Session]]:
+    engine = create_engine(mssql_databases.app_engine.url)
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE IF EXISTS dbo.contended_counters"))
+        connection.execute(text("DROP TABLE IF EXISTS dbo.contended_writes"))
+        connection.execute(text("CREATE TABLE dbo.contended_counters (id int NOT NULL PRIMARY KEY, v int NOT NULL)"))
+        connection.execute(text("INSERT INTO dbo.contended_counters (id, v) VALUES (1, 0), (2, 0)"))
+        connection.execute(text("CREATE TABLE dbo.contended_writes (attempt int NOT NULL PRIMARY KEY)"))
+    yield sessionmaker(engine)
+    engine.dispose()
+
+
+def deadlock_against(session: Session, competitor_engine: Engine) -> None:
+    """Make the session the victim of a deadlock with a higher-priority competing transaction."""
+    competitor_ready = threading.Event()
+
+    def competitor() -> None:
+        with competitor_engine.connect() as connection:
+            connection.execute(text("SET DEADLOCK_PRIORITY HIGH"))
+            connection.execute(text("UPDATE dbo.contended_counters SET v = v + 1 WHERE id = 2"))
+            competitor_ready.set()
+            connection.execute(text("UPDATE dbo.contended_counters SET v = v + 1 WHERE id = 1"))
+            connection.commit()
+
+    session.execute(text("UPDATE dbo.contended_counters SET v = v + 1 WHERE id = 1"))
+    thread = threading.Thread(target=competitor)
+    thread.start()
+    try:
+        assert competitor_ready.wait(10)
+        # Let the competitor block on row 1 before this session requests row 2.
+        time.sleep(0.3)
+        session.execute(text("UPDATE dbo.contended_counters SET v = v + 1 WHERE id = 2"))
+    finally:
+        thread.join(30)
+
+
+def test_retry_on_transient_conflict_commits_only_the_attempt_after_a_deadlock(
+        mssql_databases: ManagedE2eDatabases,
+        contended_sessions: sessionmaker[Session],
+) -> None:
+    attempts: list[None] = []
+
+    @retry_on_transient_conflict
+    def write(session: Session) -> None:
+        attempts.append(None)
+        session.execute(text("INSERT INTO dbo.contended_writes (attempt) VALUES (:attempt)"), {"attempt": len(attempts)})
+        if len(attempts) == 1:
+            deadlock_against(session, mssql_databases.app_engine)
+
+    with contended_sessions() as session:
+        write(session)
+        assert not session.in_transaction()
+        writes = session.execute(text("SELECT attempt FROM dbo.contended_writes")).scalars().all()
+        counters = session.execute(text("SELECT v FROM dbo.contended_counters ORDER BY id")).scalars().all()
+
+    assert len(attempts) == 2
+    assert writes == [2]
+    # Only the competitor's increments survive; the deadlock victim's were rolled back.
+    assert counters == [1, 1]

@@ -94,7 +94,7 @@ flight fails. grad-pylib handles that failure at three levels:
   ```
 
 * **Writes:** `retry_on_transient_conflict` retries a lost connection along with deadlocks, lock
-  timeouts, and RCSI conflicts. Use it on operations that are safe to repeat; never use
+  timeouts, and RCSI conflicts (see [Retrying writes](#retrying-writes)). Never use
   `retry_on_disconnect` on an endpoint that writes.
 * **Everything else:** `register_exception_handlers` answers a lost connection with HTTP 503 and
   `Retry-After: 1` instead of a 500. Clients should retry automatically only for safe methods.
@@ -102,6 +102,56 @@ flight fails. grad-pylib handles that failure at three levels:
 A connection lost during commit is never retried, because the commit may already have been
 applied. `is_retryable_disconnect` makes that distinction from the ODBC function pyodbc names in
 its error message.
+
+### Retrying writes
+
+`retry_on_transient_conflict` owns the transaction of the function it decorates. Each attempt
+begins a transaction on the function's `Session` argument, runs the function, and commits when it
+returns; an exception rolls the attempt back. Deadlocks, lock timeouts, RCSI conflicts, and
+connections lost before commit are retried up to three attempts in total.
+
+SQL Server aborts the whole transaction on a deadlock or lost connection, not just the statement
+that failed, so a retry is only correct when the decorated function did all the work in that
+transaction. The decorator enforces this:
+
+* The function must receive exactly one `Session` argument, or the call raises `TypeError`.
+* If that session already has a transaction in progress, the call raises `RuntimeError` before
+  running anything. That includes a transaction autobegun by an earlier read on the session and
+  one begun by an enclosing decorated call.
+* The function must not call `commit()`; the decorator commits.
+
+Decorate the part of the endpoint that writes, and put the reads that decide what to write inside
+it, so every attempt decides again from current data:
+
+```python
+@retry_on_transient_conflict
+def enroll_student(session: Session, course_id: int, student_id: int) -> Enrollment:
+    course = session.get_one(Course, course_id, with_for_update=True)
+    if course.seats_taken >= course.capacity:
+        raise ConflictError("Course is full.")
+    course.seats_taken += 1
+    enrollment = Enrollment(course_id=course_id, student_id=student_id)
+    session.add(enrollment)
+    return enrollment
+
+
+@router.post("/courses/{course_id}/enrollments")
+def create_enrollment(course_id: int, body: EnrollmentIn, user: UserPolicy, session: DbSession) -> EnrollmentOut:
+    enrollment = enroll_student(session, course_id, body.student_id)
+    # Committed; later reads start a new transaction that closes with the request.
+    return EnrollmentOut.model_validate(enrollment)
+```
+
+Reading through the session before the call, for example to load the course in the endpoint,
+raises `RuntimeError`. Move that read into the decorated function, or end the transaction with
+`session.rollback()` if the read does not affect the write. Work after the call runs in a new
+transaction: the decorated write is already committed and is not undone if a later step fails, so
+anything that must commit together belongs in the same decorated function. Use the sessions from
+`DatabaseRuntime`, whose objects are not expired on commit, so returned objects stay usable.
+
+Role overrides from `grad_pylib.core.auth` roll back the request session after loading, so they do
+not leave a transaction in progress (see [AUTH.md](AUTH.md)). Application dependencies that read
+through the request session before the endpoint runs need to do the same.
 
 ### Log events
 

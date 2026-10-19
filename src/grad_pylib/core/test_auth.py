@@ -13,6 +13,7 @@ from fastapi.security import SecurityScopes
 from fastapi.testclient import TestClient
 from fastapi_azure_auth import SingleTenantAzureAuthorizationCodeBearer
 from pydantic import ValidationError
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 from starlette.requests import Request
 
@@ -278,6 +279,43 @@ def test_dev_api_key_stores_only_the_application_user_on_request_state() -> None
     user = _policy_dependency([])(request=request, session=object(), azure_user=None)
 
     assert request.state.user is user
+
+
+def test_override_loader_session_is_rolled_back_after_loading() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    in_transaction_during_load: list[bool] = []
+
+    def load_override(user: auth_module.AuthUser, active_session: Session) -> auth_module.AuthUser:
+        active_session.execute(text("select 1"))
+        in_transaction_during_load.append(active_session.in_transaction())
+        return _auditor_override(user)
+
+    with Session(engine) as session:
+        user = _policy_dependency([], override_loader=load_override)(
+            request=_request(), session=session, azure_user=None,
+        )
+
+        assert user.effective_roles == ("Auditor",)
+        assert in_transaction_during_load == [True]
+        assert not session.in_transaction()
+    engine.dispose()
+
+
+def test_override_loader_session_is_rolled_back_when_loading_fails() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+
+    def load_override(_user: auth_module.AuthUser, active_session: Session) -> auth_module.AuthUser:
+        active_session.execute(text("select 1"))
+        raise LookupError("override store unavailable")
+
+    with Session(engine) as session:
+        with pytest.raises(LookupError):
+            _policy_dependency([], override_loader=load_override)(
+                request=_request(), session=session, azure_user=None,
+            )
+
+        assert not session.in_transaction()
+    engine.dispose()
 
 
 @pytest.mark.parametrize(
