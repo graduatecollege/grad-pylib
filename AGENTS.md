@@ -4,7 +4,7 @@ This is a shared FastAPI utilities project for the Graduate College.
 
 ## Instructions
 
-**Modern Python 3.14 is used**. Futures imports are not needed. Use built-in type hints when possible.
+**Modern Python 3.14+ is used (3.14 and 3.15 are supported)**. Futures imports are not needed. Use built-in type hints when possible.
 
 **If you need to run python** or **install dependencies**, use `uv`.
 

@@ -11,8 +11,14 @@ permissions:
 
 jobs:
   build:
-    name: Run tests and build package
+    name: Run tests and build package (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.14', '3.15']
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
 
     steps:
       - name: Check out the repository
@@ -29,7 +35,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # ratchet:actions/setup-python@v6
         with:
-          python-version: '3.14'
+          python-version: ${{ matrix.python-version }}
 
       - name: Install SQL Server ODBC driver
         shell: bash
