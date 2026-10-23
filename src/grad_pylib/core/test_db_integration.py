@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from grad_pylib.core.db import (
     SqlServerErrorType,
     describe_disconnect,
+    install_connection_reset,
     is_disconnect_error,
     is_retryable_disconnect,
     parse_mssql_error,
@@ -268,3 +269,36 @@ def test_retry_on_transient_conflict_commits_only_the_attempt_after_a_deadlock(
     assert writes == [2]
     # Only the competitor's increments survive; the deadlock victim's were rolled back.
     assert counters == [1, 1]
+
+
+
+@pytest.fixture
+def single_connection_engine(mssql_databases: ManagedE2eDatabases) -> Generator[Engine]:
+    engine = create_engine(mssql_databases.app_engine.url, pool_size=1, max_overflow=0)
+    install_connection_reset(engine)
+    yield engine
+    engine.dispose()
+
+
+def _session_state(engine: Engine) -> tuple[int, int]:
+    with engine.connect() as connection:
+        spid, nocount = connection.execute(text("SELECT @@SPID, @@OPTIONS & 512")).one()
+    return spid, nocount
+
+
+def test_connection_reset_clears_state_left_by_a_failed_batch(single_connection_engine: Engine) -> None:
+    with single_connection_engine.connect() as connection:
+        spid = connection.execute(text("SELECT @@SPID")).scalar_one()
+        with pytest.raises(DBAPIError):
+            # A conversion error aborts the batch before it can restore NOCOUNT.
+            connection.execute(text("SET NOCOUNT ON; SELECT CAST('x' AS int); SET NOCOUNT OFF;"))
+
+    assert _session_state(single_connection_engine) == (spid, 0)
+
+
+def test_connection_reset_skips_clean_returns(single_connection_engine: Engine) -> None:
+    with single_connection_engine.connect() as connection:
+        spid = connection.execute(text("SET NOCOUNT ON; SELECT @@SPID")).scalar_one()
+
+    # Clean returns are not reset, so batches must restore their own state.
+    assert _session_state(single_connection_engine) == (spid, 512)

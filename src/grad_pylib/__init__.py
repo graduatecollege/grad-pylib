@@ -4,7 +4,7 @@
 from grad_pylib.core.auth import AUDIT_LOGGER_NAME, INSTITUTIONAL_EMAIL_DOMAINS, LOOPBACK_CLIENT_HOSTS, MECHANISM_AZURE_AD, MECHANISM_DEV_API_KEY, AuthUser, BaseUser, AuthConfiguration, AuthRuntimeConfig, AuthRuntime, AuthAppFactory, netid_from_email, azure_ad_configured, warn_if_azure_ad_missing, with_azure_development_placeholders, build_azure_scheme, load_azure_openid_config, normalize_role, parse_roles, parse_distinct_strings, claim_list, claim_value, unauthorized_error, default_claims_to_user, azure_user_to_current_user, client_host, is_allowed_api_key_client, constant_time_equals, store_request_user, subject_of, require_policy, build_auth_runtime, dev_api_key_enabled_for
 from grad_pylib.core.cache import LazyValueCache
 from grad_pylib.core.config import ENVIRONMENT_ENV_VAR, DEVELOPMENT_ENVIRONMENTS, is_development_environment, BaseAppSettings, configure_settings_factory, get_settings
-from grad_pylib.core.db import build_mssql_url, resolve_database_url, DEFAULT_POOL_RECYCLE_SECONDS, is_disconnect_error, is_retryable_disconnect, describe_disconnect, DatabaseRuntime, NamedDatabase, NamedDatabases, SqlServerErrorType, ParsedSqlError, parse_mssql_error, retry_on_transient_conflict, retry_on_disconnect, orm_upsert, select_exclude
+from grad_pylib.core.db import build_mssql_url, resolve_database_url, DEFAULT_POOL_RECYCLE_SECONDS, is_disconnect_error, is_retryable_disconnect, describe_disconnect, install_connection_reset, DatabaseRuntime, NamedDatabase, NamedDatabases, SqlServerErrorType, ParsedSqlError, parse_mssql_error, retry_on_transient_conflict, retry_on_disconnect, orm_upsert, select_exclude
 from grad_pylib.core.decimal import OptionalStringDecimal, OptionalNumberDecimal, OptionalIntDecimal, StringDecimal, NumberDecimal, IntDecimal
 from grad_pylib.core.exceptions import DATABASE_UNAVAILABLE_RETRY_AFTER_SECONDS, ApiError, BadRequestError, ForbiddenError, NotFoundError, ConflictError, api_error_handler, database_disconnect_handler, register_exception_handlers
 from grad_pylib.core.filtering import FilterField, filter_key, filter_field_definitions, create_filter_model, filter_values
@@ -107,6 +107,7 @@ __all__ = [
     "filter_key",
     "filter_values",
     "get_settings",
+    "install_connection_reset",
     "is_allowed_api_key_client",
     "is_development_environment",
     "is_disconnect_error",

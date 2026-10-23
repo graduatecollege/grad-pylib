@@ -17,6 +17,7 @@ import pytest
 from _pytest.config import Config
 from xdist.workermanage import WorkerController
 
+from grad_pylib.core.db import install_connection_reset
 from grad_pylib.sqlserver_container import DEFAULT_SQL_SERVER_IMAGE, build_sql_server_container_kwargs
 
 CODEBOOK_DATABASE_NAME = "Codebook"
@@ -150,6 +151,13 @@ class SqlServerTestBootstrap:
         )
 
 
+def _create_app_engine(url: Any) -> Engine:
+    """Create an application engine that resets session state after errors, like `DatabaseRuntime`."""
+    engine = create_engine(url, future=True, pool_pre_ping=True)
+    install_connection_reset(engine)
+    return engine
+
+
 @dataclass(slots=True)
 class ManagedE2eDatabases:
     admin_url: str
@@ -159,11 +167,7 @@ class ManagedE2eDatabases:
     def engine_for(self, database_name: str) -> Engine:
         engine = self._named_engines.get(database_name)
         if engine is None:
-            engine = create_engine(
-                self.app_engine.url.set(database=database_name),
-                future=True,
-                pool_pre_ping=True,
-            )
+            engine = _create_app_engine(self.app_engine.url.set(database=database_name))
             self._named_engines[database_name] = engine
         return engine
 
@@ -276,7 +280,7 @@ def create_mssql_engine(request: pytest.FixtureRequest, fixture_config: SqlServe
         database_name = config.workerinput["shared_mssql_db_name"]
 
         database_url = create_database(admin_url, database_name)
-        engine = create_engine(database_url, future=True, pool_pre_ping=True)
+        engine = _create_app_engine(database_url)
         fixture_config.migration_runner(engine)
         try:
             yield engine
@@ -297,7 +301,7 @@ def create_mssql_engine(request: pytest.FixtureRequest, fixture_config: SqlServe
         database_name = f"{fixture_config.database_prefix}_{worker_id}"
         database_url = create_database(admin_url, database_name)
 
-        engine = create_engine(database_url, future=True, pool_pre_ping=True)
+        engine = _create_app_engine(database_url)
         fixture_config.migration_runner(engine)
         try:
             yield engine
@@ -306,11 +310,7 @@ def create_mssql_engine(request: pytest.FixtureRequest, fixture_config: SqlServe
 
 
 def create_codebook_engine(mssql_engine: Engine) -> Generator[Engine]:
-    codebook_engine = create_engine(
-        _url_with_database(mssql_engine.url, CODEBOOK_DATABASE_NAME),
-        future=True,
-        pool_pre_ping=True,
-    )
+    codebook_engine = _create_app_engine(_url_with_database(mssql_engine.url, CODEBOOK_DATABASE_NAME))
     try:
         yield codebook_engine
     finally:
@@ -465,7 +465,7 @@ def create_e2e_database_bundle(
     )) as container:
         admin_url = _build_pyodbc_url(container.get_connection_url())
         app_database_url = create_database(admin_url, database_name)
-        app_engine = create_engine(app_database_url, future=True, pool_pre_ping=True)
+        app_engine = _create_app_engine(app_database_url)
         databases = ManagedE2eDatabases(admin_url=admin_url, app_engine=app_engine)
         try:
             yield databases

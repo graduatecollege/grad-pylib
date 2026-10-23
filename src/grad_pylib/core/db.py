@@ -17,6 +17,7 @@ from sqlalchemy import URL, create_engine, event, inspect, Table, Select, select
 from sqlalchemy.engine import Engine, ExceptionContext
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, DeclarativeBase, load_only, sessionmaker
+from sqlalchemy.pool import PoolResetState
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_incrementing, RetryCallState
 
 _logger = structlog.get_logger(__name__)
@@ -53,6 +54,7 @@ DEFAULT_POOL_RECYCLE_SECONDS = 300
 # pyodbc ends each driver message with the failing ODBC function; SQLEndTran is the commit call.
 _COMMIT_DRIVER_FUNCTION = "(SQLEndTran"
 _CONNECTED_AT_INFO_KEY = "grad_pylib_connected_at"
+_NEEDS_RESET_INFO_KEY = "grad_pylib_needs_reset"
 
 
 def is_disconnect_error(exc: BaseException) -> TypeGuard[DBAPIError]:
@@ -119,6 +121,39 @@ def _log_disconnect(context: ExceptionContext) -> None:
         pass
 
 
+def _flag_for_reset(context: ExceptionContext) -> None:
+    # An exception escaping a handle_error listener would replace the database error being raised.
+    try:
+        connection = context.connection
+        # Lost connections are discarded anyway, and reading `info` from one would reconnect it.
+        if (connection is not None and not context.is_disconnect
+                and not connection.invalidated and not connection.closed):
+            connection.info[_NEEDS_RESET_INFO_KEY] = True
+    except Exception:
+        pass
+
+
+def _reset_after_error(dbapi_connection: Any, connection_record: Any, reset_state: PoolResetState) -> None:
+    needs_reset = connection_record is not None and connection_record.info.pop(_NEEDS_RESET_INFO_KEY, False)
+    if needs_reset and not reset_state.terminate_only:
+        dbapi_connection.execute("{call sys.sp_reset_connection}")
+        # Keeps pyodbc's transaction tracking consistent after the call above.
+        dbapi_connection.rollback()
+
+
+def install_connection_reset(engine: Engine) -> None:
+    """Reset SQL Server session state when a connection that raised a database error returns to the pool.
+
+    A batch that fails partway can skip its own cleanup, such as `SET NOCOUNT OFF`, leaving session
+    state for the next checkout. Only those connections pay for the `sp_reset_connection` round trip;
+    clean returns keep SQLAlchemy's default rollback-on-return.
+    """
+    if engine.dialect.name != "mssql":
+        return
+    event.listen(engine, "handle_error", _flag_for_reset)
+    event.listen(engine, "reset", _reset_after_error)
+
+
 def _install_disconnect_logging(engine: Engine) -> None:
     """Log each lost connection with its age so drops can be correlated with network events.
 
@@ -168,6 +203,7 @@ class DatabaseRuntime:
                         max_overflow=self._max_overflow,
                         pool_recycle=self._pool_recycle,
                     )
+                    install_connection_reset(engine)
                     _install_disconnect_logging(engine)
                     self._engine = engine
                     return engine
