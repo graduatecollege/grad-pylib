@@ -1,7 +1,8 @@
 # Database pattern support: requirements and implementation plan
 
-**Status: step 1 (SQLite removed from tests; shared SQL Server fixtures in the repo-root
-`conftest.py`) implemented; later steps planned.** This document tracks the grad-pylib work needed to
+**Status: steps 1 (SQLite removed from tests; shared SQL Server fixtures in the repo-root
+`conftest.py`) and 2 (batch regressions and the cursor-error adapter) implemented; later steps
+planned.** This document tracks the grad-pylib work needed to
 support [DB.md](DB.md). DB.md remains the application-facing standard and source for an
 agent skill; implementation tasks and compatibility decisions belong here.
 
@@ -19,7 +20,6 @@ No changes to gcp-server, hooding-server, or grad-codebook are part of this impl
 | `read_all_result_sets()` | Non-row results and empty SELECTs both become `[]`; direct cursor failures escape as driver exceptions | Option-aware navigation and SQLAlchemy-compatible errors |
 | Runtime and application fixture engines | Install the in-progress reset hook, but no batch-navigation hook | Install the same batch support consistently |
 | Migration and provisioning script loops | Execute each batch without explicitly traversing all results | Drain every result before declaring success or recording a migration |
-| Test database coverage | Seven test modules use SQLite engines, URLs, or driver errors | Remove all SQLite usage; use real SQL Server for database behavior and database-free tests for pure logic |
 
 The fewer-calls, conditional-write, failure-only-diagnosis, and narrow-locking recommendations
 in DB.md primarily concern application SQL and service design. They do not require a generic
@@ -134,25 +134,6 @@ report delayed failures, but do not promise rollback of already-applied administ
 Keep explicit setup-lock return-code checks and database-existence checks; those reads decide
 whether provisioning is needed and are not redundant mutation preflights.
 
-### R6. No SQLite in tests
-
-Remove all SQLite usage from first-party tests and supporting fixtures/configuration,
-including engine creation, connection URLs, `sqlite3` exceptions, and SQLite-specific SQL
-or expected results. Do not retain SQLite for speed or for tests described as generic.
-
-Execute database-dependent tests against disposable SQL Server through the shared fixture
-infrastructure. Pure mapping, query construction, URL handling, and orchestration tests may
-remain database-free, using metadata, dialect compilation, and focused doubles where those
-actually test the contract. Such doubles do not establish database behavior. In particular,
-do not simulate pyodbc disconnect semantics using a SQLite engine with rewritten errors.
-
-Preserve the intent and coverage of each migrated test rather than deleting difficult cases.
-Use real constraints, transaction behavior, and driver errors for integration coverage.
-Share container infrastructure to control startup cost, isolate databases/data by test
-scope and xdist worker, and clean up committed state as well as rolled-back transactions.
-Missing SQL Server infrastructure must fail required database coverage clearly, not trigger
-a SQLite fallback or silently skip it.
-
 ## Implementation sequence
 
 Each step includes its focused tests. The steps below are implementation work to perform,
@@ -160,60 +141,43 @@ not a record of completed changes.
 
 | Step | Work | Depends on |
 |---|---|---|
-| 1 | Replace SQLite test usage and establish shared SQL Server coverage | None |
-| 2 | Establish batch regressions and the SQLAlchemy error-integration boundary | 1 |
+| 1 | **Done** | None |
+| 2 | **Done** | 1 |
 | 3 | Implement validated execution-time navigation and engine installation | 2 |
 | 4 | Integrate the multi-result reader and direct-cursor error handling | 2, 3 |
 | 5 | Add script draining and wire migration/provisioning callers | 4 |
 | 6 | Verify end-to-end compatibility and publish the supported contract | 1, 3, 4, 5 |
 
-### 1. Replace SQLite test usage
+### 2. Integration boundary findings (done)
 
-Start with the following inventory under `src/grad_pylib`, and check all test support/config
-for indirect usage before declaring the migration complete:
+Regressions live in `core/test_db_integration.py` and `core/test_multiquery.py`; behavior owed
+by steps 3 and 4 is pinned with strict xfails that must be flipped by those steps. The
+`_Cursor` double accepts exception entries (failing `nextset`/`fetchall`) and a `close_error`.
 
-| Test module | Migration focus |
-|---|---|
-| `core/test_db.py` | Runtime/session behavior on SQL Server; remove SQLite-based disconnect simulation and `sqlite3` errors |
-| `core/test_multiquery.py` | Real SQL Server results for execution/mapping; retain database-free cursor doubles for isolated sequencing |
-| `core/test_querying.py` | Execute fragment cases on MSSQL and use its dialect for compilation assertions |
-| `core/test_auth.py` | Real SQL Server for session/transaction behavior; focused doubles only for orchestration |
-| `testing/test_fixtures.py` | SQL Server app/Codebook databases, cleanup and lifecycle; replace SQLite URL-only cases without opening a database |
-| `tools/test_migrate.py` | Real SQL Server migration execution, history, and transaction outcomes |
-| `tools/test_generate_models.py` | MSSQL dialect/metadata for generation-only cases; real SQL Server when reflection or execution is needed |
-
-Reuse the existing disposable container/bootstrap machinery. Make the SQL Server fixture
-currently local to `core/test_db_integration.py` available through suitable shared test
-fixtures rather than importing one test module from another or starting a container per
-test. Keep deliberate separate connections for concurrency and multi-database cases.
-
-Move driver-independent unit cases off database engines entirely where practical. For
-disconnect/retry cases, combine deterministic driver-accurate fault injection with real
-SQL Server integration coverage; preserve ambiguous-commit and cleanup assertions.
-Exercise unsupported-dialect guards with focused doubles, not a replacement SQLite engine
-or a newly introduced PostgreSQL server.
-
-**Exit condition:** no SQLite engines, URLs, imports, driver exceptions, or SQL assumptions
-remain in first-party tests/support; migrated coverage passes on SQL Server or is genuinely
-database-free. Do not count deleting or skipping coverage as completing this step.
-
-### 2. Establish the integration boundary
-
-Use the shared disposable SQL Server fixtures established in step 1 to turn
-the known failures into regression cases: DML before a SELECT with NOCOUNT OFF, interleaved
-row counts, and errors delivered after an earlier valid rowset. Extend the cursor doubles
-in `core/test_multiquery.py` for deterministic edge cases.
-
-Confirm the error-adaptation route against the pinned SQLAlchemy 2.1.5/pyodbc 5.3.0
-dependencies before implementing it. Prefer supported APIs, but require real error-event,
-disconnect, and reset integration rather than a superficial wrapper. If SQLAlchemy requires
-a private error-dispatch method, isolate that dependency in one typed library-local adapter
-in `core/db.py` and cover it with compatibility tests. Do not duplicate SQLAlchemy's entire
-error dispatcher or require application code to call a private API.
-
-**Exit condition:** executable regressions and a demonstrated adapter design that preserves
-error listeners, exception details, and invalidation for both result-associated and raw
-script cursors. Dependency upgrades must rerun these compatibility cases.
+- **Adapter:** `_sqlalchemy_cursor_errors()` in `core/db.py` is the only caller of the private
+  `Connection._handle_dbapi_exception`, the method SQLAlchemy's own fetch strategies use. No
+  public API dispatches `handle_error` for cursor work SQLAlchemy does not drive. Compatibility
+  tests pin its signature and cover listeners, `.orig`/chaining/subclass, disconnect
+  invalidation without reconnecting, and error-only reset for result and raw cursors (pyodbc,
+  plus pymssql wrapping). Rerun them on any SQLAlchemy upgrade.
+- SQLAlchemy 2.1.5 never assigns `ExceptionContext.cursor`; listeners must not read it.
+- The adapter closes the cursor on non-disconnect errors as SQLAlchemy does, so a later
+  `result.close()` logs "Error closing cursor"; step 4 should avoid that double close.
+- Without traversal, errors after a rowset (`SELECT 1; SELECT 1/0` then `.all()`) and within
+  DML-only batches (statement-level errors such as divide by zero) are silently lost. The
+  reader currently lets raw `pyodbc.DataError` escape from `nextset()`.
+- An admin `KILL` (or a severity 20+ error) ends the session and SQL Server rolls back its work.
+  Mid-fetch, pyodbc reports this as SQLSTATE `HY000` "Connection may have been terminated by
+  the server", which the dialect did not classify; `install_terminated_session_detection()`
+  (installed by `DatabaseRuntime` and the test fixtures) now marks exactly that message as a
+  disconnect, so the connection is invalidated and the usual retry rules apply. Other `HY000`
+  errors, such as "Connection is busy with results for another command", are not disconnects.
+  If a partly fetched rowset is skipped instead, `nextset()` reports exhaustion and a later
+  `commit()` silently does nothing (the same was reported for mssql-jdbc#1505). Readers that
+  fully fetch each rowset see the error; given how rare application-query kills are, no extra
+  completion statements are planned.
+- `install_connection_reset` uses pyodbc-only `Connection.execute`; do not install it on pymssql
+  engines. `parse_mssql_error` does not parse pymssql arguments.
 
 ### 3. Implement the option and engine wiring
 

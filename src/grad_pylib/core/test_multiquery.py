@@ -1,11 +1,14 @@
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
+import pyodbc
 import pytest
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import Column, Executable, Integer, MetaData, String, Table, literal, select, text
 from sqlalchemy.engine import Connection, CursorResult, Engine, Result
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import DeclarativeBase
 
 from grad_pylib.core.multiquery import (
@@ -95,33 +98,51 @@ class _NestedRenamedDto(BaseModel):
     record: _RenamedDto
 
 
-type _CursorSet = tuple[tuple[str, ...] | None, list[tuple[object, ...]]]
+type _CursorSet = tuple[tuple[str, ...] | None, list[tuple[object, ...]] | BaseException]
 
 
 @dataclass
 class _Cursor:
-    result_sets: tuple[_CursorSet, ...]
+    """A DB-API cursor double; an exception entry fails ``nextset``, exception rows fail ``fetchall``."""
+
+    result_sets: tuple[_CursorSet | BaseException, ...]
     index: int = 0
     closed: bool = False
     fetches: list[int] = field(default_factory=list)
+    close_error: BaseException | None = None
+
+    def _current(self) -> _CursorSet:
+        result_set = self.result_sets[self.index]
+        assert not isinstance(result_set, BaseException)
+        return result_set
 
     @property
     def description(self) -> tuple[tuple[str], ...] | None:
-        names, _ = self.result_sets[self.index]
+        names, _ = self._current()
         return tuple((name,) for name in names) if names is not None else None
 
     def fetchall(self) -> list[tuple[object, ...]]:
         self.fetches.append(self.index)
-        return self.result_sets[self.index][1]
+        rows = self._current()[1]
+        if isinstance(rows, BaseException):
+            raise rows
+        return rows
 
     def nextset(self) -> bool | None:
         if self.index + 1 == len(self.result_sets):
             return None
         self.index += 1
+        result_set = self.result_sets[self.index]
+        if isinstance(result_set, BaseException):
+            self.result_sets = self.result_sets[:self.index]
+            self.index -= 1
+            raise result_set
         return True
 
     def close(self) -> None:
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
 
 @pytest.fixture(scope="module")
@@ -256,6 +277,141 @@ def test_read_all_result_sets_closes_cursor_on_invalid_row_width(
 
     assert result.closed
     assert cursor.closed
+
+
+_AWAITING_READER_ERRORS = "Step 4: reader driver errors are not adapted to SQLAlchemy errors yet."
+_AWAITING_NAVIGATION = "Step 3: mssql_skip_rowcounts navigation is not implemented yet."
+
+
+def _delayed_conversion_error() -> pyodbc.DataError:
+    return pyodbc.DataError(
+        "22018",
+        "[22018] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Conversion failed "
+        "when converting the varchar value 'x' to data type int. (245) (SQLMoreResults)",
+    )
+
+
+def test_read_all_result_sets_keeps_legacy_placeholders_for_non_row_results(
+    cursor_result: tuple[Result[*tuple[Any, ...]], _Cursor],
+) -> None:
+    result, cursor = cursor_result
+    cursor.result_sets = (
+        (None, []),
+        (("a",), [(1,)]),
+        (None, []),
+        (None, []),
+        (("b",), [(2,)]),
+        (None, []),
+    )
+
+    assert read_all_result_sets(result) == [[], [{"a": 1}], [], [], [{"b": 2}], []]
+    assert cursor.fetches == [1, 4]
+    assert result.closed
+
+
+@pytest.mark.xfail(strict=True, raises=pyodbc.Error, reason=_AWAITING_READER_ERRORS)
+@pytest.mark.parametrize("operation", ["nextset", "fetchall"])
+def test_read_all_result_sets_adapts_driver_errors_after_a_valid_rowset(
+    cursor_result: tuple[Result[*tuple[Any, ...]], _Cursor], operation: str,
+) -> None:
+    result, cursor = cursor_result
+    error = _delayed_conversion_error()
+    failing_set: _CursorSet | BaseException = error if operation == "nextset" else (("b",), error)
+    cursor.result_sets = ((("a",), [(1,)]), failing_set)
+
+    with pytest.raises(DBAPIError) as raised:
+        read_all_result_sets(result)
+
+    assert raised.value.orig is error
+    assert raised.value.__cause__ is error
+    assert result.closed
+    assert cursor.closed
+
+
+def test_read_all_result_sets_preserves_the_primary_error_when_close_also_fails(
+    cursor_result: tuple[Result[*tuple[Any, ...]], _Cursor],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    result, cursor = cursor_result
+    error = RuntimeError("nextset failed")
+    cursor.result_sets = ((("a",), [(1,)]), error)
+    cursor.close_error = pyodbc.Error("HY000", "close failed")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError) as raised:
+        read_all_result_sets(result)
+
+    assert raised.value is error
+    assert result.closed
+    assert cursor.closed
+    assert any(
+        record.exc_info is not None and record.exc_info[1] is cursor.close_error
+        for record in caplog.records
+    )
+
+
+@pytest.mark.xfail(strict=True, raises=pytest.fail.Exception, reason=_AWAITING_READER_ERRORS)
+def test_read_all_result_sets_surfaces_a_close_failure_after_a_complete_read(
+    cursor_result: tuple[Result[*tuple[Any, ...]], _Cursor],
+) -> None:
+    result, cursor = cursor_result
+    close_error = pyodbc.Error("HY000", "close failed")
+    cursor.result_sets = ((("a",), [(1,)]),)
+    cursor.close_error = close_error
+
+    with pytest.raises(DBAPIError) as raised:
+        read_all_result_sets(result)
+
+    assert raised.value.orig is close_error
+    assert result.closed
+
+
+def test_read_all_result_sets_keeps_server_placeholders_without_the_option(
+    connection: Connection,
+) -> None:
+    result = connection.execute(text(
+        "SELECT id FROM parent WHERE id = 1; UPDATE parent SET name = name; "
+        "SELECT id FROM parent WHERE 1 = 0; UPDATE parent SET name = name"
+    ))
+
+    assert read_all_result_sets(result) == [[{"id": 1}], [], [], []]
+
+
+@pytest.mark.xfail(strict=True, raises=(AssertionError, ValueError), reason=_AWAITING_NAVIGATION)
+@pytest.mark.parametrize("leading_dml", [False, True], ids=["leading-select", "leading-dml"])
+def test_read_all_result_sets_omits_only_non_row_results_with_the_option(
+    connection: Connection, leading_dml: bool,
+) -> None:
+    statement = (
+        "SELECT id FROM parent WHERE id = 1; UPDATE parent SET name = name; "
+        "SELECT id FROM parent WHERE 1 = 0; UPDATE parent SET name = name"
+    )
+    if leading_dml:
+        statement = f"UPDATE parent SET name = name; {statement}"
+    result = connection.execute(text(statement), execution_options={"mssql_skip_rowcounts": True})
+
+    assert read_all_result_sets(result) == [[{"id": 1}], []]
+
+
+@pytest.mark.xfail(strict=True, raises=pyodbc.Error, reason=_AWAITING_READER_ERRORS)
+@pytest.mark.parametrize(
+    ("failing_statement", "native_code"),
+    [
+        ("SELECT CAST('x' AS int) AS b", "(245)"),
+        ("UPDATE parent SET name = name WHERE id = 1 / 0", "(8134)"),
+    ],
+    ids=["delayed-select", "trailing-dml"],
+)
+def test_read_all_result_sets_raises_server_errors_after_a_valid_rowset(
+    connection: Connection, failing_statement: str, native_code: str,
+) -> None:
+    result = connection.execute(text(f"SELECT id FROM parent WHERE id = 1; {failing_statement}"))
+
+    with pytest.raises(DBAPIError) as raised:
+        read_all_result_sets(result)
+
+    assert isinstance(raised.value.orig, pyodbc.Error)
+    assert native_code in str(raised.value.orig)
+    assert result.closed
 
 
 @pytest.mark.parametrize("section", [renamed, _RenamedModel, _RenamedModel()])

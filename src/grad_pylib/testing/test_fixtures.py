@@ -254,8 +254,15 @@ def test_create_codebook_engine_targets_codebook_database(
     def fake_install_connection_reset(engine: _DisposableEngine) -> None:
         recorded["reset_engine"] = engine
 
+    def fake_install_terminated_session_detection(engine: _DisposableEngine) -> None:
+        recorded["detection_engine"] = engine
+
     monkeypatch.setattr("grad_pylib.testing.fixtures.create_engine", fake_create_engine)
     monkeypatch.setattr("grad_pylib.testing.fixtures.install_connection_reset", fake_install_connection_reset)
+    monkeypatch.setattr(
+        "grad_pylib.testing.fixtures.install_terminated_session_detection",
+        fake_install_terminated_session_detection,
+    )
     generator = create_codebook_engine(SimpleNamespace(url=source_url))
 
     assert next(generator) is recorded["engine"]
@@ -269,6 +276,7 @@ def test_create_codebook_engine_targets_codebook_database(
     assert recorded["future"] is True
     assert recorded["pool_pre_ping"] is True
     assert recorded["reset_engine"] is recorded["engine"]
+    assert recorded["detection_engine"] is recorded["engine"]
 
     with pytest.raises(StopIteration):
         next(generator)

@@ -560,6 +560,8 @@ function returns is not covered.
 
 Do not retry a lost connection during commit automatically: the commit may have succeeded.
 The current pyodbc classification uses its driver diagnostics to distinguish this case.
+A session that SQL Server terminates mid-request (an admin `KILL` or a severity 20+ error) is
+also treated as a lost connection, because the server rolls back its work.
 Its safety assumptions require ordinary transactional writes: no internal SQL commits,
 autocommit, or external side effects inside the supposedly replayable unit.
 

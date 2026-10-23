@@ -1,6 +1,7 @@
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
-from typing import Annotated, Any
+from types import SimpleNamespace
+from typing import Annotated, Any, cast
 
 import pyodbc
 import pytest
@@ -8,7 +9,7 @@ from fastapi import Body, Depends, FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 from sqlalchemy import Integer, String, create_engine, inspect as sa_inspect, select, text
-from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.engine import Engine, ExceptionContext, make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -688,6 +689,13 @@ def test_is_transient_conflict_only_retries_known_transient_errors(
 
 
 LOST_CONNECTION_MESSAGE = "[Microsoft][ODBC Driver 18 for SQL Server]TCP Provider: Error code 0x68 (104)"
+TERMINATED_SESSION_MESSAGE = (
+    "[HY000] [Microsoft][ODBC Driver 18 for SQL Server]Unspecified error occurred on SQL Server. "
+    "Connection may have been terminated by the server. (0)"
+)
+BUSY_CONNECTION_MESSAGE = (
+    "[HY000] [Microsoft][ODBC Driver 18 for SQL Server]Connection is busy with results for another command (0)"
+)
 
 
 def make_disconnect_error(driver_function: str, *, invalidated: bool = True) -> DBAPIError:
@@ -717,6 +725,40 @@ def test_disconnect_classification_only_retries_connections_lost_before_commit(
     assert db_module.is_disconnect_error(error) is disconnect
     assert db_module.is_retryable_disconnect(error) is retryable
     assert db_module._is_transient_conflict(error) is retryable
+
+
+@pytest.mark.parametrize(
+    ("driver_error", "is_disconnect"),
+    [
+        (DummyDriverError("HY000", f"{TERMINATED_SESSION_MESSAGE} (SQLFetch)"), True),
+        (DummyDriverError("HY000", f"{TERMINATED_SESSION_MESSAGE} (SQLExecDirectW)"), True),
+        (DummyDriverError("HY000", f"{BUSY_CONNECTION_MESSAGE} (SQLExecDirectW)"), False),
+        (DummyDriverError("42000", f"{TERMINATED_SESSION_MESSAGE} (SQLExecDirectW)"), False),
+        (DummyDriverError(20, b"Connection may have been terminated by the server"), False),
+        (ValueError("HY000"), False),
+    ],
+    ids=["fetch", "execute", "busy", "other-sqlstate", "pymssql-args", "not-a-driver-error"],
+)
+def test_only_sessions_the_server_terminated_become_disconnects(
+    driver_error: BaseException, is_disconnect: bool,
+) -> None:
+    context = SimpleNamespace(original_exception=driver_error, is_disconnect=False)
+
+    db_module._detect_terminated_session(cast(ExceptionContext, context))
+
+    assert context.is_disconnect is is_disconnect
+
+
+def test_database_runtime_classifies_terminated_sessions_before_other_error_listeners() -> None:
+    engine = DatabaseRuntime(lambda: "mssql+pyodbc://user:pass@localhost/app?driver=ODBC+Driver+18+for+SQL+Server").get_engine()
+    try:
+        assert list(cast(Any, engine.dialect.dispatch).handle_error) == [
+            db_module._detect_terminated_session,
+            db_module._flag_for_reset,
+            db_module._log_disconnect,
+        ]
+    finally:
+        engine.dispose()
 
 
 def test_describe_disconnect_reports_driver_fields_without_statement() -> None:

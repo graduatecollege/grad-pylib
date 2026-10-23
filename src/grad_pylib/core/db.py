@@ -14,8 +14,9 @@ from fastapi import Depends
 from grad_pylib.core.config import BaseAppSettings, get_settings
 from pydantic import BaseModel
 from sqlalchemy import URL, create_engine, event, inspect, Table, Select, select
-from sqlalchemy.engine import Engine, ExceptionContext
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.engine import Connection, Engine, ExceptionContext
+from sqlalchemy.engine.interfaces import DBAPICursor, ExecutionContext
+from sqlalchemy.exc import DBAPIError, StatementError
 from sqlalchemy.orm import Session, DeclarativeBase, load_only, sessionmaker
 from sqlalchemy.pool import PoolResetState
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_incrementing, RetryCallState
@@ -53,6 +54,7 @@ DEFAULT_POOL_RECYCLE_SECONDS = 300
 
 # pyodbc ends each driver message with the failing ODBC function; SQLEndTran is the commit call.
 _COMMIT_DRIVER_FUNCTION = "(SQLEndTran"
+_TERMINATED_SESSION_MESSAGE = "Connection may have been terminated by the server"
 _CONNECTED_AT_INFO_KEY = "grad_pylib_connected_at"
 _NEEDS_RESET_INFO_KEY = "grad_pylib_needs_reset"
 
@@ -121,6 +123,27 @@ def _log_disconnect(context: ExceptionContext) -> None:
         pass
 
 
+def _detect_terminated_session(context: ExceptionContext) -> None:
+    # pyodbc reports a session the server ended (KILL, severity 20+ errors) as a general HY000 error that
+    # the dialect does not classify. Other HY000 errors, such as a busy connection, leave it usable.
+    args = getattr(context.original_exception, "args", ())
+    if args and args[0] == "HY000" and _TERMINATED_SESSION_MESSAGE in _driver_message(context.original_exception):
+        context.is_disconnect = True
+
+
+def install_terminated_session_detection(engine: Engine) -> None:
+    """Treat sessions SQL Server terminated mid-request as lost connections.
+
+    pyodbc reports these with the catch-all SQLSTATE HY000, so SQLAlchemy would return the dead
+    connection to the pool and `retry_on_disconnect` would not retry. The server has rolled back
+    the session's work, so the usual disconnect handling and retry rules apply.
+    """
+    if engine.dialect.name != "mssql":
+        return
+    # Runs before other listeners so they see the corrected classification.
+    event.listen(engine, "handle_error", _detect_terminated_session, insert=True)
+
+
 def _flag_for_reset(context: ExceptionContext) -> None:
     # An exception escaping a handle_error listener would replace the database error being raised.
     try:
@@ -152,6 +175,39 @@ def install_connection_reset(engine: Engine) -> None:
         return
     event.listen(engine, "handle_error", _flag_for_reset)
     event.listen(engine, "reset", _reset_after_error)
+
+
+@contextmanager
+def _sqlalchemy_cursor_errors(
+        connection: Connection,
+        cursor: DBAPICursor | None,
+        *,
+        context: ExecutionContext | None = None,
+        statement: str | None = None,
+) -> Generator[None]:
+    """Handle failures of direct DB-API cursor operations as SQLAlchemy handles its own.
+
+    SQLAlchemy only adapts errors from cursor work it drives itself and has no public API for
+    work it does not, such as `nextset()` or a raw script cursor. This calls the private
+    `Connection._handle_dbapi_exception` that SQLAlchemy's own result fetching uses, so a driver
+    failure becomes the matching `DBAPIError` subclass chained from the driver error kept in
+    `.orig`, runs `handle_error` listeners (disconnect logging, reset marking), and invalidates
+    lost connections without reconnecting them. Keep every use of that private API here; its
+    compatibility tests must be rerun on SQLAlchemy upgrades.
+
+    Pass the execution context for a result's cursor, or the statement for a raw cursor so it
+    appears in the error. Errors SQLAlchemy already handled are re-raised untouched, and other
+    exceptions keep their identity. Like SQLAlchemy, this closes the cursor after errors other
+    than disconnects; commit and rollback of the transaction remain with its owner.
+    """
+    try:
+        yield
+    except StatementError:
+        raise
+    except BaseException as error:
+        is_driver_error = isinstance(error, connection.dialect.loaded_dbapi.Error)
+        # A statement without a context would also make SQLAlchemy wrap non-driver exceptions.
+        connection._handle_dbapi_exception(error, statement if is_driver_error else None, None, cursor, context)
 
 
 def _install_disconnect_logging(engine: Engine) -> None:
@@ -203,6 +259,7 @@ class DatabaseRuntime:
                         max_overflow=self._max_overflow,
                         pool_recycle=self._pool_recycle,
                     )
+                    install_terminated_session_detection(engine)
                     install_connection_reset(engine)
                     _install_disconnect_logging(engine)
                     self._engine = engine
