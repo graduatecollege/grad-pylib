@@ -3,14 +3,15 @@ import threading
 import time
 from collections.abc import Generator
 from dataclasses import dataclass, field
+from string.templatelib import Template
 from typing import Any
 
 import pymssql
 import pyodbc
 import pytest
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import Column, Executable, Integer, MetaData, Table, create_engine, event, select, text, tstring
 from sqlalchemy.engine import Connection, CursorResult, Engine, ExceptionContext
-from sqlalchemy.exc import DataError, DBAPIError, ResourceClosedError
+from sqlalchemy.exc import ArgumentError, DataError, DBAPIError, ResourceClosedError
 from sqlalchemy.orm import Session, sessionmaker
 
 from grad_pylib.core import db as db_module
@@ -19,6 +20,7 @@ from grad_pylib.core.db import (
     _sqlalchemy_cursor_errors,
     describe_disconnect,
     install_connection_reset,
+    install_mssql_batch_support,
     install_terminated_session_detection,
     is_disconnect_error,
     is_retryable_disconnect,
@@ -304,12 +306,12 @@ def test_connection_reset_skips_clean_returns(single_connection_engine: Engine) 
     assert _session_state(single_connection_engine) == (spid, 512)
 
 
-# Textual batch regressions for the `mssql_skip_rowcounts` option (DB-IMPLEMENTATION.md, R1). SQLAlchemy builds a
-# result from the batch's first result and closes the cursor, discarding the remaining results unread.
+# Textual batch regressions for the `mssql_skip_rowcounts` option (DB-IMPLEMENTATION.md, R1). Without it, SQLAlchemy
+# builds a result from the batch's first result and closes the cursor, discarding the remaining results unread.
 _SKIP_ROWCOUNTS = {"mssql_skip_rowcounts": True}
-_AWAITING_NAVIGATION = "Step 3: mssql_skip_rowcounts navigation is not implemented yet."
 # Large enough that SQL Server is still sending it when the session is killed.
 _LARGE_SELECT = "SELECT a.object_id FROM sys.all_objects AS a CROSS JOIN sys.all_objects AS b"
+_batch_writes = Table("batch_writes", MetaData(), Column("id", Integer, primary_key=True, autoincrement=False), schema="dbo")
 
 
 @pytest.fixture(scope="module")
@@ -328,36 +330,134 @@ def batch_connection(batch_engine: Engine) -> Generator[Connection]:
         transaction.rollback()
 
 
-def test_dml_before_a_select_hides_the_select_without_the_option(batch_connection: Connection) -> None:
-    result = batch_connection.execute(text(
-        "INSERT INTO dbo.batch_writes (id) VALUES (1); SELECT id FROM dbo.batch_writes"
-    ))
+def record_cursor_executions(connection: Connection) -> list[str]:
+    statements: list[str] = []
+
+    def record(_conn: Connection, _cursor: Any, statement: str, *_args: Any) -> None:
+        statements.append(statement)
+
+    event.listen(connection, "before_cursor_execute", record)
+    return statements
+
+
+def batch_rows(connection: Connection) -> list[int]:
+    return list(connection.execute(text("SELECT id FROM dbo.batch_writes ORDER BY id")).scalars())
+
+
+@pytest.mark.parametrize("execution_options", [{}, {"mssql_skip_rowcounts": False}], ids=["absent", "false"])
+def test_dml_before_a_select_hides_the_select_without_the_option(
+        batch_connection: Connection,
+        execution_options: dict[str, Any],
+) -> None:
+    result = batch_connection.execute(
+        text("INSERT INTO dbo.batch_writes (id) VALUES (1); SELECT id FROM dbo.batch_writes"),
+        execution_options=execution_options,
+    )
 
     assert not result.returns_rows
     with pytest.raises(ResourceClosedError):
         result.all()
 
 
-@pytest.mark.xfail(strict=True, raises=ResourceClosedError, reason=_AWAITING_NAVIGATION)
-@pytest.mark.parametrize("option_level", ["statement", "execute"])
+def _batch_ending_with(select_sql: str, kind: str) -> Executable:
+    insert_sql = "INSERT INTO dbo.batch_writes (id) VALUES (1); UPDATE dbo.batch_writes SET id = id WHERE id = 0; "
+    if kind == "tstring":
+        return tstring(Template(insert_sql + select_sql))
+    statement = text(insert_sql + select_sql)
+    return statement.columns(id=Integer) if kind == "declared-columns" else statement
+
+
+@pytest.mark.parametrize("kind", ["text", "tstring", "declared-columns"])
+@pytest.mark.parametrize("option_level", ["statement", "execute", "connection"])
 @pytest.mark.parametrize(("where", "expected"), [("", [1]), ("WHERE id = 0", [])], ids=["rows", "empty"])
 def test_opted_in_dml_before_a_select_returns_the_select(
         batch_connection: Connection,
+        kind: str,
         option_level: str,
         where: str,
         expected: list[int],
 ) -> None:
-    statement = text(
-        "INSERT INTO dbo.batch_writes (id) VALUES (1); "
-        "UPDATE dbo.batch_writes SET id = id WHERE id = 0; "
-        f"SELECT id FROM dbo.batch_writes {where}"
-    )
+    statement = _batch_ending_with(f"SELECT id FROM dbo.batch_writes {where}", kind)
+    statements = record_cursor_executions(batch_connection)
     if option_level == "statement":
         result = batch_connection.execute(statement.execution_options(**_SKIP_ROWCOUNTS))
-    else:
+    elif option_level == "execute":
         result = batch_connection.execute(statement, execution_options=_SKIP_ROWCOUNTS)
+    else:
+        result = batch_connection.execution_options(**_SKIP_ROWCOUNTS).execute(statement)
 
+    assert list(result.keys()) == ["id"]
     assert result.scalars().all() == expected
+    # The batch is the only statement sent, and it leaves NOCOUNT alone.
+    assert len(statements) == 1
+    assert batch_connection.execute(text("SELECT @@OPTIONS & 512")).scalar_one() == 0
+
+
+def test_opted_in_driver_sql_returns_the_select_after_dml(batch_connection: Connection) -> None:
+    result = batch_connection.exec_driver_sql(
+        "INSERT INTO dbo.batch_writes (id) VALUES (?); SELECT id FROM dbo.batch_writes",
+        (1,),
+        execution_options=_SKIP_ROWCOUNTS,
+    )
+
+    assert result.scalars().all() == [1]
+
+
+def test_opted_in_batches_stop_at_a_leading_empty_select(batch_connection: Connection) -> None:
+    """An empty rowset is a real result, not a row count to skip."""
+    result = batch_connection.execute(
+        text("SELECT id FROM dbo.batch_writes WHERE 1 = 0; INSERT INTO dbo.batch_writes (id) VALUES (1); SELECT 2 AS b"),
+        execution_options=_SKIP_ROWCOUNTS,
+    )
+
+    assert list(result.keys()) == ["id"]
+    assert result.all() == []
+
+
+def test_opted_in_session_batches_return_the_select(batch_engine: Engine) -> None:
+    with Session(batch_engine) as session:
+        rows = session.execute(
+            text("INSERT INTO dbo.batch_writes (id) VALUES (1); SELECT id FROM dbo.batch_writes"),
+            execution_options=_SKIP_ROWCOUNTS,
+        ).scalars().all()
+        session.rollback()
+
+    assert rows == [1]
+
+
+@pytest.mark.parametrize(
+    ("statement", "expected"),
+    [
+        ("UPDATE dbo.batch_writes SET id = id WHERE id = 0", []),
+        (
+            "INSERT INTO dbo.batch_writes (id) VALUES (1); UPDATE dbo.batch_writes SET id = id WHERE id = 0; "
+            "INSERT INTO dbo.batch_writes (id) VALUES (2)",
+            [1, 2],
+        ),
+    ],
+    ids=["zero-rows", "several-statements"],
+)
+def test_opted_in_dml_only_batches_complete_without_a_result(
+        batch_engine: Engine,
+        batch_connection: Connection,
+        statement: str,
+        expected: list[int],
+) -> None:
+    more_results: list[bool] = []
+
+    def check_exhausted(_conn: Connection, cursor: Any, *_args: Any) -> None:
+        more_results.append(bool(cursor.nextset()))
+
+    # Engine listeners run in registration order, so this sees the cursor after navigation.
+    event.listen(batch_engine, "after_cursor_execute", check_exhausted)
+    try:
+        result = batch_connection.execute(text(statement), execution_options=_SKIP_ROWCOUNTS)
+    finally:
+        event.remove(batch_engine, "after_cursor_execute", check_exhausted)
+
+    assert not result.returns_rows
+    assert more_results == [False]
+    assert batch_rows(batch_connection) == expected
 
 
 _DML_ONLY_BATCH_WITH_A_FAILING_STATEMENT = (
@@ -370,14 +470,80 @@ _DML_ONLY_BATCH_WITH_A_FAILING_STATEMENT = (
 def test_dml_only_batches_lose_later_errors_without_the_option(batch_connection: Connection) -> None:
     batch_connection.execute(text(_DML_ONLY_BATCH_WITH_A_FAILING_STATEMENT))
 
-    rows = batch_connection.execute(text("SELECT id FROM dbo.batch_writes ORDER BY id")).scalars().all()
-    assert rows == [1, 3]
+    assert batch_rows(batch_connection) == [1, 3]
 
 
-@pytest.mark.xfail(strict=True, raises=pytest.fail.Exception, reason=_AWAITING_NAVIGATION)
-def test_opted_in_dml_only_batches_raise_errors_from_later_statements(batch_connection: Connection) -> None:
-    with pytest.raises(DataError):
-        batch_connection.execute(text(_DML_ONLY_BATCH_WITH_A_FAILING_STATEMENT), execution_options=_SKIP_ROWCOUNTS)
+@pytest.mark.parametrize(
+    "statement",
+    [
+        _DML_ONLY_BATCH_WITH_A_FAILING_STATEMENT,
+        "INSERT INTO dbo.batch_writes (id) VALUES (1); UPDATE dbo.batch_writes SET id = id WHERE id = 0; "
+        "INSERT INTO dbo.batch_writes (id) VALUES (1 / 0)",
+    ],
+    ids=["middle", "last"],
+)
+def test_opted_in_dml_only_batches_raise_errors_from_later_statements(
+        batch_connection: Connection,
+        statement: str,
+) -> None:
+    with pytest.raises(DataError) as raised:
+        batch_connection.execute(text(statement), execution_options=_SKIP_ROWCOUNTS)
+
+    assert parse_mssql_error(raised.value).error_type is SqlServerErrorType.DIVIDE_BY_ZERO
+    assert raised.value.__cause__ is raised.value.orig
+
+
+@pytest.mark.parametrize(
+    ("statement", "parameters", "message"),
+    [
+        (select(_batch_writes.c.id), None, "textual statements"),
+        (_batch_writes.insert().values(id=1), None, "textual statements"),
+        (text("INSERT INTO dbo.batch_writes (id) VALUES (:id)"), [{"id": 1}, {"id": 2}], "executemany"),
+    ],
+    ids=["core-select", "core-insert", "executemany"],
+)
+def test_unsupported_opted_in_statements_are_rejected_before_execution(
+        batch_engine: Engine,
+        statement: Executable,
+        parameters: list[dict[str, Any]] | None,
+        message: str,
+) -> None:
+    with batch_engine.connect() as connection:
+        statements = record_cursor_executions(connection)
+        with pytest.raises(ArgumentError, match=message):
+            connection.execute(statement, parameters, execution_options=_SKIP_ROWCOUNTS)
+
+        assert statements == []
+        assert not connection.in_transaction()
+        assert batch_rows(connection) == []
+
+
+@pytest.mark.parametrize("value", ["yes", 1, None])
+def test_invalid_option_values_are_rejected_before_execution(batch_engine: Engine, value: object) -> None:
+    with batch_engine.connect() as connection:
+        statements = record_cursor_executions(connection)
+        with pytest.raises(ArgumentError, match="must be True or False"):
+            connection.execute(
+                text("INSERT INTO dbo.batch_writes (id) VALUES (1)"),
+                execution_options={"mssql_skip_rowcounts": value},
+            )
+
+        assert statements == []
+        assert batch_rows(connection) == []
+
+
+def test_opted_in_orm_statements_are_rejected_before_execution(batch_engine: Engine) -> None:
+    with Session(batch_engine) as session, pytest.raises(ArgumentError, match="textual statements"):
+        session.execute(select(_batch_writes.c.id), execution_options=_SKIP_ROWCOUNTS)
+
+
+def test_opted_in_driver_sql_executemany_is_rejected_before_execution(batch_connection: Connection) -> None:
+    with pytest.raises(ArgumentError, match="executemany"):
+        batch_connection.exec_driver_sql(
+            "INSERT INTO dbo.batch_writes (id) VALUES (?)", [(1,), (2,)], execution_options=_SKIP_ROWCOUNTS,
+        )
+
+    assert batch_rows(batch_connection) == []
 
 
 @pytest.mark.parametrize("execution_options", [{}, _SKIP_ROWCOUNTS], ids=["default", "opted-in"])
@@ -638,6 +804,24 @@ def test_pymssql_raw_cursor_errors_reach_sqlalchemy_error_handling(pymssql_engin
     assert raised.value.statement == _FAILS_AFTER_A_ROWSET
     assert not raised.value.connection_invalidated
     assert handled == [raised.value.orig]
+
+
+@pytest.mark.parametrize("driver_sql", [False, True], ids=["text", "driver-sql"])
+def test_opted_in_batches_are_rejected_on_unsupported_drivers(
+        batch_engine: Engine,
+        pymssql_engine: Engine,
+        driver_sql: bool,
+) -> None:
+    install_mssql_batch_support(pymssql_engine)
+    statement = "INSERT INTO dbo.batch_writes (id) VALUES (1)"
+    with pymssql_engine.connect() as connection:
+        with pytest.raises(ArgumentError, match=r"requires an mssql\+pyodbc engine, not mssql\+pymssql"):
+            if driver_sql:
+                connection.exec_driver_sql(statement, execution_options=_SKIP_ROWCOUNTS)
+            else:
+                connection.execute(text(statement), execution_options=_SKIP_ROWCOUNTS)
+        # Unopted-in work on the same engine is unaffected.
+        assert connection.execute(text("SELECT COUNT(*) FROM dbo.batch_writes")).scalar_one() == 0
 
 
 def test_a_session_the_server_terminates_is_a_retryable_disconnect(listened_engine: ListenedEngine) -> None:

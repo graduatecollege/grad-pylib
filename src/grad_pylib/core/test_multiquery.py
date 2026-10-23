@@ -280,7 +280,7 @@ def test_read_all_result_sets_closes_cursor_on_invalid_row_width(
 
 
 _AWAITING_READER_ERRORS = "Step 4: reader driver errors are not adapted to SQLAlchemy errors yet."
-_AWAITING_NAVIGATION = "Step 3: mssql_skip_rowcounts navigation is not implemented yet."
+_AWAITING_READER_OMISSION = "Step 4: the reader does not omit non-row results with mssql_skip_rowcounts yet."
 
 
 def _delayed_conversion_error() -> pyodbc.DataError:
@@ -376,7 +376,7 @@ def test_read_all_result_sets_keeps_server_placeholders_without_the_option(
     assert read_all_result_sets(result) == [[{"id": 1}], [], [], []]
 
 
-@pytest.mark.xfail(strict=True, raises=(AssertionError, ValueError), reason=_AWAITING_NAVIGATION)
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=_AWAITING_READER_OMISSION)
 @pytest.mark.parametrize("leading_dml", [False, True], ids=["leading-select", "leading-dml"])
 def test_read_all_result_sets_omits_only_non_row_results_with_the_option(
     connection: Connection, leading_dml: bool,

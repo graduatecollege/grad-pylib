@@ -1,5 +1,6 @@
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
+from string.templatelib import Template
 from types import SimpleNamespace
 from typing import Annotated, Any, cast
 
@@ -8,9 +9,9 @@ import pytest
 from fastapi import Body, Depends, FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
-from sqlalchemy import Integer, String, create_engine, inspect as sa_inspect, select, text
+from sqlalchemy import Integer, String, create_engine, event, inspect as sa_inspect, select, text, tstring
 from sqlalchemy.engine import Engine, ExceptionContext, make_url
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import ArgumentError, DBAPIError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from grad_pylib.core import db as db_module
@@ -759,6 +760,161 @@ def test_database_runtime_classifies_terminated_sessions_before_other_error_list
         ]
     finally:
         engine.dispose()
+
+
+def _batch_listener_counts(engine: Engine) -> tuple[int, int, int]:
+    dispatch = cast(Any, engine.dispatch)
+    return (
+        len(dispatch.before_execute),
+        len(dispatch.before_cursor_execute),
+        len(dispatch.after_cursor_execute),
+    )
+
+
+def test_install_mssql_batch_support_is_idempotent() -> None:
+    engine = create_engine("mssql+pyodbc://")
+
+    db_module.install_mssql_batch_support(engine)
+    db_module.install_mssql_batch_support(engine)
+
+    assert _batch_listener_counts(engine) == (1, 1, 1)
+    assert event.contains(engine, "after_cursor_execute", db_module._skip_leading_rowcounts)
+
+
+def test_install_mssql_batch_support_only_validates_on_other_drivers() -> None:
+    engine = create_engine("mssql+pymssql://")
+
+    db_module.install_mssql_batch_support(engine)
+
+    assert _batch_listener_counts(engine) == (1, 1, 0)
+
+
+def test_database_runtime_installs_batch_support() -> None:
+    engine = DatabaseRuntime(lambda: "mssql+pyodbc://localhost/app?driver=ODBC+Driver+18+for+SQL+Server").get_engine()
+    try:
+        assert _batch_listener_counts(engine) == (1, 1, 1)
+        assert event.contains(engine, "before_execute", db_module._validate_batch_execution)
+    finally:
+        engine.dispose()
+
+
+_NO_CURSOR: Any = None
+
+
+def _dialect(name: str = "mssql", driver: str = "pyodbc") -> Any:
+    return SimpleNamespace(dialect=SimpleNamespace(name=name, driver=driver))
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        text("SELECT 1"),
+        tstring(Template("SELECT 1")),
+        text("SELECT 1 AS id").columns(id=Integer),
+    ],
+    ids=["text", "tstring", "declared-columns"],
+)
+def test_batch_validation_accepts_textual_statements(statement: object) -> None:
+    db_module._validate_batch_execution(_dialect(), statement, [], {}, {"mssql_skip_rowcounts": True})
+
+
+@pytest.mark.parametrize(
+    ("connection", "statement", "multiparams", "options", "message"),
+    [
+        (_dialect("postgresql", "psycopg"), text("SELECT 1"), [], {"mssql_skip_rowcounts": True}, "postgresql"),
+        (_dialect("mssql", "pymssql"), text("SELECT 1"), [], {"mssql_skip_rowcounts": True}, "mssql\\+pymssql"),
+        (_dialect(), select(ExampleUpsertModel), [], {"mssql_skip_rowcounts": True}, "not Select"),
+        (_dialect(), text("SELECT :a"), [{"a": 1}, {"a": 2}], {"mssql_skip_rowcounts": True}, "executemany"),
+        (_dialect(), text("SELECT 1"), [], {"mssql_skip_rowcounts": "true"}, "True or False"),
+        (_dialect("postgresql", "psycopg"), select(ExampleUpsertModel), [], {"mssql_skip_rowcounts": 1}, "True or"),
+    ],
+    ids=["other-dialect", "other-driver", "orm-select", "executemany", "string-value", "integer-value"],
+)
+def test_batch_validation_rejects_unsupported_opted_in_use(
+    connection: Any, statement: object, multiparams: list[dict[str, int]], options: dict[str, object], message: str,
+) -> None:
+    with pytest.raises(ArgumentError, match=message):
+        db_module._validate_batch_execution(connection, statement, multiparams, {}, options)
+
+
+@pytest.mark.parametrize("options", [{}, {"mssql_skip_rowcounts": False}], ids=["absent", "false"])
+def test_batch_validation_ignores_executions_without_the_option(options: dict[str, object]) -> None:
+    db_module._validate_batch_execution(
+        _dialect("postgresql", "psycopg"), select(ExampleUpsertModel), [{"a": 1}, {"a": 2}], {}, options,
+    )
+
+
+@pytest.mark.parametrize(
+    ("connection", "compiled", "executemany", "message"),
+    [
+        (_dialect("mssql", "pymssql"), None, False, "mssql\\+pymssql"),
+        (_dialect(), None, True, "executemany"),
+    ],
+    ids=["other-driver", "executemany"],
+)
+def test_driver_sql_validation_rejects_unsupported_opted_in_use(
+    connection: Any, compiled: object, executemany: bool, message: str,
+) -> None:
+    context: Any = SimpleNamespace(compiled=compiled, execution_options={"mssql_skip_rowcounts": True})
+
+    with pytest.raises(ArgumentError, match=message):
+        db_module._validate_driver_sql_batch(connection, _NO_CURSOR, "SELECT 1", (), context, executemany)
+
+
+def test_driver_sql_validation_leaves_compiled_statements_to_before_execute() -> None:
+    context: Any = SimpleNamespace(compiled=object(), execution_options={"mssql_skip_rowcounts": True})
+
+    db_module._validate_driver_sql_batch(_dialect("mssql", "pymssql"), _NO_CURSOR, "SELECT 1", (), context, True)
+
+
+class _BatchCursor:
+    """Cursor double whose results are column descriptions, with None for a row count."""
+
+    def __init__(self, *descriptions: tuple[str, ...] | None) -> None:
+        self._descriptions = descriptions
+        self.index = 0
+
+    @property
+    def description(self) -> tuple[str, ...] | None:
+        return self._descriptions[self.index] if self.index < len(self._descriptions) else None
+
+    def nextset(self) -> bool:
+        self.index += 1
+        return self.index < len(self._descriptions)
+
+    def fetchall(self) -> list[object]:
+        raise AssertionError("navigation must not fetch rows")
+
+
+@pytest.mark.parametrize(
+    ("descriptions", "final_index"),
+    [
+        ((None, None, ("id",), None, ("b",)), 2),
+        ((("id",), None), 0),
+        ((None, None), 2),
+        ((None,), 1),
+    ],
+    ids=["leading-row-counts", "leading-rowset", "row-counts-only", "single-row-count"],
+)
+def test_navigation_stops_at_the_first_rowset_or_exhaustion(
+    descriptions: tuple[tuple[str, ...] | None, ...], final_index: int,
+) -> None:
+    cursor = _BatchCursor(*descriptions)
+    context: Any = SimpleNamespace(execution_options={"mssql_skip_rowcounts": True})
+
+    db_module._skip_leading_rowcounts(_dialect(), cast(Any, cursor), "", (), context, False)
+
+    assert cursor.index == final_index
+
+
+@pytest.mark.parametrize("options", [{}, {"mssql_skip_rowcounts": False}], ids=["absent", "false"])
+def test_navigation_leaves_cursors_alone_without_the_option(options: dict[str, object]) -> None:
+    cursor = _BatchCursor(None, ("id",))
+    context: Any = SimpleNamespace(execution_options=options)
+
+    db_module._skip_leading_rowcounts(_dialect(), cast(Any, cursor), "", (), context, False)
+
+    assert cursor.index == 0
 
 
 def test_describe_disconnect_reports_driver_fields_without_statement() -> None:

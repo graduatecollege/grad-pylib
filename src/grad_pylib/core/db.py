@@ -1,4 +1,4 @@
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from typing import Annotated, Any, Self, TypeGuard
 import functools
@@ -13,12 +13,13 @@ import structlog
 from fastapi import Depends
 from grad_pylib.core.config import BaseAppSettings, get_settings
 from pydantic import BaseModel
-from sqlalchemy import URL, create_engine, event, inspect, Table, Select, select
-from sqlalchemy.engine import Connection, Engine, ExceptionContext
+from sqlalchemy import URL, create_engine, event, inspect, Table, Select, TextualSelect, select
+from sqlalchemy.engine import Connection, Dialect, Engine, ExceptionContext
 from sqlalchemy.engine.interfaces import DBAPICursor, ExecutionContext
-from sqlalchemy.exc import DBAPIError, StatementError
+from sqlalchemy.exc import ArgumentError, DBAPIError, StatementError
 from sqlalchemy.orm import Session, DeclarativeBase, load_only, sessionmaker
 from sqlalchemy.pool import PoolResetState
+from sqlalchemy.sql.elements import AbstractTextClause
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_incrementing, RetryCallState
 
 _logger = structlog.get_logger(__name__)
@@ -57,6 +58,7 @@ _COMMIT_DRIVER_FUNCTION = "(SQLEndTran"
 _TERMINATED_SESSION_MESSAGE = "Connection may have been terminated by the server"
 _CONNECTED_AT_INFO_KEY = "grad_pylib_connected_at"
 _NEEDS_RESET_INFO_KEY = "grad_pylib_needs_reset"
+_SKIP_ROWCOUNTS_OPTION = "mssql_skip_rowcounts"
 
 
 def is_disconnect_error(exc: BaseException) -> TypeGuard[DBAPIError]:
@@ -177,6 +179,104 @@ def install_connection_reset(engine: Engine) -> None:
     event.listen(engine, "reset", _reset_after_error)
 
 
+def _supports_batch_navigation(dialect: Dialect) -> bool:
+    return dialect.name == "mssql" and dialect.driver == "pyodbc"
+
+
+def _skip_rowcounts_requested(dialect: Dialect, execution_options: Mapping[str, Any]) -> bool:
+    """Return whether `mssql_skip_rowcounts` is enabled, rejecting invalid values and unsupported engines."""
+    value = execution_options.get(_SKIP_ROWCOUNTS_OPTION, False)
+    if not isinstance(value, bool):
+        raise ArgumentError(f"{_SKIP_ROWCOUNTS_OPTION} must be True or False, not {value!r}.")
+    if value and not _supports_batch_navigation(dialect):
+        raise ArgumentError(
+            f"{_SKIP_ROWCOUNTS_OPTION} requires an mssql+pyodbc engine, not {dialect.name}+{dialect.driver}."
+        )
+    return value
+
+
+def _reject_executemany(executemany: bool) -> None:
+    if executemany:
+        raise ArgumentError(
+            f"{_SKIP_ROWCOUNTS_OPTION} does not support executemany; execute each parameter set as its own batch."
+        )
+
+
+def _validate_batch_execution(
+        conn: Connection,
+        clauseelement: Any,
+        multiparams: Sequence[Any],
+        _params: Mapping[str, Any],
+        execution_options: Mapping[str, Any],
+) -> None:
+    # Runs before compilation and autobegin, so rejected use sends nothing to the server.
+    if not _skip_rowcounts_requested(conn.dialect, execution_options):
+        return
+    if not isinstance(clauseelement, (AbstractTextClause, TextualSelect)):
+        raise ArgumentError(
+            f"{_SKIP_ROWCOUNTS_OPTION} applies only to textual statements such as text() and tstring(), "
+            f"not {type(clauseelement).__name__}."
+        )
+    _reject_executemany(len(multiparams) > 1)
+
+
+def _validate_driver_sql_batch(
+        conn: Connection,
+        _cursor: DBAPICursor,
+        _statement: str,
+        _parameters: Any,
+        context: ExecutionContext | None,
+        executemany: bool,
+) -> None:
+    # `exec_driver_sql` skips `before_execute`; compiled statements were validated there.
+    if context is None or context.compiled is not None:
+        return
+    if _skip_rowcounts_requested(conn.dialect, context.execution_options):
+        _reject_executemany(executemany)
+
+
+def _skip_leading_rowcounts(
+        _conn: Connection,
+        cursor: DBAPICursor,
+        _statement: str,
+        _parameters: Any,
+        context: ExecutionContext | None,
+        _executemany: bool,
+) -> None:
+    # Runs before SQLAlchemy reads the description to build its result. SELECT rows are never fetched
+    # here, and errors raised while advancing reach SQLAlchemy's usual error handling.
+    if context is None or context.execution_options.get(_SKIP_ROWCOUNTS_OPTION) is not True:
+        return
+    while cursor.description is None and cursor.nextset():
+        pass
+
+
+def install_mssql_batch_support(engine: Engine) -> None:
+    """Enable the `mssql_skip_rowcounts` execution option for deliberately textual batches.
+
+    With the option, a `text()`, `tstring()`, or `exec_driver_sql` batch on an `mssql+pyodbc`
+    engine skips the row counts of statements preceding its first rowset, so DML before a SELECT
+    no longer hides the SELECT and `SET NOCOUNT ON` scaffolding is unnecessary. A DML-only batch
+    is traversed to exhaustion before execution returns, so errors from any of its statements are
+    raised. Traversal stops at the first rowset, even an empty one; results after it still need to
+    be read in full, for example with `read_all_result_sets`. The option neither commits, retries,
+    nor changes session settings.
+
+    Opted-in use is rejected with `ArgumentError` before any SQL is sent if the value is not a
+    bool, the engine is not `mssql+pyodbc`, the statement is not textual, or several parameter
+    sets are passed. Executions without the option are unaffected. Engines created by
+    `DatabaseRuntime` and the testing fixtures already have this installed; call it for engines
+    created elsewhere, since an engine without it silently ignores the option. Repeated calls on
+    the same engine have no effect.
+    """
+    if event.contains(engine, "before_execute", _validate_batch_execution):
+        return
+    event.listen(engine, "before_execute", _validate_batch_execution)
+    event.listen(engine, "before_cursor_execute", _validate_driver_sql_batch)
+    if _supports_batch_navigation(engine.dialect):
+        event.listen(engine, "after_cursor_execute", _skip_leading_rowcounts)
+
+
 @contextmanager
 def _sqlalchemy_cursor_errors(
         connection: Connection,
@@ -261,6 +361,7 @@ class DatabaseRuntime:
                     )
                     install_terminated_session_detection(engine)
                     install_connection_reset(engine)
+                    install_mssql_batch_support(engine)
                     _install_disconnect_logging(engine)
                     self._engine = engine
                     return engine

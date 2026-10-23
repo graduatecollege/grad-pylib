@@ -17,7 +17,11 @@ import pytest
 from _pytest.config import Config
 from xdist.workermanage import WorkerController
 
-from grad_pylib.core.db import install_connection_reset, install_terminated_session_detection
+from grad_pylib.core.db import (
+    install_connection_reset,
+    install_mssql_batch_support,
+    install_terminated_session_detection,
+)
 from grad_pylib.sqlserver_container import DEFAULT_SQL_SERVER_IMAGE, build_sql_server_container_kwargs
 
 CODEBOOK_DATABASE_NAME = "Codebook"
@@ -152,10 +156,11 @@ class SqlServerTestBootstrap:
 
 
 def _create_app_engine(url: Any) -> Engine:
-    """Create an application engine that classifies errors and resets session state like `DatabaseRuntime`."""
+    """Create an application engine with the error handling and batch support of `DatabaseRuntime` engines."""
     engine = create_engine(url, future=True, pool_pre_ping=True)
     install_terminated_session_detection(engine)
     install_connection_reset(engine)
+    install_mssql_batch_support(engine)
     return engine
 
 

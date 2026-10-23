@@ -8,16 +8,18 @@ from typing import Annotated
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import URL, Engine, make_url
 from sqlalchemy.orm import Session
 
+from grad_pylib.core import db as db_module
 from grad_pylib.testing.fixtures import (
     CODEBOOK_DATABASE_NAME,
     E2eServerConfig,
     ManagedE2eDatabases,
     SessionDependencyOverride,
     SqlServerFixtureConfig,
+    _create_app_engine,
     build_test_app,
     configure_e2e_environment,
     create_codebook_engine,
@@ -257,12 +259,16 @@ def test_create_codebook_engine_targets_codebook_database(
     def fake_install_terminated_session_detection(engine: _DisposableEngine) -> None:
         recorded["detection_engine"] = engine
 
+    def fake_install_mssql_batch_support(engine: _DisposableEngine) -> None:
+        recorded["batch_engine"] = engine
+
     monkeypatch.setattr("grad_pylib.testing.fixtures.create_engine", fake_create_engine)
     monkeypatch.setattr("grad_pylib.testing.fixtures.install_connection_reset", fake_install_connection_reset)
     monkeypatch.setattr(
         "grad_pylib.testing.fixtures.install_terminated_session_detection",
         fake_install_terminated_session_detection,
     )
+    monkeypatch.setattr("grad_pylib.testing.fixtures.install_mssql_batch_support", fake_install_mssql_batch_support)
     generator = create_codebook_engine(SimpleNamespace(url=source_url))
 
     assert next(generator) is recorded["engine"]
@@ -277,11 +283,36 @@ def test_create_codebook_engine_targets_codebook_database(
     assert recorded["pool_pre_ping"] is True
     assert recorded["reset_engine"] is recorded["engine"]
     assert recorded["detection_engine"] is recorded["engine"]
+    assert recorded["batch_engine"] is recorded["engine"]
 
     with pytest.raises(StopIteration):
         next(generator)
 
     assert recorded["engine"].disposed is True
+
+
+def test_app_engines_install_the_runtime_batch_support() -> None:
+    managed = ManagedE2eDatabases(
+        admin_url="unused",
+        app_engine=_create_app_engine("mssql+pyodbc://localhost/App?driver=ODBC+Driver+18+for+SQL+Server"),
+    )
+    try:
+        for engine in (managed.app_engine, managed.engine_for(CODEBOOK_DATABASE_NAME)):
+            assert event.contains(engine, "before_execute", db_module._validate_batch_execution)
+            assert event.contains(engine, "before_cursor_execute", db_module._validate_driver_sql_batch)
+            assert event.contains(engine, "after_cursor_execute", db_module._skip_leading_rowcounts)
+    finally:
+        managed.dispose()
+
+
+def test_app_engines_run_opted_in_batches(mssql_databases: ManagedE2eDatabases) -> None:
+    with mssql_databases.app_engine.connect() as connection:
+        result = connection.execute(
+            text("DECLARE @t TABLE (id int); INSERT INTO @t VALUES (1); SELECT id FROM @t"),
+            execution_options={"mssql_skip_rowcounts": True},
+        )
+
+        assert result.scalars().all() == [1]
 
 
 def test_create_db_session_fixture_rolls_back_changes_cleans_tables_and_runs_hooks(

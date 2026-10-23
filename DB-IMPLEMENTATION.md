@@ -1,8 +1,8 @@
 # Database pattern support: requirements and implementation plan
 
 **Status: steps 1 (SQLite removed from tests; shared SQL Server fixtures in the repo-root
-`conftest.py`) and 2 (batch regressions and the cursor-error adapter) implemented; later steps
-planned.** This document tracks the grad-pylib work needed to
+`conftest.py`), 2 (batch regressions and the cursor-error adapter), and 3 (option validation,
+navigation, and engine installation) implemented; later steps planned.** This document tracks the grad-pylib work needed to
 support [DB.md](DB.md). DB.md remains the application-facing standard and source for an
 agent skill; implementation tasks and compatibility decisions belong here.
 
@@ -143,7 +143,7 @@ not a record of completed changes.
 |---|---|---|
 | 1 | **Done** | None |
 | 2 | **Done** | 1 |
-| 3 | Implement validated execution-time navigation and engine installation | 2 |
+| 3 | **Done** | 2 |
 | 4 | Integrate the multi-result reader and direct-cursor error handling | 2, 3 |
 | 5 | Add script draining and wire migration/provisioning callers | 4 |
 | 6 | Verify end-to-end compatibility and publish the supported contract | 1, 3, 4, 5 |
@@ -179,19 +179,25 @@ by steps 3 and 4 is pinned with strict xfails that must be flipped by those step
 - `install_connection_reset` uses pyodbc-only `Connection.execute`; do not install it on pymssql
   engines. `parse_mssql_error` does not parse pymssql arguments.
 
-### 3. Implement the option and engine wiring
+### 3. Option and engine wiring (done)
 
-Add pre-execution validation and the navigation listener in `core/db.py`. Validate only
-explicit opt-in usage; keep the ordinary path inert. Make installer calls idempotent, wire
-runtime and fixture engine creation, and add the public export in `__init__.py`.
+`install_mssql_batch_support(engine)` in `core/db.py` is exported and installed by
+`DatabaseRuntime.get_engine()` and `testing/fixtures.py::_create_app_engine()`. Repeated calls
+are no-ops (`event.contains` on the `before_execute` validator).
 
-Extend `core/test_db.py`, `testing/test_fixtures.py`, and `core/test_db_integration.py`.
-Cover duplicate installation, unsupported use rejected before side effects, statement-level
-and execute-level option resolution, zero-row DML, one final rowset, and DML-only exhaustion.
-Verify `text()` and `tstring()` without swallowing empty SELECTs.
-
-**Exit condition:** one submitted application batch can yield a normal SQLAlchemy result
-without NOCOUNT scaffolding, and unsupported opt-in use fails clearly on configured engines.
+- **Validation:** `before_execute` checks `text()`/`tstring()`/`TextualSelect` executions before
+  compilation and autobegin, so rejected use sends nothing and leaves no transaction. The option
+  merges statement, connection, and execute levels. Non-bool values (including `None`),
+  non-`mssql+pyodbc` engines, non-textual statements, and several parameter sets raise
+  `sqlalchemy.exc.ArgumentError`; absent or `False` is inert, even on other engines.
+- `exec_driver_sql` skips `before_execute`, so `before_cursor_execute` validates statements without
+  a compiled form. It is supported, but a rejection there passes through `handle_error` and marks
+  the connection for the error-only reset.
+- **Navigation:** an `after_cursor_execute` listener, registered only on `mssql+pyodbc` engines,
+  calls `nextset()` while `description` is `None`; failures surface as the usual SQLAlchemy
+  errors (for example `DataError` with `.orig`). Connection-level `after_cursor_execute` listeners
+  run before engine-level ones and so see the cursor before navigation.
+- The multiquery omission test now waits only on step 4; its xfail was relabelled accordingly.
 
 ### 4. Integrate reader navigation and errors
 
