@@ -6,6 +6,7 @@ Additional docs in the repository root:
 
 * [AUTH.md](AUTH.md)
 * [DB.md](DB.md)
+* [DB-IMPLEMENTATION.md](DB-IMPLEMENTATION.md) - planned library support for the database patterns
 * [E2E.md](E2E.md)
 * [PARAMS.md](PARAMS.md)
 * [QUERYING.md](QUERYING.md)
