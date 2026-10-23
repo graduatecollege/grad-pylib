@@ -1,11 +1,9 @@
-from collections.abc import Generator
-
 import pytest
 from sqlalchemy import String, column, table, tstring
 from sqlalchemy.engine import Engine
 
 from grad_pylib.core.querying import QuerySpec, order_by_fragment, where_fragment
-from grad_pylib.testing import SqlServerFixtureConfig, create_e2e_database_bundle
+from grad_pylib.testing import ManagedE2eDatabases
 
 A = table(
     "awards",
@@ -22,30 +20,24 @@ SPEC = QuerySpec(
 
 
 @pytest.fixture(scope="module")
-def awards_engine() -> Generator[Engine]:
-    fixture_config = SqlServerFixtureConfig(
-        migration_runner=lambda _engine: None,
-        tables_to_clean=(),
-        database_prefix="GradPyLibQuerying",
-    )
-    with create_e2e_database_bundle(fixture_config) as databases:
-        with databases.app_engine.begin() as connection:
-            connection.exec_driver_sql("""
-                CREATE TABLE dbo.awards (
-                    term varchar(6) NOT NULL,
-                    department varchar(10) NOT NULL,
-                    program varchar(10) NULL,
-                    submitted_at date NOT NULL
-                )
-            """)
-            connection.exec_driver_sql("""
-                INSERT INTO dbo.awards VALUES
-                    ('120258', 'Chem', 'P1', '2026-01-01'),
-                    ('120258', 'Bio', NULL, '2026-02-01'),
-                    ('120258', 'CHEMENG', 'P3', '2026-03-01'),
-                    ('120261', 'Chem', 'P4', '2026-04-01')
-            """)
-        yield databases.app_engine
+def awards_engine(mssql_databases: ManagedE2eDatabases) -> Engine:
+    with mssql_databases.app_engine.begin() as connection:
+        connection.exec_driver_sql("""
+            CREATE TABLE dbo.awards (
+                term varchar(6) NOT NULL,
+                department varchar(10) NOT NULL,
+                program varchar(10) NULL,
+                submitted_at date NOT NULL
+            )
+        """)
+        connection.exec_driver_sql("""
+            INSERT INTO dbo.awards VALUES
+                ('120258', 'Chem', 'P1', '2026-01-01'),
+                ('120258', 'Bio', NULL, '2026-02-01'),
+                ('120258', 'CHEMENG', 'P3', '2026-03-01'),
+                ('120261', 'Chem', 'P4', '2026-04-01')
+        """)
+    return mssql_databases.app_engine
 
 
 def test_fragments_execute_on_sql_server(awards_engine: Engine):

@@ -1,6 +1,7 @@
 # Database pattern support: requirements and implementation plan
 
-**Status: planned, not implemented.** This document tracks the grad-pylib work needed to
+**Status: step 1 (SQLite removed from tests; shared SQL Server fixtures in the repo-root
+`conftest.py`) implemented; later steps planned.** This document tracks the grad-pylib work needed to
 support [DB.md](DB.md). DB.md remains the application-facing standard and source for an
 agent skill; implementation tasks and compatibility decisions belong here.
 

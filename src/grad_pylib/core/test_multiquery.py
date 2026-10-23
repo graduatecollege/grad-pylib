@@ -4,8 +4,8 @@ from typing import Any
 
 import pytest
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import Column, Executable, Integer, MetaData, String, Table, create_engine, literal, select, text
-from sqlalchemy.engine import Connection, CursorResult, Result
+from sqlalchemy import Column, Executable, Integer, MetaData, String, Table, literal, select, text
+from sqlalchemy.engine import Connection, CursorResult, Engine, Result
 from sqlalchemy.orm import DeclarativeBase
 
 from grad_pylib.core.multiquery import (
@@ -16,26 +16,27 @@ from grad_pylib.core.multiquery import (
     section_columns,
     split_row_sections,
 )
+from grad_pylib.testing import ManagedE2eDatabases
 
 
 metadata = MetaData()
 parent = Table(
     "parent",
     metadata,
-    Column("id", Integer, primary_key=True),
+    Column("id", Integer, primary_key=True, autoincrement=False),
     Column("name", String, nullable=False),
 )
 child = Table(
     "child",
     metadata,
-    Column("id", Integer, primary_key=True),
+    Column("id", Integer, primary_key=True, autoincrement=False),
     Column("parent_id", Integer, nullable=False),
     Column("name", String, nullable=False),
 )
 renamed = Table(
     "renamed",
     metadata,
-    Column("db_id", Integer, key="python_id", primary_key=True),
+    Column("db_id", Integer, key="python_id", primary_key=True, autoincrement=False),
     Column("db_name", String, key="python_name"),
 )
 
@@ -123,18 +124,23 @@ class _Cursor:
         self.closed = True
 
 
+@pytest.fixture(scope="module")
+def multiquery_engine(mssql_databases: ManagedE2eDatabases) -> Engine:
+    metadata.create_all(mssql_databases.app_engine)
+    return mssql_databases.app_engine
+
+
 @pytest.fixture
-def connection() -> Iterator[Connection]:
-    engine = create_engine("sqlite://")
-    metadata.create_all(engine)
-    with engine.begin() as connection:
+def connection(multiquery_engine: Engine) -> Iterator[Connection]:
+    """Seed rows in a transaction that is rolled back after each test."""
+    with multiquery_engine.connect() as connection, connection.begin() as transaction:
         connection.execute(
             parent.insert(),
             [{"id": 1, "name": "Parent"}, {"id": 3, "name": "Other"}],
         )
         connection.execute(child.insert(), {"id": 2, "parent_id": 1, "name": "Child"})
         yield connection
-    engine.dispose()
+        transaction.rollback()
 
 
 @pytest.fixture

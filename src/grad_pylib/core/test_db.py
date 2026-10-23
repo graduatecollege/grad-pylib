@@ -1,9 +1,8 @@
-import sqlite3
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Annotated, Any
 
+import pyodbc
 import pytest
 from fastapi import Body, Depends, FastAPI
 from fastapi.testclient import TestClient
@@ -15,6 +14,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 from grad_pylib.core import db as db_module
 from grad_pylib.core.config import BaseAppSettings
+from grad_pylib.testing import ManagedE2eDatabases, SqlServerFixtureConfig, create_db_session_fixture
 from grad_pylib.core.db import (
     DatabaseRuntime,
     NamedDatabases,
@@ -35,7 +35,7 @@ class Base(DeclarativeBase):
 class ExampleUpsertModel(Base):
     __tablename__ = "example_upsert_model"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
     value: Mapped[str] = mapped_column(String(50), nullable=False)
     created_by: Mapped[str | None] = mapped_column(String(50))
 
@@ -86,16 +86,18 @@ class RuntimeSpy:
     sessions: list[DummySession]
 
 
+@pytest.fixture(scope="module")
+def db_engine(mssql_databases: ManagedE2eDatabases) -> Engine:
+    Base.metadata.create_all(mssql_databases.app_engine)
+    return mssql_databases.app_engine
+
+
 @pytest.fixture
-def session() -> Generator[Session]:
-    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
-    Base.metadata.create_all(engine)
-    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
-
-    with session_factory() as db_session:
-        yield db_session
-
-    engine.dispose()
+def session(db_engine: Engine) -> Generator[Session]:
+    yield from create_db_session_fixture(db_engine, SqlServerFixtureConfig(
+        migration_runner=Base.metadata.create_all,
+        tables_to_clean=tuple(Base.metadata.tables),
+    ))
 
 
 @pytest.fixture
@@ -103,7 +105,8 @@ def runtime_spy(monkeypatch: pytest.MonkeyPatch) -> RuntimeSpy:
     create_engine_calls: list[tuple[str, dict[str, object]]] = []
     sessionmaker_calls: list[dict[str, object]] = []
     sessions: list[DummySession] = []
-    engine = create_engine("sqlite+pysqlite:///:memory:")
+    # Never connected: DatabaseRuntime only needs an engine object to hand back.
+    engine = create_engine("mssql+pyodbc://")
 
     def fake_create_engine(url: str, **kwargs: object) -> object:
         create_engine_calls.append((url, kwargs))
@@ -749,15 +752,20 @@ def db_logs(monkeypatch: pytest.MonkeyPatch) -> LogRecorder:
 
 @dataclass
 class FlakyEngine:
-    """SQLite engine that loses its connection on demand, as pyodbc reports it for SQL Server."""
+    """SQL Server engine whose pyodbc connection is lost on demand."""
     engine: Engine
     statement_failures: int = 0
     commit_failures: int = 0
 
 
+def lost_connection(driver_function: str) -> pyodbc.OperationalError:
+    """Build the error pyodbc raises when SQL Server drops the connection."""
+    return pyodbc.OperationalError("08S01", f"{LOST_CONNECTION_MESSAGE} ({driver_function})")
+
+
 @pytest.fixture
-def flaky_engine(monkeypatch: pytest.MonkeyPatch) -> Generator[FlakyEngine]:
-    engine = create_engine("sqlite+pysqlite:///:memory:")
+def flaky_engine(monkeypatch: pytest.MonkeyPatch, db_engine: Engine) -> Generator[FlakyEngine]:
+    engine = create_engine(db_engine.url)
     db_module._install_disconnect_logging(engine)
     # Connect once so the dialect's first-connect initialization cannot consume a failure.
     with engine.connect():
@@ -767,24 +775,20 @@ def flaky_engine(monkeypatch: pytest.MonkeyPatch) -> Generator[FlakyEngine]:
     real_execute = dialect.do_execute
     real_commit = dialect.do_commit
 
-    def lose_connection(driver_function: str) -> sqlite3.OperationalError:
-        return sqlite3.OperationalError("08S01", f"{LOST_CONNECTION_MESSAGE} ({driver_function})")
-
     def do_execute(cursor: Any, statement: str, parameters: Any, context: Any = None) -> None:
         if flaky.statement_failures:
             flaky.statement_failures -= 1
-            raise lose_connection("SQLExecDirectW")
+            raise lost_connection("SQLExecDirectW")
         real_execute(cursor, statement, parameters, context)
 
     def do_commit(dbapi_connection: Any) -> None:
         if flaky.commit_failures:
             flaky.commit_failures -= 1
-            raise lose_connection("SQLEndTran")
+            raise lost_connection("SQLEndTran")
         real_commit(dbapi_connection)
 
     monkeypatch.setattr(dialect, "do_execute", do_execute)
     monkeypatch.setattr(dialect, "do_commit", do_commit)
-    monkeypatch.setattr(dialect, "is_disconnect", lambda error, *_: error.args[:1] == ("08S01",))
     yield flaky
     engine.dispose()
 
@@ -1039,8 +1043,7 @@ def test_retry_on_disconnect_runs_again_on_a_fresh_connection(
     assert str(retry_log["operation"]).endswith("read")
 
 
-def test_retry_on_disconnect_rolls_back_every_session_argument(flaky_engine: FlakyEngine) -> None:
-    healthy_engine = create_engine("sqlite+pysqlite:///:memory:")
+def test_retry_on_disconnect_rolls_back_every_session_argument(flaky_engine: FlakyEngine, db_engine: Engine) -> None:
     attempts: list[int] = []
 
     @db_module.retry_on_disconnect
@@ -1049,13 +1052,12 @@ def test_retry_on_disconnect_rolls_back_every_session_argument(flaky_engine: Fla
         session.execute(text("select 1"))
         return other_session.execute(text("select 2")).scalar_one()
 
-    with Session(healthy_engine) as session, Session(flaky_engine.engine) as other_session:
+    with Session(db_engine) as session, Session(flaky_engine.engine) as other_session:
         # Fail the second session's statement, after the first session has begun a transaction.
         flaky_engine.statement_failures = 1
         assert read(session, other_session=other_session) == 2
 
     assert len(attempts) == 2
-    healthy_engine.dispose()
 
 
 def test_retry_on_disconnect_reraises_a_second_lost_connection(
@@ -1130,8 +1132,9 @@ def test_retry_on_disconnect_keeps_fastapi_endpoint_parameters(flaky_engine: Fla
 def test_disconnect_logging_reports_pre_ping_failures_at_info(
     monkeypatch: pytest.MonkeyPatch,
     db_logs: LogRecorder,
+    db_engine: Engine,
 ) -> None:
-    engine = create_engine("sqlite+pysqlite:///:memory:", pool_pre_ping=True)
+    engine = create_engine(db_engine.url, pool_pre_ping=True)
     db_module._install_disconnect_logging(engine)
     with engine.connect() as connection:
         connection.execute(text("select 1"))
@@ -1142,11 +1145,10 @@ def test_disconnect_logging_reports_pre_ping_failures_at_info(
     def ping_once_failing(dbapi_connection: Any) -> bool:
         if ping_failures:
             ping_failures.pop()
-            raise sqlite3.OperationalError("08S01", f"{LOST_CONNECTION_MESSAGE} (SQLExecDirectW)")
+            raise lost_connection("SQLExecDirectW")
         return real_ping(dbapi_connection)
 
     monkeypatch.setattr(engine.dialect, "do_ping", ping_once_failing)
-    monkeypatch.setattr(engine.dialect, "is_disconnect", lambda error, *_: error.args[:1] == ("08S01",))
     with engine.connect() as connection:
         connection.execute(text("select 1"))
     engine.dispose()
@@ -1161,24 +1163,23 @@ def test_disconnect_logging_reports_pre_ping_failures_at_info(
 
 
 def test_disconnect_logging_does_not_reconnect_an_invalidated_connection(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     db_logs: LogRecorder,
+    db_engine: Engine,
 ) -> None:
-    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'reconnect.db'}")
+    engine = create_engine(db_engine.url)
     db_module._install_disconnect_logging(engine)
     connect_attempts: list[None] = []
 
     def failing_connect(*_args: Any, **_kwargs: Any) -> None:
         connect_attempts.append(None)
-        raise sqlite3.OperationalError("08S01", f"{LOST_CONNECTION_MESSAGE} (SQLDriverConnect)")
+        raise lost_connection("SQLDriverConnect")
 
     with engine.connect() as connection:
         connection.execute(text("select 1"))
         connection.invalidate()
         connection.rollback()
         monkeypatch.setattr(engine.dialect, "connect", failing_connect)
-        monkeypatch.setattr(engine.dialect, "is_disconnect", lambda error, *_: error.args[:1] == ("08S01",))
 
         with pytest.raises(DBAPIError):
             connection.execute(text("select 1"))

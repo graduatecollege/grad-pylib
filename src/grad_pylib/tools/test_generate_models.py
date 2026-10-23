@@ -19,6 +19,9 @@ from grad_pylib.tools.generate_models import (
     normalize_sql_server_system_constraint_names,
 )
 
+# Generation-only cases compile against the SQL Server dialect; creating the engine does not connect.
+MSSQL_BIND = create_engine("mssql+pyodbc://")
+
 
 def test_render_column_includes_autoincrement_false_for_single_integer_primary_key() -> None:
     metadata = MetaData()
@@ -29,7 +32,7 @@ def test_render_column_includes_autoincrement_false_for_single_integer_primary_k
     )
     column = table.c.id
     generator_class = generator_with_non_autoincrement_primary_keys(DeclarativeGenerator)
-    generator = generator_class(metadata, create_engine("sqlite://"), {"use_inflect", "nojoined", "nobidi"})
+    generator = generator_class(metadata, MSSQL_BIND, {"use_inflect", "nojoined", "nobidi"})
 
     assert generator.render_column(column, show_name=True, is_table=True) == (
         "Column('id', Integer, primary_key=True, autoincrement=False)"
@@ -45,7 +48,7 @@ def test_render_column_skips_autoincrement_false_for_identity_primary_key() -> N
     )
     column = table.c.id
     generator_class = generator_with_non_autoincrement_primary_keys(DeclarativeGenerator)
-    generator = generator_class(metadata, create_engine("sqlite://"), {"use_inflect", "nojoined", "nobidi"})
+    generator = generator_class(metadata, MSSQL_BIND, {"use_inflect", "nojoined", "nobidi"})
 
     assert generator.render_column(column, show_name=True, is_table=True) == (
         "Column('id', Integer, primary_key=True, autoincrement=True)"
@@ -216,7 +219,7 @@ def test_render_relationship_includes_viewonly_for_marked_relationship() -> None
     setattr(relationship, "viewonly", True)
 
     generator_class = generator_with_non_autoincrement_primary_keys(DeclarativeGenerator)
-    generator = generator_class(metadata, create_engine("sqlite://"), {"use_inflect", "nojoined", "nobidi"})
+    generator = generator_class(metadata, MSSQL_BIND, {"use_inflect", "nojoined", "nobidi"})
 
     assert generator.render_relationship(relationship) == (
         "parent: Mapped['Parent'] = relationship('Parent', viewonly=True)"

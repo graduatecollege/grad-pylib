@@ -1,8 +1,35 @@
+from collections.abc import Generator
 from pathlib import Path
 
-from sqlalchemy import create_engine, text
+import pytest
+from sqlalchemy import MetaData, inspect, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import DBAPIError
 
-from grad_pylib.tools.migrate import run_migrations, split_batches
+from grad_pylib.testing import ManagedE2eDatabases
+from grad_pylib.tools.migrate import checksum, run_migrations, split_batches
+
+
+@pytest.fixture
+def migration_engine(mssql_databases: ManagedE2eDatabases) -> Generator[Engine]:
+    engine = mssql_databases.app_engine
+    yield engine
+    metadata = MetaData()
+    metadata.reflect(engine)
+    metadata.drop_all(engine)
+
+
+@pytest.fixture
+def schema_dir(tmp_path: Path) -> Path:
+    path = tmp_path / "schema"
+    path.mkdir()
+    return path
+
+
+def applied_history(engine: Engine) -> list[tuple[str, str]]:
+    with engine.connect() as connection:
+        rows = connection.execute(text("SELECT file_name, checksum FROM schema_migrations ORDER BY file_name"))
+        return [tuple(row) for row in rows]
 
 
 def test_split_batches_supports_go_delimiter() -> None:
@@ -10,16 +37,45 @@ def test_split_batches_supports_go_delimiter() -> None:
     assert batches == ["create table a(id int);", "create table b(id int);"]
 
 
-def test_run_migrations_uses_schema_dir_parameter(tmp_path: Path) -> None:
-    schema_dir = tmp_path / "schema"
-    schema_dir.mkdir()
-    (schema_dir / "001-create.sql").write_text("create table demo(id integer);", encoding="utf-8")
+def test_run_migrations_uses_schema_dir_parameter(migration_engine: Engine, schema_dir: Path) -> None:
+    sql = "CREATE TABLE demo (id int NOT NULL);\nGO\nINSERT INTO demo (id) VALUES (1);"
+    (schema_dir / "001-create.sql").write_text(sql, encoding="utf-8")
 
-    db_path = tmp_path / "test.db"
-    engine = create_engine(f"sqlite:///{db_path}", future=True)
-    try:
-        run_migrations(engine, schema_dir=schema_dir)
-        with engine.connect() as conn:
-            conn.execute(text("select * from demo"))
-    finally:
-        engine.dispose()
+    run_migrations(migration_engine, schema_dir=schema_dir)
+
+    with migration_engine.connect() as connection:
+        assert connection.execute(text("SELECT id FROM demo")).scalars().all() == [1]
+    assert applied_history(migration_engine) == [("001-create.sql", checksum(sql))]
+
+
+def test_run_migrations_skips_applied_files_and_rejects_changed_ones(
+        migration_engine: Engine, schema_dir: Path,
+) -> None:
+    migration = schema_dir / "001-create.sql"
+    migration.write_text("CREATE TABLE demo (id int NOT NULL);", encoding="utf-8")
+    run_migrations(migration_engine, schema_dir=schema_dir)
+
+    run_migrations(migration_engine, schema_dir=schema_dir)
+
+    migration.write_text("CREATE TABLE demo (id bigint NOT NULL);", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="001-create.sql has changed since it was applied"):
+        run_migrations(migration_engine, schema_dir=schema_dir)
+    assert [name for name, _ in applied_history(migration_engine)] == ["001-create.sql"]
+
+
+def test_run_migrations_rolls_back_a_failed_file_without_recording_it(
+        migration_engine: Engine, schema_dir: Path,
+) -> None:
+    (schema_dir / "001-create.sql").write_text("CREATE TABLE kept (id int NOT NULL);", encoding="utf-8")
+    (schema_dir / "002-fail.sql").write_text(
+        "CREATE TABLE rolled_back (id int NOT NULL);\nGO\nINSERT INTO missing_table (id) VALUES (1);",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DBAPIError):
+        run_migrations(migration_engine, schema_dir=schema_dir)
+
+    table_names = set(inspect(migration_engine).get_table_names())
+    assert {"kept", "schema_migrations"} <= table_names
+    assert "rolled_back" not in table_names
+    assert [name for name, _ in applied_history(migration_engine)] == ["001-create.sql"]

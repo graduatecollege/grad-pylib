@@ -17,18 +17,7 @@ from grad_pylib.core.db import (
     parse_mssql_error,
     retry_on_transient_conflict,
 )
-from grad_pylib.testing import ManagedE2eDatabases, SqlServerFixtureConfig, create_e2e_database_bundle
-
-
-@pytest.fixture(scope="module")
-def mssql_databases() -> Generator[ManagedE2eDatabases]:
-    fixture_config = SqlServerFixtureConfig(
-        migration_runner=lambda _engine: None,
-        tables_to_clean=(),
-        database_prefix="GradPyLibDbIntegration",
-    )
-    with create_e2e_database_bundle(fixture_config) as databases:
-        yield databases
+from grad_pylib.testing import ManagedE2eDatabases
 
 
 @pytest.fixture(scope="module")

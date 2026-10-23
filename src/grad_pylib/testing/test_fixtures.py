@@ -9,12 +9,13 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import URL, make_url
+from sqlalchemy.engine import URL, Engine, make_url
 from sqlalchemy.orm import Session
 
 from grad_pylib.testing.fixtures import (
     CODEBOOK_DATABASE_NAME,
     E2eServerConfig,
+    ManagedE2eDatabases,
     SessionDependencyOverride,
     SqlServerFixtureConfig,
     build_test_app,
@@ -113,6 +114,13 @@ class _FakeDatabases:
         return self._codebook_engine
 
 
+def _unconnected_mssql_engine(database: str) -> Engine:
+    """Return a SQL Server engine for tests that only inspect its URL; it never connects."""
+    return create_engine(URL.create(
+        "mssql+pyodbc", host="localhost", database=database, query={"driver": "ODBC Driver 18 for SQL Server"},
+    ))
+
+
 def _make_master_engine(
     recorded_sql: list[str],
     *,
@@ -123,9 +131,7 @@ def _make_master_engine(
     )
 
 
-def test_build_test_app_disables_env_file_overrides_sessions_and_skips_lifespan(
-    tmp_path: Path,
-) -> None:
+def test_build_test_app_disables_env_file_overrides_sessions_and_skips_lifespan() -> None:
     original_env_file = _FakeSettings.model_config["env_file"]
     startup_calls = 0
 
@@ -155,8 +161,8 @@ def test_build_test_app_disables_env_file_overrides_sessions_and_skips_lifespan(
         return app
 
     try:
-        app_engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'app-test.db'}")
-        codebook_engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'codebook-test.db'}")
+        app_engine = _unconnected_mssql_engine("AppTest")
+        codebook_engine = _unconnected_mssql_engine("CodebookTest")
         app = build_test_app(
             create_app=create_app,
             settings_type=_FakeSettings,
@@ -173,8 +179,7 @@ def test_build_test_app_disables_env_file_overrides_sessions_and_skips_lifespan(
             response = client.get("/sessions")
 
         payload = response.json()
-        assert payload["app"].endswith("app-test.db")
-        assert payload["codebook"].endswith("codebook-test.db")
+        assert payload == {"app": "AppTest", "codebook": "CodebookTest"}
         assert startup_calls == 0
     finally:
         app_engine.dispose()
@@ -222,7 +227,7 @@ def test_provision_sql_server_database_from_file_only_runs_missing_database_batc
 @pytest.mark.parametrize(
     "source_url",
     [
-        pytest.param(make_url("sqlite:///app.db"), id="standard-url"),
+        pytest.param(make_url("mssql+pyodbc://localhost/App?driver=ODBC+Driver+18+for+SQL+Server"), id="standard-url"),
         pytest.param(
             make_url(
                 "mssql+pyodbc:///?odbc_connect="
@@ -272,14 +277,14 @@ def test_create_codebook_engine_targets_codebook_database(
 
 
 def test_create_db_session_fixture_rolls_back_changes_cleans_tables_and_runs_hooks(
-    tmp_path: Path,
+    mssql_databases: ManagedE2eDatabases,
 ) -> None:
-    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'app.db'}")
+    engine = mssql_databases.app_engine
     events: list[str] = []
     row_counts_after_cleanup: list[int] = []
 
     with engine.begin() as conn:
-        conn.exec_driver_sql("CREATE TABLE widgets (id INTEGER)")
+        conn.exec_driver_sql("CREATE TABLE widgets (id int)")
         conn.exec_driver_sql("INSERT INTO widgets (id) VALUES (1)")
 
     def after_test() -> None:
@@ -306,7 +311,6 @@ def test_create_db_session_fixture_rolls_back_changes_cleans_tables_and_runs_hoo
     assert events == ["before", "after"]
     assert row_counts_after_cleanup == [0]
     assert remaining_rows == 0
-    engine.dispose()
 
 
 def test_configure_e2e_environment_sets_required_values_and_preserves_allowed_origins(
@@ -335,10 +339,9 @@ def test_configure_e2e_environment_sets_required_values_and_preserves_allowed_or
 
 def test_run_e2e_server_orchestrates_migration_seed_and_server_start(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
-    app_engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'app.db'}")
-    codebook_engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'codebook.db'}")
+    app_engine = _unconnected_mssql_engine("AppE2e")
+    codebook_engine = _unconnected_mssql_engine("Codebook")
     databases = _FakeDatabases(app_engine=app_engine, codebook_engine=codebook_engine)
     recorded_steps: list[tuple[str, object]] = []
     app = FastAPI()
@@ -386,7 +389,7 @@ def test_run_e2e_server_orchestrates_migration_seed_and_server_start(
     assert recorded_steps == [
         ("migrate", app_engine),
         ("provision_codebook", app_engine),
-        ("seed", str(tmp_path / "app.db")),
+        ("seed", "AppE2e"),
         ("build_app", (app_engine, codebook_engine)),
         ("serve", (app, "127.0.0.1", 9001, True)),
     ]
