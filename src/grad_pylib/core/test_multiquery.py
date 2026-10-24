@@ -1,5 +1,6 @@
 import logging
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -8,9 +9,10 @@ import pytest
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import Column, Executable, Integer, MetaData, String, Table, literal, select, text
 from sqlalchemy.engine import Connection, CursorResult, Engine, Result
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DataError, DBAPIError
 from sqlalchemy.orm import DeclarativeBase
 
+from grad_pylib.core.db import SqlServerErrorType, parse_mssql_error
 from grad_pylib.core.multiquery import (
     cursor_rows_to_dicts,
     map_row_to_pydantic,
@@ -107,9 +109,13 @@ class _Cursor:
 
     result_sets: tuple[_CursorSet | BaseException, ...]
     index: int = 0
-    closed: bool = False
+    closes: int = 0
     fetches: list[int] = field(default_factory=list)
     close_error: BaseException | None = None
+
+    @property
+    def closed(self) -> bool:
+        return self.closes > 0
 
     def _current(self) -> _CursorSet:
         result_set = self.result_sets[self.index]
@@ -140,7 +146,8 @@ class _Cursor:
         return True
 
     def close(self) -> None:
-        self.closed = True
+        # pyodbc rejects closing a cursor twice, so every close is counted.
+        self.closes += 1
         if self.close_error is not None:
             raise self.close_error
 
@@ -164,22 +171,47 @@ def connection(multiquery_engine: Engine) -> Iterator[Connection]:
         transaction.rollback()
 
 
+_SKIP_ROWCOUNTS = {"mssql_skip_rowcounts": True}
+
+
+@pytest.fixture(params=[False, True], ids=["default", "opted-in"])
+def skip_rowcounts(request: pytest.FixtureRequest) -> bool:
+    return request.param
+
+
 @pytest.fixture
 def cursor_result(
     connection: Connection, monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[tuple[Result[*tuple[Any, ...]], _Cursor]]:
+    with _doubled_result(connection, monkeypatch, {}) as doubled:
+        yield doubled
+
+
+@contextmanager
+def _doubled_result(
+    connection: Connection, monkeypatch: pytest.MonkeyPatch, execution_options: dict[str, Any],
+) -> Generator[tuple[Result[*tuple[Any, ...]], _Cursor]]:
+    """Execute a real statement with the given options, then swap its cursor for a ``_Cursor``."""
     cursor = _Cursor((
         (("id", "name"), [(1, "Name"), (2, None)]),
         (None, []),
         (("empty",), []),
         (("total",), [(2,)]),
     ))
-    with connection.execute(text("SELECT 1")) as result:
+    with connection.execute(text("SELECT 1"), execution_options=execution_options) as result:
         assert isinstance(result, CursorResult)
         assert result.cursor is not None
         result.cursor.close()
         monkeypatch.setattr(result, "cursor", cursor)
         yield result, cursor
+
+
+@pytest.fixture
+def option_cursor_result(
+    connection: Connection, monkeypatch: pytest.MonkeyPatch, skip_rowcounts: bool,
+) -> Iterator[tuple[Result[*tuple[Any, ...]], _Cursor]]:
+    with _doubled_result(connection, monkeypatch, _SKIP_ROWCOUNTS if skip_rowcounts else {}) as doubled:
+        yield doubled
 
 
 def test_read_all_result_sets_reads_all_sets_and_closes_cursor(
@@ -195,11 +227,11 @@ def test_read_all_result_sets_reads_all_sets_and_closes_cursor(
     ]
     assert cursor.fetches == [0, 2, 3]
     assert result.closed
-    assert cursor.closed
+    assert cursor.closes == 1
 
 
 @pytest.mark.parametrize("operation", ["fetchall", "nextset"])
-def test_read_all_result_sets_closes_cursor_on_driver_errors(
+def test_read_all_result_sets_keeps_non_driver_errors_and_closes_cursor(
     cursor_result: tuple[Result[*tuple[Any, ...]], _Cursor],
     monkeypatch: pytest.MonkeyPatch,
     operation: str,
@@ -216,7 +248,7 @@ def test_read_all_result_sets_closes_cursor_on_driver_errors(
 
     assert caught.value is error
     assert result.closed
-    assert cursor.closed
+    assert cursor.closes == 1
 
 
 def test_read_all_result_sets_rejects_non_cursor_results(connection: Connection) -> None:
@@ -276,11 +308,7 @@ def test_read_all_result_sets_closes_cursor_on_invalid_row_width(
         read_all_result_sets(result)
 
     assert result.closed
-    assert cursor.closed
-
-
-_AWAITING_READER_ERRORS = "Step 4: reader driver errors are not adapted to SQLAlchemy errors yet."
-_AWAITING_READER_OMISSION = "Step 4: the reader does not omit non-row results with mssql_skip_rowcounts yet."
+    assert cursor.closes == 1
 
 
 def _delayed_conversion_error() -> pyodbc.DataError:
@@ -309,23 +337,52 @@ def test_read_all_result_sets_keeps_legacy_placeholders_for_non_row_results(
     assert result.closed
 
 
-@pytest.mark.xfail(strict=True, raises=pyodbc.Error, reason=_AWAITING_READER_ERRORS)
-@pytest.mark.parametrize("operation", ["nextset", "fetchall"])
-def test_read_all_result_sets_adapts_driver_errors_after_a_valid_rowset(
-    cursor_result: tuple[Result[*tuple[Any, ...]], _Cursor], operation: str,
+def test_read_all_result_sets_omits_non_row_results_but_keeps_empty_rowsets_with_the_option(
+    connection: Connection, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result, cursor = cursor_result
-    error = _delayed_conversion_error()
-    failing_set: _CursorSet | BaseException = error if operation == "nextset" else (("b",), error)
-    cursor.result_sets = ((("a",), [(1,)]), failing_set)
+    with _doubled_result(connection, monkeypatch, _SKIP_ROWCOUNTS) as (result, cursor):
+        cursor.result_sets = (
+            (("a",), [(1,)]),
+            (None, []),
+            (("empty",), []),
+            (None, []),
+            (("b",), [(2,)]),
+            (None, []),
+            (None, []),
+        )
 
-    with pytest.raises(DBAPIError) as raised:
+        assert read_all_result_sets(result) == [[{"a": 1}], [], [{"b": 2}]]
+
+    # Trailing non-row results are still traversed, so their errors would be reported.
+    assert cursor.index == len(cursor.result_sets) - 1
+    assert cursor.fetches == [0, 2, 4]
+    assert cursor.closes == 1
+
+
+@pytest.mark.parametrize("operation", ["nextset", "fetchall", "trailing-nextset"])
+def test_read_all_result_sets_adapts_driver_errors_after_a_valid_rowset(
+    option_cursor_result: tuple[Result[*tuple[Any, ...]], _Cursor],
+    caplog: pytest.LogCaptureFixture,
+    operation: str,
+) -> None:
+    result, cursor = option_cursor_result
+    error = _delayed_conversion_error()
+    if operation == "fetchall":
+        cursor.result_sets = ((("a",), [(1,)]), (("b",), error))
+    elif operation == "nextset":
+        cursor.result_sets = ((("a",), [(1,)]), error)
+    else:
+        cursor.result_sets = ((("a",), [(1,)]), (None, []), error)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(DataError) as raised:
         read_all_result_sets(result)
 
     assert raised.value.orig is error
     assert raised.value.__cause__ is error
+    assert parse_mssql_error(raised.value).error_type is SqlServerErrorType.DATA_CONVERSION
     assert result.closed
-    assert cursor.closed
+    assert cursor.closes == 1
+    assert caplog.records == []
 
 
 def test_read_all_result_sets_preserves_the_primary_error_when_close_also_fails(
@@ -342,27 +399,25 @@ def test_read_all_result_sets_preserves_the_primary_error_when_close_also_fails(
 
     assert raised.value is error
     assert result.closed
-    assert cursor.closed
-    assert any(
-        record.exc_info is not None and record.exc_info[1] is cursor.close_error
-        for record in caplog.records
-    )
+    assert cursor.closes == 1
+    assert [record.exc_info[1] for record in caplog.records if record.exc_info] == [cursor.close_error]
 
 
-@pytest.mark.xfail(strict=True, raises=pytest.fail.Exception, reason=_AWAITING_READER_ERRORS)
-def test_read_all_result_sets_surfaces_a_close_failure_after_a_complete_read(
+def test_read_all_result_sets_logs_a_close_failure_after_a_complete_read(
     cursor_result: tuple[Result[*tuple[Any, ...]], _Cursor],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     result, cursor = cursor_result
     close_error = pyodbc.Error("HY000", "close failed")
     cursor.result_sets = ((("a",), [(1,)]),)
     cursor.close_error = close_error
 
-    with pytest.raises(DBAPIError) as raised:
-        read_all_result_sets(result)
+    with caplog.at_level(logging.ERROR):
+        assert read_all_result_sets(result) == [[{"a": 1}]]
 
-    assert raised.value.orig is close_error
     assert result.closed
+    assert cursor.closes == 1
+    assert [record.exc_info[1] for record in caplog.records if record.exc_info] == [close_error]
 
 
 def test_read_all_result_sets_keeps_server_placeholders_without_the_option(
@@ -376,7 +431,6 @@ def test_read_all_result_sets_keeps_server_placeholders_without_the_option(
     assert read_all_result_sets(result) == [[{"id": 1}], [], [], []]
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=_AWAITING_READER_OMISSION)
 @pytest.mark.parametrize("leading_dml", [False, True], ids=["leading-select", "leading-dml"])
 def test_read_all_result_sets_omits_only_non_row_results_with_the_option(
     connection: Connection, leading_dml: bool,
@@ -387,31 +441,51 @@ def test_read_all_result_sets_omits_only_non_row_results_with_the_option(
     )
     if leading_dml:
         statement = f"UPDATE parent SET name = name; {statement}"
-    result = connection.execute(text(statement), execution_options={"mssql_skip_rowcounts": True})
+    result = connection.execute(text(statement), execution_options=_SKIP_ROWCOUNTS)
 
     assert read_all_result_sets(result) == [[{"id": 1}], []]
 
 
-@pytest.mark.xfail(strict=True, raises=pyodbc.Error, reason=_AWAITING_READER_ERRORS)
+def test_read_all_result_sets_rejects_fully_traversed_dml_only_batches(connection: Connection) -> None:
+    result = connection.execute(text("UPDATE parent SET name = name"), execution_options=_SKIP_ROWCOUNTS)
+
+    with pytest.raises(ValueError, match="no active cursor"):
+        read_all_result_sets(result)
+
+
 @pytest.mark.parametrize(
-    ("failing_statement", "native_code"),
+    ("failing_statement", "error_type"),
     [
-        ("SELECT CAST('x' AS int) AS b", "(245)"),
-        ("UPDATE parent SET name = name WHERE id = 1 / 0", "(8134)"),
+        ("SELECT CAST('x' AS int) AS b", SqlServerErrorType.DATA_CONVERSION),
+        ("UPDATE parent SET name = name WHERE id = 1 / 0", SqlServerErrorType.DIVIDE_BY_ZERO),
+        ("UPDATE parent SET name = name; UPDATE parent SET name = name WHERE id = 1 / 0",
+         SqlServerErrorType.DIVIDE_BY_ZERO),
     ],
-    ids=["delayed-select", "trailing-dml"],
+    ids=["delayed-select", "trailing-dml", "after-a-row-count"],
 )
 def test_read_all_result_sets_raises_server_errors_after_a_valid_rowset(
-    connection: Connection, failing_statement: str, native_code: str,
+    connection: Connection,
+    caplog: pytest.LogCaptureFixture,
+    skip_rowcounts: bool,
+    failing_statement: str,
+    error_type: SqlServerErrorType,
 ) -> None:
-    result = connection.execute(text(f"SELECT id FROM parent WHERE id = 1; {failing_statement}"))
+    result = connection.execute(
+        text(f"SELECT id FROM parent WHERE id = 1; {failing_statement}"),
+        execution_options=_SKIP_ROWCOUNTS if skip_rowcounts else {},
+    )
 
-    with pytest.raises(DBAPIError) as raised:
+    with caplog.at_level(logging.ERROR), pytest.raises(DBAPIError) as raised:
         read_all_result_sets(result)
 
     assert isinstance(raised.value.orig, pyodbc.Error)
-    assert native_code in str(raised.value.orig)
+    assert raised.value.__cause__ is raised.value.orig
+    assert parse_mssql_error(raised.value).error_type is error_type
     assert result.closed
+    # The cursor is closed once; a second close would log "Error closing cursor".
+    assert caplog.records == []
+    # The transaction is left to its owner.
+    assert connection.in_transaction()
 
 
 @pytest.mark.parametrize("section", [renamed, _RenamedModel, _RenamedModel()])

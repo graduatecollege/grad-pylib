@@ -1,8 +1,9 @@
 # Database pattern support: requirements and implementation plan
 
 **Status: steps 1 (SQLite removed from tests; shared SQL Server fixtures in the repo-root
-`conftest.py`), 2 (batch regressions and the cursor-error adapter), and 3 (option validation,
-navigation, and engine installation) implemented; later steps planned.** This document tracks the grad-pylib work needed to
+`conftest.py`), 2 (batch regressions and the cursor-error adapter), 3 (option validation,
+navigation, and engine installation), and 4 (multi-result reader integration) implemented;
+later steps planned.** This document tracks the grad-pylib work needed to
 support [DB.md](DB.md). DB.md remains the application-facing standard and source for an
 agent skill; implementation tasks and compatibility decisions belong here.
 
@@ -90,6 +91,9 @@ Do not add retries to the reader/hook, commit or roll back caller-owned work, do
 errors already handled by SQLAlchemy, or replace the original failure with a cleanup failure.
 If cleanup alone fails, surface it; if cleanup fails while handling another error, preserve
 the primary exception and make the cleanup failure observable through existing logging.
+Exception: the reader leaves cursor closing to `CursorResult.close()`, which logs close failures
+as SQLAlchemy does for any result; after a complete traversal such a failure cannot lose data
+or hide a statement error.
 After a database failure, the transaction owner still decides rollback/retry.
 
 ### R4. Engine parity and compatibility
@@ -144,7 +148,7 @@ not a record of completed changes.
 | 1 | **Done** | None |
 | 2 | **Done** | 1 |
 | 3 | **Done** | 2 |
-| 4 | Integrate the multi-result reader and direct-cursor error handling | 2, 3 |
+| 4 | **Done** | 2, 3 |
 | 5 | Add script draining and wire migration/provisioning callers | 4 |
 | 6 | Verify end-to-end compatibility and publish the supported contract | 1, 3, 4, 5 |
 
@@ -199,20 +203,27 @@ are no-ops (`event.contains` on the `before_execute` validator).
   run before engine-level ones and so see the cursor before navigation.
 - The multiquery omission test now waits only on step 4; its xfail was relabelled accordingly.
 
-### 4. Integrate reader navigation and errors
+### 4. Reader navigation and errors (done)
 
-Update `core/multiquery.py::read_all_result_sets()` to use the effective option and shared
-error adapter. Keep existing mapping helpers and the low-level cursor helper's contract.
-Ensure result closure does not mask the primary failure or accidentally reconnect.
+`read_all_result_sets()` keeps its signature and return shape. It reads `mssql_skip_rowcounts`
+from the result's execution context; when set, results without a description are omitted while
+empty SELECTs stay `[]`. Every result is traversed, including trailing row counts.
 
-Extend `core/test_multiquery.py` and the SQL Server integration tests. Verify legacy
-placeholders as well as opted-in omission, empty rowsets, delayed failure, `.orig`, native
-error classification, `handle_error` invocation, disconnect invalidation, and reset marking.
-Exercise the existing read/write retry decorators around complete reader operations; the
-reader itself must never replay a cursor operation.
-
-**Exit condition:** full traversal either returns the complete agreed data or raises a
-classifiable error; retrying a whole operation cannot commit a partially successful attempt.
+- **Errors:** traversal runs inside `_sqlalchemy_cursor_errors`, so driver failures become the
+  matching `DBAPIError` (with `.orig`, chaining, `handle_error` listeners, reset marking, and
+  disconnect invalidation without reconnecting). Non-driver exceptions keep their identity.
+- **Single close:** pyodbc raises on a second `close()`, which SQLAlchemy logs as "Error closing
+  cursor". The reader passes no cursor to the adapter, so only `result.close()` closes it, and
+  close failures are logged rather than raised. A disconnect during a read therefore also logs
+  "Error closing cursor" (the connection is already closed), as plain SQLAlchemy fetches do; this
+  was accepted over detaching the cursor from the result to keep the reader simple.
+- A conversion error (245) aborts the batch and SQL Server rolls back the transaction itself;
+  statement-level errors such as divide by zero do not, so only complete traversal stops their
+  earlier writes from being committed.
+- Tests: unit doubles in `core/test_multiquery.py` pin omission, trailing traversal, error
+  adaptation, and close counts; SQL Server tests there and in `core/test_db_integration.py` cover
+  legacy placeholders, native classification, listeners, reset, disconnects, and whole-operation
+  retries with `retry_on_transient_conflict` and `retry_on_disconnect`.
 
 ### 5. Drain migration and provisioning scripts
 

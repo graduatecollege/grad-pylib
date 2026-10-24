@@ -1,4 +1,5 @@
 import inspect
+import logging
 import threading
 import time
 from collections.abc import Generator
@@ -25,8 +26,10 @@ from grad_pylib.core.db import (
     is_disconnect_error,
     is_retryable_disconnect,
     parse_mssql_error,
+    retry_on_disconnect,
     retry_on_transient_conflict,
 )
+from grad_pylib.core.multiquery import read_all_result_sets
 from grad_pylib.testing import ManagedE2eDatabases
 
 
@@ -631,6 +634,7 @@ def listened_engine(mssql_databases: ManagedE2eDatabases, monkeypatch: pytest.Mo
     engine = create_engine(mssql_databases.app_engine.url, pool_size=1, max_overflow=0)
     install_terminated_session_detection(engine)
     install_connection_reset(engine)
+    install_mssql_batch_support(engine)
     db_module._install_disconnect_logging(engine)
     listened = ListenedEngine(engine)
     event.listen(engine, "handle_error", listened.record)
@@ -873,3 +877,155 @@ def test_other_general_driver_errors_keep_the_connection(listened_engine: Listen
     assert original_error(raised.value).args[0] == "HY000"
     assert not is_disconnect_error(raised.value)
     assert listened_engine.log_events == []
+
+
+# `read_all_result_sets` integration (DB-IMPLEMENTATION.md, R2/R3): reader failures take SQLAlchemy's error path, and
+# whole operations around the reader are what retries replay.
+def assert_cursor_closed_once(caplog: pytest.LogCaptureFixture) -> None:
+    """A second close of a pyodbc cursor fails, and SQLAlchemy logs that as "Error closing cursor"."""
+    assert [record.getMessage() for record in caplog.records if "closing cursor" in record.getMessage()] == []
+
+
+@pytest.mark.parametrize("execution_options", [{}, _SKIP_ROWCOUNTS], ids=["default", "opted-in"])
+def test_reader_errors_reach_sqlalchemy_error_handling(
+        listened_engine: ListenedEngine,
+        caplog: pytest.LogCaptureFixture,
+        execution_options: dict[str, Any],
+) -> None:
+    with caplog.at_level(logging.ERROR), listened_engine.engine.connect() as connection:
+        spid = connection.execute(text("SELECT @@SPID")).scalar_one()
+        result = connection.execute(text(_FAILS_AFTER_A_ROWSET), execution_options=execution_options)
+        context = result.context
+
+        with pytest.raises(DBAPIError) as raised:
+            read_all_result_sets(result)
+        assert result.closed
+        assert connection.in_transaction()
+
+    assert_wraps_conversion_error(raised.value)
+    assert listened_engine.handled == [HandledError(original_error(raised.value), raised.value, False, context, None)]
+    # The batch failed before restoring NOCOUNT; the error-only reset restored it on return to the pool.
+    assert _session_state(listened_engine.engine) == (spid, 0)
+    assert_cursor_closed_once(caplog)
+
+
+def test_reader_disconnects_invalidate_without_reconnecting(
+        mssql_databases: ManagedE2eDatabases,
+        listened_engine: ListenedEngine,
+        monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with listened_engine.engine.connect() as connection:
+        spid = connection.execute(text("SELECT @@SPID")).scalar_one()
+        result = connection.execute(text(f"{_LARGE_SELECT}; SELECT 2 AS b"))
+        kill_spid(spid, mssql_databases.app_engine)
+        connects = record_connects(listened_engine.engine, monkeypatch)
+
+        with pytest.raises(DBAPIError) as raised:
+            read_all_result_sets(result)
+        assert result.closed
+        assert connection.invalidated
+
+    assert connects == []
+    assert raised.value.__cause__ is raised.value.orig
+    assert is_retryable_disconnect(raised.value)
+    assert [handled.is_disconnect for handled in listened_engine.handled] == [True]
+    assert listened_engine.log_events == ["db.disconnect"]
+    with listened_engine.engine.connect() as connection:
+        assert connection.execute(text("SELECT 1")).scalar_one() == 1
+
+
+@pytest.fixture
+def reader_writes(mssql_databases: ManagedE2eDatabases) -> Generator[None]:
+    with mssql_databases.app_engine.begin() as connection:
+        connection.execute(text("DROP TABLE IF EXISTS dbo.reader_writes"))
+        connection.execute(text("CREATE TABLE dbo.reader_writes (attempt int NOT NULL PRIMARY KEY)"))
+    yield
+    with mssql_databases.app_engine.begin() as connection:
+        connection.execute(text("DROP TABLE dbo.reader_writes"))
+
+
+def committed_reader_writes(engine: Engine) -> list[int]:
+    with engine.connect() as connection:
+        return list(connection.execute(text("SELECT attempt FROM dbo.reader_writes ORDER BY attempt")).scalars())
+
+
+@pytest.mark.usefixtures("reader_writes")
+def test_retry_on_transient_conflict_reruns_the_whole_reader_operation_after_a_lost_connection(
+        mssql_databases: ManagedE2eDatabases,
+        listened_engine: ListenedEngine,
+) -> None:
+    attempts: list[None] = []
+
+    @retry_on_transient_conflict
+    def write_and_read(session: Session) -> list[list[dict[str, Any]]]:
+        attempts.append(None)
+        spid = session.execute(text("SELECT @@SPID")).scalar_one()
+        first_rowset = _LARGE_SELECT if len(attempts) == 1 else "SELECT 1 AS a"
+        result = session.execute(
+            text(
+                f"INSERT INTO dbo.reader_writes (attempt) VALUES (:attempt); {first_rowset}; "
+                "SELECT COUNT(*) AS n FROM dbo.reader_writes"
+            ),
+            {"attempt": len(attempts)},
+            execution_options=_SKIP_ROWCOUNTS,
+        )
+        if len(attempts) == 1:
+            kill_spid(spid, mssql_databases.app_engine)
+        return read_all_result_sets(result)
+
+    with Session(listened_engine.engine) as session:
+        result_sets = write_and_read(session)
+
+    assert len(attempts) == 2
+    assert result_sets == [[{"a": 1}], [{"n": 1}]]
+    # The killed attempt's write was rolled back by SQL Server; only the complete attempt committed.
+    assert committed_reader_writes(listened_engine.engine) == [2]
+    assert listened_engine.log_events == ["db.disconnect", "db.retry"]
+
+
+@pytest.mark.usefixtures("reader_writes")
+def test_a_reader_error_after_a_valid_rowset_prevents_the_commit(listened_engine: ListenedEngine) -> None:
+    attempts: list[None] = []
+
+    @retry_on_transient_conflict
+    def write_and_read(session: Session) -> list[list[dict[str, Any]]]:
+        attempts.append(None)
+        result = session.execute(
+            # Divide by zero is a statement-level error, so SQL Server keeps the transaction and its insert.
+            text(
+                "INSERT INTO dbo.reader_writes (attempt) VALUES (1); SELECT 1 AS a; "
+                "UPDATE dbo.reader_writes SET attempt = attempt WHERE attempt = 1 / 0"
+            ),
+            execution_options=_SKIP_ROWCOUNTS,
+        )
+        return read_all_result_sets(result)
+
+    with Session(listened_engine.engine) as session, pytest.raises(DataError) as raised:
+        write_and_read(session)
+
+    assert len(attempts) == 1
+    assert parse_mssql_error(raised.value).error_type is SqlServerErrorType.DIVIDE_BY_ZERO
+    assert committed_reader_writes(listened_engine.engine) == []
+
+
+def test_retry_on_disconnect_reruns_the_whole_reader_operation(
+        mssql_databases: ManagedE2eDatabases,
+        listened_engine: ListenedEngine,
+) -> None:
+    attempts: list[None] = []
+
+    @retry_on_disconnect
+    def read(session: Session) -> list[list[dict[str, Any]]]:
+        attempts.append(None)
+        spid = session.execute(text("SELECT @@SPID")).scalar_one()
+        first_rowset = _LARGE_SELECT if len(attempts) == 1 else "SELECT 1 AS a"
+        result = session.execute(text(f"{first_rowset}; SELECT 2 AS b"))
+        if len(attempts) == 1:
+            kill_spid(spid, mssql_databases.app_engine)
+        return read_all_result_sets(result)
+
+    with Session(listened_engine.engine) as session:
+        assert read(session) == [[{"a": 1}], [{"b": 2}]]
+
+    assert len(attempts) == 2
+    assert listened_engine.log_events == ["db.disconnect", "db.retry", "db.retry.succeeded"]

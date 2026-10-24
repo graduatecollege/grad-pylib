@@ -8,6 +8,8 @@ from sqlalchemy.engine import Row
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.sql.selectable import FromClause
 
+from grad_pylib.core.db import _SKIP_ROWCOUNTS_OPTION, _sqlalchemy_cursor_errors
+
 type _RowSection = tuple[str, ...] | type[DeclarativeBase] | DeclarativeBase | Table
 
 
@@ -83,17 +85,30 @@ def split_row_sections(
 
 
 def read_all_result_sets(result: Result[*tuple[Any, ...]]) -> list[list[dict[str, Any]]]:
-    """Read an unconsumed ``CursorResult`` using a driver supporting ``nextset``.
+    """Read every result of an unconsumed ``CursorResult`` using a driver supporting ``nextset``.
 
     Accepts ``Result`` because ``Connection.execute``/``Session.execute`` are
     typed that way; the runtime object must be a ``CursorResult`` (as for Core
     and textual statements), otherwise ``TypeError`` is raised, e.g. for ORM
-    entity results.
+    entity results. A missing/closed cursor raises ``ValueError``; a DML-only
+    batch executed with ``mssql_skip_rowcounts`` has none, since it was fully
+    traversed during execution.
 
-    Each result set becomes a list of dictionaries keyed by cursor column names;
-    sets without a description or rows become empty lists. The result is always
-    closed, including on driver errors. A missing/closed cursor raises
-    ``ValueError``.
+    Each result set becomes a list of dictionaries keyed by cursor column names,
+    in batch order; empty SELECTs become empty lists. Results without a column
+    description, such as DML row counts, also become empty lists unless the
+    execution used the ``mssql_skip_rowcounts`` option, in which case they are
+    omitted. Every result is traversed, so errors raised by later statements
+    in the batch are reported rather than lost.
+
+    Driver failures while reading are raised as the matching SQLAlchemy
+    ``DBAPIError`` subclass with the driver error in ``.orig``, after
+    SQLAlchemy's usual error handling (``handle_error`` listeners, invalidation
+    of lost connections). Other exceptions, such as row width mismatches, keep
+    their identity. No partial data is returned, the reader never retries, and
+    the transaction is left to its owner. The result and its cursor are always
+    closed; as with any SQLAlchemy result, a cursor close failure is logged as
+    "Error closing cursor", not raised.
     """
     try:
         if not isinstance(result, CursorResult):
@@ -104,12 +119,21 @@ def read_all_result_sets(result: Result[*tuple[Any, ...]]) -> list[list[dict[str
         cursor: _MultiResultCursor | None = result.cursor
         if cursor is None:
             raise ValueError("Result has no active cursor.")
-        result_sets = [cursor_rows_to_dicts(cursor)]
-        while cursor.nextset():
-            result_sets.append(cursor_rows_to_dicts(cursor))
-        return result_sets
+        omit_non_row_results = result.context.execution_options.get(_SKIP_ROWCOUNTS_OPTION) is True
+        # No cursor is passed so the adapter leaves closing to `result.close()`; pyodbc rejects a second close.
+        with _sqlalchemy_cursor_errors(result.connection, None, context=result.context):
+            return _read_result_sets(cursor, omit_non_row_results)
     finally:
         result.close()
+
+
+def _read_result_sets(cursor: _MultiResultCursor, omit_non_row_results: bool) -> list[list[dict[str, Any]]]:
+    result_sets: list[list[dict[str, Any]]] = []
+    while True:
+        if not (omit_non_row_results and cursor.description is None):
+            result_sets.append(cursor_rows_to_dicts(cursor))
+        if not cursor.nextset():
+            return result_sets
 
 
 def cursor_rows_to_dicts(cursor: _RowCursor) -> list[dict[str, Any]]:
