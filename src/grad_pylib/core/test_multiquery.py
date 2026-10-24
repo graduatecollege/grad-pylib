@@ -2,19 +2,22 @@ import logging
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pyodbc
 import pytest
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import Column, Executable, Integer, MetaData, String, Table, literal, select, text
+from sqlalchemy import Column, Executable, Integer, MetaData, String, Table, create_engine, literal, select, text
 from sqlalchemy.engine import Connection, CursorResult, Engine, Result
-from sqlalchemy.exc import DataError, DBAPIError
+from sqlalchemy.exc import ArgumentError, DataError, DBAPIError
 from sqlalchemy.orm import DeclarativeBase
 
+from grad_pylib.core import multiquery as multiquery_module
 from grad_pylib.core.db import SqlServerErrorType, parse_mssql_error
 from grad_pylib.core.multiquery import (
     cursor_rows_to_dicts,
+    execute_script_batch,
     map_row_to_pydantic,
     qualified_columns,
     read_all_result_sets,
@@ -685,3 +688,260 @@ def test_map_row_to_pydantic_uses_physical_names_for_nested_validation_aliases(
     mapped = map_row_to_pydantic(row, _NestedRenamedDto, {"record": renamed})
 
     assert mapped.model_dump() == {"record": {"python_id": 1, "python_name": "Name"}}
+
+
+# Script batches (DB-IMPLEMENTATION.md, R5).
+_LARGE_ROWSET = "SELECT TOP (100000) a.object_id FROM sys.all_objects AS a CROSS JOIN sys.all_objects AS b"
+
+
+@dataclass
+class _ScriptCursor(_Cursor):
+    """A ``_Cursor`` that also executes and fetches in chunks; ``fetchall`` is never expected."""
+
+    executed: list[str] = field(default_factory=list)
+    fetch_sizes: list[int] = field(default_factory=list)
+    execute_error: BaseException | None = None
+    offset: int = 0
+
+    def execute(self, statement: str) -> None:
+        self.executed.append(statement)
+        if self.execute_error is not None:
+            raise self.execute_error
+
+    def fetchall(self) -> list[tuple[object, ...]]:
+        raise AssertionError("script batches must be fetched in bounded chunks")
+
+    def fetchmany(self, size: int) -> list[tuple[object, ...]]:
+        self.fetch_sizes.append(size)
+        rows = self._current()[1]
+        if isinstance(rows, BaseException):
+            raise rows
+        chunk = rows[self.offset:self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+    def nextset(self) -> bool | None:
+        self.offset = 0
+        return super().nextset()
+
+
+@dataclass
+class _ScriptLog:
+    events: list[tuple[str, dict[str, object]]] = field(default_factory=list)
+
+    def warning(self, event_name: str, /, **fields: object) -> None:
+        self.events.append((event_name, fields))
+
+
+@pytest.fixture
+def script_log(monkeypatch: pytest.MonkeyPatch) -> _ScriptLog:
+    log = _ScriptLog()
+    monkeypatch.setattr(multiquery_module, "_logger", log)
+    return log
+
+
+def _use_script_cursor(connection: Connection, monkeypatch: pytest.MonkeyPatch, cursor: _ScriptCursor) -> None:
+    monkeypatch.setattr(connection.connection, "cursor", lambda: cursor)
+
+
+def _record_driver_cursors(connection: Connection, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    created: list[Any] = []
+    fairy = connection.connection
+    real_cursor = fairy.cursor
+
+    def cursor() -> Any:
+        created.append(real_cursor())
+        return created[-1]
+
+    monkeypatch.setattr(fairy, "cursor", cursor)
+    return created
+
+
+def test_execute_script_batch_drains_every_result_in_bounded_chunks(
+    connection: Connection, monkeypatch: pytest.MonkeyPatch, script_log: _ScriptLog,
+) -> None:
+    cursor = _ScriptCursor((
+        (("a",), [(n,) for n in range(2500)]),
+        (None, []),
+        (("empty",), []),
+        (("b",), [(1,)]),
+        (None, []),
+    ))
+    _use_script_cursor(connection, monkeypatch, cursor)
+
+    execute_script_batch(connection, "batch")
+
+    assert cursor.executed == ["batch"]
+    assert cursor.fetch_sizes == [1000] * 4 + [1000] + [1000] * 2
+    assert cursor.index == len(cursor.result_sets) - 1
+    assert cursor.closes == 1
+    assert script_log.events == []
+    assert connection.in_transaction()
+
+
+@pytest.mark.parametrize("operation", ["execute", "fetchmany", "nextset", "trailing-nextset"])
+def test_execute_script_batch_adapts_driver_errors_and_closes_the_cursor(
+    connection: Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    script_log: _ScriptLog,
+    caplog: pytest.LogCaptureFixture,
+    operation: str,
+) -> None:
+    error = _delayed_conversion_error()
+    result_sets: dict[str, tuple[_CursorSet | BaseException, ...]] = {
+        "execute": ((("a",), [(1,)]),),
+        "fetchmany": ((("a",), [(1,)]), (("b",), error)),
+        "nextset": ((("a",), [(1,)]), error),
+        "trailing-nextset": ((("a",), [(1,)]), (None, []), error),
+    }
+    cursor = _ScriptCursor(result_sets[operation])
+    if operation == "execute":
+        cursor.execute_error = error
+    _use_script_cursor(connection, monkeypatch, cursor)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(DataError) as raised:
+        execute_script_batch(connection, "batch")
+
+    assert raised.value.orig is error
+    assert raised.value.__cause__ is error
+    assert raised.value.statement == "batch"
+    assert parse_mssql_error(raised.value).error_type is SqlServerErrorType.DATA_CONVERSION
+    assert cursor.closes == 1
+    assert script_log.events == []
+    assert caplog.records == []
+    # The transaction is left to its owner.
+    assert connection.in_transaction()
+
+
+def test_execute_script_batch_keeps_non_driver_errors(
+    connection: Connection, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = RuntimeError("fetch failed")
+    cursor = _ScriptCursor((((("a",), error)),))
+    _use_script_cursor(connection, monkeypatch, cursor)
+
+    with pytest.raises(RuntimeError) as raised:
+        execute_script_batch(connection, "batch")
+
+    assert raised.value is error
+    assert cursor.closes == 1
+
+
+def test_execute_script_batch_raises_a_close_failure_after_a_complete_batch(
+    connection: Connection, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_error = pyodbc.Error("HY000", "close failed")
+    cursor = _ScriptCursor(((("a",), [(1,)]),), close_error=close_error)
+    _use_script_cursor(connection, monkeypatch, cursor)
+
+    with pytest.raises(DBAPIError) as raised:
+        execute_script_batch(connection, "batch")
+
+    assert raised.value.orig is close_error
+    assert cursor.closes == 1
+
+
+def test_execute_script_batch_preserves_the_primary_error_and_logs_a_close_failure(
+    connection: Connection, monkeypatch: pytest.MonkeyPatch, script_log: _ScriptLog,
+) -> None:
+    error = _delayed_conversion_error()
+    close_error = pyodbc.Error("HY000", "close failed")
+    cursor = _ScriptCursor(((("a",), [(1,)]), error), close_error=close_error)
+    _use_script_cursor(connection, monkeypatch, cursor)
+
+    with pytest.raises(DataError) as raised:
+        execute_script_batch(connection, "batch")
+
+    assert raised.value.orig is error
+    assert cursor.closes == 1
+    assert script_log.events == [("db.script.cursor_close_failed", {"exc_info": close_error})]
+
+
+@pytest.mark.parametrize(("name", "driver"), [("postgresql", "psycopg"), ("mssql", "aioodbc")])
+def test_execute_script_batch_rejects_unsupported_drivers_before_running(name: str, driver: str) -> None:
+    unsupported = SimpleNamespace(dialect=SimpleNamespace(name=name, driver=driver))
+
+    with pytest.raises(ArgumentError, match=f"not {name}\\+{driver}"):
+        execute_script_batch(cast(Connection, unsupported), "SELECT 1")
+
+
+@pytest.fixture(params=["pyodbc", "pymssql"])
+def script_engine(request: pytest.FixtureRequest, multiquery_engine: Engine) -> Iterator[Engine]:
+    if request.param == "pyodbc":
+        yield multiquery_engine
+        return
+    engine = create_engine(multiquery_engine.url.set(drivername="mssql+pymssql", query={}))
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture
+def script_connection(script_engine: Engine) -> Iterator[Connection]:
+    with script_engine.connect() as connection:
+        yield connection
+        connection.rollback()
+
+
+def _assert_closed(cursor: Any) -> None:
+    with pytest.raises(Exception, match="(?i)closed"):
+        cursor.execute("SELECT 1")
+
+
+def test_execute_script_batch_runs_writes_after_a_large_discarded_rowset(
+    script_connection: Connection, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script_connection.exec_driver_sql("CREATE TABLE #script_writes (id int NOT NULL)")
+    cursors = _record_driver_cursors(script_connection, monkeypatch)
+
+    execute_script_batch(
+        script_connection,
+        f"INSERT INTO #script_writes VALUES (1); {_LARGE_ROWSET}; INSERT INTO #script_writes VALUES (2)",
+    )
+
+    assert len(cursors) == 1
+    _assert_closed(cursors[0])
+    assert script_connection.exec_driver_sql(
+        "SELECT id FROM #script_writes ORDER BY id"
+    ).scalars().all() == [1, 2]
+
+
+@pytest.mark.parametrize(
+    ("failing_statement", "error_type"),
+    [
+        ("SELECT CAST('x' AS int) AS b", SqlServerErrorType.DATA_CONVERSION),
+        ("UPDATE parent SET name = name WHERE id = 1 / 0", SqlServerErrorType.DIVIDE_BY_ZERO),
+        ("UPDATE parent SET name = name; UPDATE parent SET name = name WHERE id = 1 / 0",
+         SqlServerErrorType.DIVIDE_BY_ZERO),
+    ],
+    ids=["delayed-select", "trailing-dml", "after-a-row-count"],
+)
+def test_execute_script_batch_raises_server_errors_after_a_valid_result(
+    script_connection: Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_statement: str,
+    error_type: SqlServerErrorType,
+) -> None:
+    batch = f"SELECT id FROM parent; {failing_statement}"
+    cursors = _record_driver_cursors(script_connection, monkeypatch)
+
+    with pytest.raises(DBAPIError) as raised:
+        execute_script_batch(script_connection, batch)
+
+    assert isinstance(raised.value.orig, script_connection.dialect.loaded_dbapi.Error)
+    assert raised.value.__cause__ is raised.value.orig
+    assert raised.value.statement == batch
+    if script_connection.dialect.driver == "pyodbc":
+        # parse_mssql_error does not parse pymssql arguments.
+        assert parse_mssql_error(raised.value).error_type is error_type
+    assert script_connection.in_transaction()
+    assert len(cursors) == 1
+    _assert_closed(cursors[0])
+
+
+def test_execute_script_batch_uses_the_callers_transaction_without_committing(script_engine: Engine) -> None:
+    with script_engine.connect() as connection:
+        execute_script_batch(connection, "CREATE TABLE script_uncommitted (id int); SELECT 1 AS a")
+
+        assert connection.in_transaction()
+        connection.rollback()
+        assert connection.exec_driver_sql("SELECT OBJECT_ID(N'script_uncommitted')").scalar() is None

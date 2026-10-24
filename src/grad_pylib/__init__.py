@@ -9,7 +9,7 @@ from grad_pylib.core.decimal import OptionalStringDecimal, OptionalNumberDecimal
 from grad_pylib.core.exceptions import DATABASE_UNAVAILABLE_RETRY_AFTER_SECONDS, ApiError, BadRequestError, ForbiddenError, NotFoundError, ConflictError, api_error_handler, database_disconnect_handler, register_exception_handlers
 from grad_pylib.core.filtering import FilterField, filter_key, filter_field_definitions, create_filter_model, filter_values
 from grad_pylib.core.logging import REQUEST_ID_HEADER, REQUEST_ID_FIELD, configure_logging, bind_request_id_context
-from grad_pylib.core.multiquery import qualified_columns, section_columns, split_row_sections, read_all_result_sets, cursor_rows_to_dicts, map_row_to_pydantic
+from grad_pylib.core.multiquery import qualified_columns, section_columns, split_row_sections, read_all_result_sets, execute_script_batch, cursor_rows_to_dicts, map_row_to_pydantic
 from grad_pylib.core.params import TermCodePath, TermCodeQuery, DepartmentCodePath, DepartmentCodeQuery, UniqueHashPath, SnakeCaseNamePath, TermCode, DepartmentCode, UniqueHash, SnakeCaseName
 from grad_pylib.core.querying import QuerySpec, RawWhereClause, escape_like, apply_filters, apply_sort, where_fragment, order_by_fragment, bind_expanding_params, build_where_clause, build_order_by_clause, apply_pagination, apply_query
 from grad_pylib.core.schemas import parse_comma_separated_strings, validate_string_items, parse_validated_comma_separated_strings, parse_json_blob, normalize_email_list, BaseDto, DataResponse, ItemResponse, ListResponse, MetaResponse, StatusResponse, build_status_response
@@ -103,6 +103,7 @@ __all__ = [
     "describe_disconnect",
     "dev_api_key_enabled_for",
     "escape_like",
+    "execute_script_batch",
     "filter_field_definitions",
     "filter_key",
     "filter_values",

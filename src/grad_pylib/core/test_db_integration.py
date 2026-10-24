@@ -16,6 +16,7 @@ from sqlalchemy.exc import ArgumentError, DataError, DBAPIError, ResourceClosedE
 from sqlalchemy.orm import Session, sessionmaker
 
 from grad_pylib.core import db as db_module
+from grad_pylib.core import multiquery as multiquery_module
 from grad_pylib.core.db import (
     SqlServerErrorType,
     _sqlalchemy_cursor_errors,
@@ -29,7 +30,7 @@ from grad_pylib.core.db import (
     retry_on_disconnect,
     retry_on_transient_conflict,
 )
-from grad_pylib.core.multiquery import read_all_result_sets
+from grad_pylib.core.multiquery import execute_script_batch, read_all_result_sets
 from grad_pylib.testing import ManagedE2eDatabases
 
 
@@ -734,6 +735,27 @@ def test_raw_cursor_disconnects_invalidate_without_reconnecting(
     assert listened_engine.log_events == ["db.disconnect"]
     with listened_engine.engine.connect() as connection:
         assert connection.execute(text("SELECT 1")).scalar_one() == 1
+
+
+def test_script_batch_disconnects_invalidate_without_reconnecting_or_closing_the_cursor(
+        mssql_databases: ManagedE2eDatabases,
+        listened_engine: ListenedEngine,
+        monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(multiquery_module, "_logger", listened_engine)
+    with listened_engine.engine.connect() as connection:
+        kill_spid(connection.execute(text("SELECT @@SPID")).scalar_one(), mssql_databases.app_engine)
+        connects = record_connects(listened_engine.engine, monkeypatch)
+
+        with pytest.raises(DBAPIError) as raised:
+            execute_script_batch(connection, "SELECT 1")
+        assert connection.invalidated
+
+    assert connects == []
+    assert is_retryable_disconnect(raised.value)
+    assert raised.value.statement == "SELECT 1"
+    # No "db.script.cursor_close_failed": the invalidated connection's cursor is not closed again.
+    assert listened_engine.log_events == ["db.disconnect"]
 
 
 def test_result_cursor_disconnects_invalidate_without_reconnecting(

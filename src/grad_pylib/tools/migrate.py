@@ -8,6 +8,7 @@ from sqlalchemy.engine import Engine
 
 from grad_pylib.core.config import get_settings
 from grad_pylib.core.db import NamedDatabases
+from grad_pylib.core.multiquery import execute_script_batch
 
 _GO_SPLIT = re.compile(r"^\s*go\s*$", re.IGNORECASE | re.MULTILINE)
 _MIGRATION_HISTORY = Table(
@@ -70,9 +71,10 @@ def run_migrations(
         if sql_file.name in applied:
             raise RuntimeError(f"Migration {sql_file.name} has changed since it was applied.")
 
+        # Every result of every batch is read before the history row is written in the same transaction.
         with eng.begin() as connection:
             for batch in split_batches(sql_text):
-                connection.exec_driver_sql(batch)
+                execute_script_batch(connection, batch)
             connection.execute(
                 _MIGRATION_HISTORY.insert().values(file_name=sql_file.name, checksum=file_checksum),
             )

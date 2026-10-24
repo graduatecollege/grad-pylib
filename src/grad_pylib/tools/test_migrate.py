@@ -2,7 +2,7 @@ from collections.abc import Generator
 from pathlib import Path
 
 import pytest
-from sqlalchemy import MetaData, inspect, text
+from sqlalchemy import MetaData, create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError
 
@@ -10,13 +10,19 @@ from grad_pylib.testing import ManagedE2eDatabases
 from grad_pylib.tools.migrate import checksum, run_migrations, split_batches
 
 
-@pytest.fixture
-def migration_engine(mssql_databases: ManagedE2eDatabases) -> Generator[Engine]:
-    engine = mssql_databases.app_engine
+@pytest.fixture(params=["pyodbc", "pymssql"])
+def migration_engine(request: pytest.FixtureRequest, mssql_databases: ManagedE2eDatabases) -> Generator[Engine]:
+    """Run migrations through both drivers; `rebuild_models` uses pymssql."""
+    app_engine = mssql_databases.app_engine
+    engine = app_engine
+    if request.param == "pymssql":
+        engine = create_engine(app_engine.url.set(drivername="mssql+pymssql", query={}))
     yield engine
+    if engine is not app_engine:
+        engine.dispose()
     metadata = MetaData()
-    metadata.reflect(engine)
-    metadata.drop_all(engine)
+    metadata.reflect(app_engine)
+    metadata.drop_all(app_engine)
 
 
 @pytest.fixture
@@ -79,3 +85,41 @@ def test_run_migrations_rolls_back_a_failed_file_without_recording_it(
     assert {"kept", "schema_migrations"} <= table_names
     assert "rolled_back" not in table_names
     assert [name for name, _ in applied_history(migration_engine)] == ["001-create.sql"]
+
+
+@pytest.mark.parametrize(
+    "failing_statement",
+    ["SELECT CAST('x' AS int) AS b", "INSERT INTO early (id) VALUES (1 / 0)"],
+    ids=["delayed-select", "statement-level-error"],
+)
+def test_run_migrations_does_not_record_a_file_that_fails_after_a_valid_result(
+        migration_engine: Engine, schema_dir: Path, failing_statement: str,
+) -> None:
+    (schema_dir / "001-fail.sql").write_text(
+        f"CREATE TABLE early (id int NOT NULL);\nGO\nINSERT INTO early (id) VALUES (1); SELECT id FROM early; "
+        f"{failing_statement}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DBAPIError):
+        run_migrations(migration_engine, schema_dir=schema_dir)
+
+    assert "early" not in inspect(migration_engine).get_table_names()
+    assert applied_history(migration_engine) == []
+
+
+def test_run_migrations_completes_writes_after_a_large_discarded_rowset(
+        migration_engine: Engine, schema_dir: Path,
+) -> None:
+    sql = (
+        "CREATE TABLE required (id int NOT NULL);\nGO\n"
+        "SELECT TOP (100000) a.object_id FROM sys.all_objects AS a CROSS JOIN sys.all_objects AS b; "
+        "INSERT INTO required (id) VALUES (1);"
+    )
+    (schema_dir / "001-required.sql").write_text(sql, encoding="utf-8")
+
+    run_migrations(migration_engine, schema_dir=schema_dir)
+
+    with migration_engine.connect() as connection:
+        assert connection.execute(text("SELECT id FROM required")).scalars().all() == [1]
+    assert applied_history(migration_engine) == [("001-required.sql", checksum(sql))]

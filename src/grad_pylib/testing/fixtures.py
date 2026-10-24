@@ -22,6 +22,7 @@ from grad_pylib.core.db import (
     install_mssql_batch_support,
     install_terminated_session_detection,
 )
+from grad_pylib.core.multiquery import execute_script_batch
 from grad_pylib.sqlserver_container import DEFAULT_SQL_SERVER_IMAGE, build_sql_server_container_kwargs
 
 CODEBOOK_DATABASE_NAME = "Codebook"
@@ -406,8 +407,9 @@ def provision_sql_server_database_from_file(
 
             exists = conn.exec_driver_sql(f"SELECT DB_ID(N'{escaped_database_name}')").scalar()
             if exists is None:
+                # AUTOCOMMIT: a failing batch is reported, but work already applied is not rolled back.
                 for batch in split_go_batches(script):
-                    conn.exec_driver_sql(batch)
+                    execute_script_batch(conn, batch)
     finally:
         master_engine.dispose()
 

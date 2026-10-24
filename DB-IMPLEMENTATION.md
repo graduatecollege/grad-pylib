@@ -2,8 +2,8 @@
 
 **Status: steps 1 (SQLite removed from tests; shared SQL Server fixtures in the repo-root
 `conftest.py`), 2 (batch regressions and the cursor-error adapter), 3 (option validation,
-navigation, and engine installation), and 4 (multi-result reader integration) implemented;
-later steps planned.** This document tracks the grad-pylib work needed to
+navigation, and engine installation), 4 (multi-result reader integration), and 5 (script
+draining for migrations and provisioning) implemented; step 6 planned.** This document tracks the grad-pylib work needed to
 support [DB.md](DB.md). DB.md remains the application-facing standard and source for an
 agent skill; implementation tasks and compatibility decisions belong here.
 
@@ -149,7 +149,7 @@ not a record of completed changes.
 | 2 | **Done** | 1 |
 | 3 | **Done** | 2 |
 | 4 | **Done** | 2, 3 |
-| 5 | Add script draining and wire migration/provisioning callers | 4 |
+| 5 | **Done** | 4 |
 | 6 | Verify end-to-end compatibility and publish the supported contract | 1, 3, 4, 5 |
 
 ### 2. Integration boundary findings (done)
@@ -225,22 +225,41 @@ empty SELECTs stay `[]`. Every result is traversed, including trailing row count
   legacy placeholders, native classification, listeners, reset, disconnects, and whole-operation
   retries with `retry_on_transient_conflict` and `retry_on_disconnect`.
 
-### 5. Drain migration and provisioning scripts
+### 5. Script draining (done)
 
-Add the shared script executor alongside cursor utilities in `core/multiquery.py`, reusing
-the adapter rather than introducing another error policy. Wire the two script loops and
-review administrative batch calls in fixture/model-rebuild setup for the same completion
-requirement. Retain scalar setup queries as explicit result-bearing operations.
+`execute_script_batch(connection, batch)` in `core/multiquery.py` (exported) runs one already split
+batch on a driver cursor taken from the connection before execution, fetches rowsets in chunks of
+1000 and discards them, and advances to exhaustion. `run_migrations()` and
+`provision_sql_server_database_from_file()` use it for every batch; GO splitting, checksums,
+history semantics, the setup lock, and the existence check are unchanged.
 
-Extend `tools/test_migrate.py`, `testing/test_fixtures.py`, and real SQL Server coverage.
-Add co-located model-rebuild tests for any changed setup paths; there is no dedicated
-`tools/test_rebuild_models.py` yet. Test a script with a valid early result followed by a failing
-statement: no migration-history success row may be committed. Also test a large discarded
-rowset followed by a required write, bounded fetching, and success/failure cursor closure.
-Run real script cases through both pyodbc and pymssql, including AUTOCOMMIT provisioning.
-
-**Exit condition:** tools cannot report success merely because the first result succeeded;
-SQL Server migration behavior and existing transaction/setup-lock ownership remain intact.
+- **Ownership:** the batch runs in the connection's current transaction, beginning one if none is
+  active as `exec_driver_sql` would, so the caller commits; migration history is written in the same
+  transaction only after every batch is drained. Session state carries across batches (`USE`, the
+  provisioning lock). The raw execution bypasses SQLAlchemy execution events and parameters.
+- **Drivers:** `_SCRIPT_DRAINERS` is the explicit boundary, with entries for `mssql+pyodbc` and
+  `mssql+pymssql`; any other connection raises `ArgumentError` before anything runs.
+- **Errors and closing:** execute, fetch, and nextset failures go through `_sqlalchemy_cursor_errors`
+  with the batch as the statement. The adapter is given no cursor, so the executor closes it exactly
+  once: a close failure is raised after a complete batch and logged as `db.script.cursor_close_failed`
+  when another error is already propagating. After a disconnect the cursor is not closed, since
+  invalidation closed the DB-API connection; no reconnect occurs.
+- **Old behavior:** with pyodbc, an error after a valid rowset was lost and the migration recorded; on
+  both drivers a write after a large rowset was silently dropped when the unread cursor was closed.
+  pymssql already reported delayed errors on its next statement.
+- **Setup review:** model rebuild changes nothing directly; its migrations now drain through pymssql.
+  `create_database` helpers and the conftest drop run single statements without rowsets, whose errors
+  are raised on execution, and the lock and existence reads stay explicit scalar queries.
+- **Environment finding (not changed):** with unixODBC, pyodbc's default driver-level pooling keeps the
+  physical connection after `Engine.dispose()` and hands it back to the next engine with the same
+  connection string, without resetting its database context or releasing session-owned app locks.
+  Provisioning never releases its session lock explicitly, so the lock lasts until that physical
+  connection closes; a different connection string (such as pymssql) waits for the lock timeout.
+- Tests: doubles in `core/test_multiquery.py` pin bounded fetching, traversal, error adaptation,
+  and close counts. Tests there and in `tools/test_migrate.py` and `testing/test_fixtures.py` run
+  real batches on pyodbc and pymssql, covering transaction ownership, failures after a valid result
+  (no history row), large discarded rowsets followed by required writes, and AUTOCOMMIT provisioning.
+  `core/test_db_integration.py` covers disconnects.
 
 ### 6. Verify and publish
 

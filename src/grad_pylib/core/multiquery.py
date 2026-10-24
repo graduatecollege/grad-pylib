@@ -1,16 +1,22 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol, Union, get_args, get_origin
 
+import structlog
 from pydantic import BaseModel
 from sqlalchemy import Table
-from sqlalchemy.engine import CursorResult, Result
+from sqlalchemy.engine import Connection, CursorResult, Result
 from sqlalchemy.engine import Row
+from sqlalchemy.engine.interfaces import DBAPICursor
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.sql.selectable import FromClause
 
 from grad_pylib.core.db import _SKIP_ROWCOUNTS_OPTION, _sqlalchemy_cursor_errors
 
 type _RowSection = tuple[str, ...] | type[DeclarativeBase] | DeclarativeBase | Table
+
+_logger = structlog.get_logger(__name__)
+_SCRIPT_FETCH_SIZE = 1000
 
 
 class _RowCursor(Protocol):
@@ -134,6 +140,77 @@ def _read_result_sets(cursor: _MultiResultCursor, omit_non_row_results: bool) ->
             result_sets.append(cursor_rows_to_dicts(cursor))
         if not cursor.nextset():
             return result_sets
+
+
+def _drain_mssql_script(cursor: DBAPICursor, batch: str) -> None:
+    # pyodbc and pymssql both report errors from later statements while fetching or advancing.
+    cursor.execute(batch)
+    while True:
+        if cursor.description is not None:
+            while cursor.fetchmany(_SCRIPT_FETCH_SIZE):
+                pass
+        if not cursor.nextset():
+            return
+
+
+# The explicit driver boundary: a backend needs its own entry, never a fallback to undrained execution.
+_SCRIPT_DRAINERS: dict[tuple[str, str], Callable[[DBAPICursor, str], None]] = {
+    ("mssql", "pyodbc"): _drain_mssql_script,
+    ("mssql", "pymssql"): _drain_mssql_script,
+}
+
+
+def execute_script_batch(connection: Connection, batch: str) -> None:
+    """Execute one already split script batch and read every result it produces, discarding rows.
+
+    For migration and provisioning scripts, whose success must not rest on the first result: rows
+    are fetched in bounded chunks and every result is advanced to exhaustion, so statements after a
+    large rowset still run and an error from any statement in the batch is raised. Use
+    `read_all_result_sets` instead when the rows are needed.
+
+    The batch runs on a driver cursor of the given connection's own DB-API connection, inside its
+    current transaction (beginning one, as `exec_driver_sql` would, if none is active). The caller
+    keeps ownership of commit and rollback, of session state such as locks and `USE`, and, under
+    AUTOCOMMIT, of statements already applied before a failure. The batch is sent as is, without
+    parameters or SQLAlchemy execution events.
+
+    Supported on `mssql+pyodbc` and `mssql+pymssql`; other connections are rejected with
+    `ArgumentError` before anything runs. Driver failures while executing, fetching, or advancing
+    are raised as the matching SQLAlchemy `DBAPIError`, as described for `read_all_result_sets`,
+    with the batch as the statement. The cursor is closed in every case; a close failure is raised
+    after a complete batch and logged when another error is already being raised.
+    """
+    dialect = connection.dialect
+    drain = _SCRIPT_DRAINERS.get((dialect.name, dialect.driver))
+    if drain is None:
+        raise ArgumentError(
+            "Script batches require an mssql+pyodbc or mssql+pymssql connection, "
+            f"not {dialect.name}+{dialect.driver}."
+        )
+    if not connection.in_transaction():
+        connection.begin()
+    # The cursor comes from the connection before execution; SQLAlchemy closes a result's cursor early.
+    with _sqlalchemy_cursor_errors(connection, None, statement=batch):
+        cursor = connection.connection.cursor()
+    # No cursor is passed to the adapter, so the cursor is closed exactly once, below.
+    try:
+        with _sqlalchemy_cursor_errors(connection, None, statement=batch):
+            drain(cursor, batch)
+    except BaseException:
+        _close_after_failure(connection, cursor)
+        raise
+    with _sqlalchemy_cursor_errors(connection, None, statement=batch):
+        cursor.close()
+
+
+def _close_after_failure(connection: Connection, cursor: DBAPICursor) -> None:
+    # Invalidation already closed the DB-API connection and its cursors.
+    if connection.invalidated:
+        return
+    try:
+        cursor.close()
+    except Exception as close_error:
+        _logger.warning("db.script.cursor_close_failed", exc_info=close_error)
 
 
 def cursor_rows_to_dicts(cursor: _RowCursor) -> list[dict[str, Any]]:

@@ -1,3 +1,4 @@
+from collections.abc import Generator
 from contextlib import asynccontextmanager, contextmanager
 from functools import lru_cache
 import os
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import URL, Engine, make_url
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from grad_pylib.core import db as db_module
@@ -213,6 +215,12 @@ def test_provision_sql_server_database_from_file_only_runs_missing_database_batc
     fake_engine = _make_master_engine(recorded_sql, database_exists=database_exists)
     monkeypatch.setattr("grad_pylib.testing.fixtures.create_engine", lambda *_args, **_kwargs: fake_engine)
 
+    def record_script_batch(connection: _RecordingMasterConnection, batch: str) -> None:
+        assert connection is fake_engine.connection
+        recorded_sql.append(batch)
+
+    monkeypatch.setattr("grad_pylib.testing.fixtures.execute_script_batch", record_script_batch)
+
     provision_sql_server_database_from_file(
         "mssql+pyodbc://localhost/master?driver=ODBC+Driver+18+for+SQL+Server",
         database_name="Codebook",
@@ -224,6 +232,93 @@ def test_provision_sql_server_database_from_file_only_runs_missing_database_batc
     assert recorded_sql[1] == "SELECT DB_ID(N'Codebook')"
     assert recorded_sql[2:] == expected_batches
     assert fake_engine.disposed is True
+
+
+_LARGE_ROWSET = "SELECT TOP (100000) a.object_id FROM sys.all_objects AS a CROSS JOIN sys.all_objects AS b"
+
+
+@pytest.fixture(params=["pyodbc", "pymssql"])
+def provisioning_admin_url(request: pytest.FixtureRequest, mssql_admin_url: str) -> str:
+    if request.param == "pyodbc":
+        return mssql_admin_url
+    return make_url(mssql_admin_url).set(drivername="mssql+pymssql", query={}).render_as_string(hide_password=False)
+
+
+@pytest.fixture
+def provisioned_database(provisioning_admin_url: str, mssql_admin_url: str) -> Generator[str]:
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "master")
+    database_name = f"GradPyLib_provision_{worker_id}_{make_url(provisioning_admin_url).get_driver_name()}"
+    yield database_name
+    admin_engine = create_engine(mssql_admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin_engine.connect() as connection:
+            # pyodbc's driver-level pooling can hand back the provisioning connection with its `USE` context.
+            connection.exec_driver_sql("USE master")
+            connection.exec_driver_sql(
+                f"IF DB_ID(N'{database_name}') IS NOT NULL "
+                f"ALTER DATABASE [{database_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
+            )
+            connection.exec_driver_sql(f"DROP DATABASE IF EXISTS [{database_name}]")
+    finally:
+        admin_engine.dispose()
+
+
+def _seeded_ids(admin_url: str, database_name: str) -> list[int]:
+    engine = create_engine(admin_url)
+    try:
+        with engine.connect() as connection:
+            return list(connection.exec_driver_sql(
+                f"SELECT id FROM [{database_name}].dbo.seeded ORDER BY id"
+            ).scalars())
+    finally:
+        engine.dispose()
+
+
+def test_provision_sql_server_database_from_file_drains_every_batch(
+    provisioning_admin_url: str,
+    provisioned_database: str,
+    mssql_admin_url: str,
+    tmp_path: Path,
+) -> None:
+    sql_file = tmp_path / "seed.sql"
+    sql_file.write_text(
+        f"CREATE DATABASE [{provisioned_database}]\nGO\n"
+        f"USE [{provisioned_database}]; CREATE TABLE dbo.seeded (id int NOT NULL);\nGO\n"
+        f"INSERT INTO dbo.seeded VALUES (1); {_LARGE_ROWSET}; INSERT INTO dbo.seeded VALUES (2);\n",
+        encoding="utf-8",
+    )
+
+    for _ in range(2):
+        provision_sql_server_database_from_file(
+            provisioning_admin_url, database_name=provisioned_database, sql_file=sql_file, lock_name=provisioned_database,
+        )
+
+    # The second call found the database and ran nothing; `USE` carried across batches on one connection.
+    assert _seeded_ids(mssql_admin_url, provisioned_database) == [1, 2]
+
+
+def test_provision_sql_server_database_from_file_reports_failures_after_a_valid_result(
+    provisioning_admin_url: str,
+    provisioned_database: str,
+    mssql_admin_url: str,
+    tmp_path: Path,
+) -> None:
+    sql_file = tmp_path / "seed.sql"
+    sql_file.write_text(
+        f"CREATE DATABASE [{provisioned_database}]\nGO\n"
+        f"USE [{provisioned_database}]; CREATE TABLE dbo.seeded (id int NOT NULL); "
+        "SELECT 1 AS a; INSERT INTO dbo.seeded VALUES (1 / 0);\nGO\n"
+        "INSERT INTO dbo.seeded VALUES (2);\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DBAPIError):
+        provision_sql_server_database_from_file(
+            provisioning_admin_url, database_name=provisioned_database, sql_file=sql_file, lock_name=provisioned_database,
+        )
+
+    # AUTOCOMMIT keeps work applied before the failure; later batches never ran.
+    assert _seeded_ids(mssql_admin_url, provisioned_database) == []
 
 
 @pytest.mark.parametrize(
