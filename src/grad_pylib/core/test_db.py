@@ -9,7 +9,7 @@ import pytest
 from fastapi import Body, Depends, FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
-from sqlalchemy import Integer, String, create_engine, event, inspect as sa_inspect, select, text, tstring
+from sqlalchemy import Integer, String, create_engine, event, inspect as sa_inspect, select, text, tstring, update
 from sqlalchemy.engine import Engine, ExceptionContext, make_url
 from sqlalchemy.exc import ArgumentError, DBAPIError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -470,6 +470,64 @@ def test_orm_upsert_preserves_insert_only_fields_and_primary_key_on_update(sessi
     assert record.id == 1
     assert record.value == "second"
     assert record.created_by == "seed-user"
+
+
+@pytest.mark.parametrize("replace_value", [False, True], ids=["refresh-only", "replace-stale-value"])
+def test_orm_upsert_refreshes_existing_state_after_another_transaction(
+        session: Session, db_engine: Engine, replace_value: bool,
+) -> None:
+    original = ExampleUpsertModel(id=1, value="original", created_by="seed-user")
+    session.add(original)
+    session.commit()
+    assert not session.expire_on_commit
+
+    with db_engine.begin() as competitor:
+        competitor.execute(
+            update(ExampleUpsertModel)
+            .where(ExampleUpsertModel.id == 1)
+            .values(value="competitor", created_by="competitor-user")
+        )
+
+    payload: dict[str, Any] = {"id": 1}
+    if replace_value:
+        payload["value"] = "original"
+    with session.begin():
+        record = orm_upsert(
+            session, ExampleUpsertModel, payload, insert_only={"created_by": "insert-only-user"},
+        )
+        assert record is original
+        assert record.value == ("original" if replace_value else "competitor")
+        assert record.created_by == "competitor-user"
+
+    with db_engine.connect() as observer:
+        persisted = observer.execute(
+            select(ExampleUpsertModel.value, ExampleUpsertModel.created_by).where(ExampleUpsertModel.id == 1)
+        ).one()
+    assert tuple(persisted) == (record.value, record.created_by)
+
+
+def test_orm_upsert_preserves_pending_changes_and_leaves_rollback_to_the_caller(
+        session: Session, db_engine: Engine,
+) -> None:
+    record = orm_upsert(
+        session, ExampleUpsertModel, {"id": 1, "value": "original", "created_by": "seed-user"},
+    )
+    record.created_by = "pending-user"
+    record.value = "pending-value"
+
+    updated = orm_upsert(session, ExampleUpsertModel, {"id": 1, "value": "replacement"})
+
+    assert updated is record
+    assert updated.value == "replacement"
+    assert updated.created_by == "pending-user"
+    assert tuple(session.execute(
+        select(ExampleUpsertModel.value, ExampleUpsertModel.created_by).where(ExampleUpsertModel.id == 1)
+    ).one()) == ("replacement", "pending-user")
+    with db_engine.connect() as observer:
+        assert observer.execute(select(ExampleUpsertModel.id)).all() == []
+    session.rollback()
+    with db_engine.connect() as observer:
+        assert observer.execute(select(ExampleUpsertModel.id)).all() == []
 
 
 def test_orm_upsert_accepts_pydantic_model_input(session: Session) -> None:

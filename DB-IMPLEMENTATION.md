@@ -257,6 +257,10 @@ history semantics, the setup lock, and the existence check are unchanged.
   before creating engines ([SQLAlchemy recommendation](https://docs.sqlalchemy.org/en/21/dialects/mssql.html#pyodbc-pooling-connection-close-behavior)).
   pyodbc reads the setting only at its first connection. Provisioning takes and releases its setup
   lock through `master.sys`, so script `USE` statements cannot move the release to another database.
+- **Provisioning error cleanup:** the administrative engine installs terminated-session detection,
+  so a fatal pyodbc `HY000` error invalidates the connection and skips lock release. If lock release
+  fails while another error is propagating, the primary error is preserved and cleanup is logged as
+  `db.provision.lock_release_failed`; a lock-release-only failure still raises.
 - Tests: doubles in `core/test_multiquery.py` pin bounded fetching, traversal, error adaptation,
   and close counts. Tests there and in `tools/test_migrate.py` and `testing/test_fixtures.py` run
   real batches on pyodbc and pymssql, covering transaction ownership, failures after a valid result

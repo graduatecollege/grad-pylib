@@ -1,25 +1,13 @@
 # Database access patterns
 
-This is the database-access standard for Graduate College Python services. It is written as
-an implementation guide and a source for an AI agent skill, not a catalogue of every existing
-implementation. Priorities, in order: **correctness, ease of understanding, performance,
+Use this guide to choose and apply database-access patterns in Graduate College Python
+services. Priorities, in order: **correctness, ease of understanding, performance,
 maintainability**.
 
 The patterns cover synchronous SQLAlchemy access to SQL Server through `mssql+pyodbc`, using
 Python 3.14/3.15. FastAPI endpoints and dependencies are synchronous. SQLAlchemy ORM/Core is
 the first choice for routine work; SQLAlchemy `tstring(t"...")` is the preferred way to write
 new application SQL batches and SQL fragments.
-
-## Status and scope
-
-This guide describes the **target standard**. Most primitives already exist, but the
-batch/result examples using `mssql_skip_rowcounts` depend on **unimplemented library support**.
-It is a proposed grad-pylib extension, not a built-in SQLAlchemy option; adding an unknown
-execution option alone does not change SQLAlchemy's behavior.
-
-Library requirements, compatibility details, and the implementation plan are maintained
-separately in [DB-IMPLEMENTATION.md](DB-IMPLEMENTATION.md). This document describes how
-application code should use the patterns, not how to implement the library support.
 
 This guide standardizes mechanics without making every endpoint behave identically. Existing
 HTTP contracts, authorization rules, and domain-specific normalization must not change as a
@@ -144,6 +132,46 @@ recommends: pyodbc's driver-level pool otherwise keeps sessions alive after the 
 them and reuses them without a reset. The setting is process-wide and is read only at the first
 pyodbc connection, so code that connects through pyodbc before any runtime engine exists, such
 as a startup check, must call `disable_pyodbc_pooling()` first.
+
+### Custom engines
+
+Prefer `DatabaseRuntime`, including through `NamedDatabases`. Its engines and the shared
+application/Codebook/E2E fixture engines install batch navigation, terminated-session
+detection, and error-only reset. Do not install those hooks again on managed engines.
+
+If an application must construct its own engine, install the same hooks once at setup,
+before using it. Here `database_url` is a configured **`mssql+pyodbc` SQLAlchemy URL**:
+
+```python
+from sqlalchemy import create_engine
+from grad_pylib.core.db import (
+    DEFAULT_POOL_RECYCLE_SECONDS,
+    disable_pyodbc_pooling,
+    install_connection_reset,
+    install_mssql_batch_support,
+    install_terminated_session_detection,
+)
+
+disable_pyodbc_pooling()
+engine = create_engine(
+    database_url,
+    pool_pre_ping=True,
+    pool_recycle=DEFAULT_POOL_RECYCLE_SECONDS,
+)
+install_terminated_session_detection(engine)
+install_connection_reset(engine)
+install_mssql_batch_support(engine)
+```
+
+The pooling call must precede the first pyodbc connection anywhere in the process, not merely
+this engine's first checkout. `install_mssql_batch_support()` is idempotent, but it installs
+only option validation/navigation, not the other connection hooks. Without it, SQLAlchemy
+silently ignores the unknown execution option. It can also be installed on other engines to
+reject unsupported opt-in use while leaving ordinary execution unchanged.
+
+The full recipe above is for `mssql+pyodbc`; the reset hook uses pyodbc-specific connection
+methods. Tools using `pymssql` should use the script executor described under
+[Migrations and generated models](#migrations-and-generated-models), not this application setup.
 
 ### Multiple databases
 
@@ -343,8 +371,6 @@ Do not accidentally turn an atomic operation into independently committed chunks
 
 ## Batch execution and result sets
 
-**Target contract; availability is tracked in [DB-IMPLEMENTATION.md](DB-IMPLEMENTATION.md).**
-
 SQL Server can produce non-row results between actual rowsets. With the option enabled,
 the first exposed result is the first actual rowset, including an empty SELECT, rather than
 a leading row-count result.
@@ -359,7 +385,11 @@ result = session.execute(
 This option changes result navigation only. It does not change isolation, commit, retry,
 change session settings, or promise a consistent snapshot. Do not enable it globally for
 ordinary ORM writes or `executemany()`: those paths have their own row-count/RETURNING behavior.
-Support it for deliberate textual SQL Server batches through the app's configured engine.
+Use it for deliberate textual batches through a configured `mssql+pyodbc` engine.
+`text()`, `tstring()`, textual statements with `.columns()`, and `exec_driver_sql()` are
+supported. Invalid non-boolean values, non-textual ORM/Core statements, multiple parameter
+sets, and unsupported dialects/drivers are rejected with `ArgumentError` before the statement
+is sent. An absent or `False` option leaves ordinary execution unchanged.
 
 ### One final rowset
 
@@ -438,8 +468,11 @@ or `.mappings()` to consume rows before handing the result to it. Consume **all*
 before committing a write or treating a batch as successful: later errors may only arrive
 from `nextset()`.
 
-Without the option, non-row results continue to appear as empty lists for compatibility. Ordinary
-single-rowset mapping helpers, nested DTO mapping, and SQL column helpers need no new modes.
+The reader requires an unconsumed `CursorResult` with an active cursor: ORM entity results
+raise `TypeError`, and results without an active cursor raise `ValueError`. It returns
+`list[list[dict]]`; the effective execution option controls omission, not a separate reader
+argument. Without the option, non-row results appear as empty lists. Ordinary single-rowset
+mapping helpers, nested DTO mapping, and SQL column helpers do not require this option.
 
 ### Batches with no rowsets
 
@@ -455,11 +488,18 @@ Capture `@@ROWCOUNT` immediately after the DML it describes, not after interveni
 
 ### Error and connection contract
 
-Under the target contract, database failures during execution or result consumption surface
-as SQLAlchemy `DBAPIError` instances with the original driver diagnostics preserved.
-Disconnected connections are invalidated so the existing explicit retry/error policies can
-handle them. Application services must not wrap raw driver errors or reach into SQLAlchemy
-private methods themselves; library integration is covered in [DB-IMPLEMENTATION.md](DB-IMPLEMENTATION.md).
+Database failures during execution or `read_all_result_sets()` consumption surface as the
+matching SQLAlchemy `DBAPIError` subclass, with the original driver exception in `.orig`
+and the exception chain. Catch SQLAlchemy exceptions around the reader, whether or not the
+execution uses `mssql_skip_rowcounts`.
+SQLAlchemy's `handle_error` listeners run, and disconnected connections are invalidated so
+the existing explicit retry/error policies can handle them. Application services must not
+wrap raw driver errors or reach into SQLAlchemy private methods themselves.
+
+Programming, mapping, and validation errors retain their identity. Standalone
+`cursor_rows_to_dicts()` has no SQLAlchemy connection context and remains a low-level helper
+that can raise raw driver errors. The reader delegates closure to `CursorResult.close()`:
+cursor-close failures are logged by SQLAlchemy, not raised over completed data or a primary error.
 
 Do not suppress a later error because earlier rowsets were valid, or return partially collected
 data as success. The reader closes its result on failure; let the transaction owner roll back.
@@ -467,9 +507,11 @@ data as success. The reader closes its result on failure; let the transaction ow
 Handling row-count results removes the need to mutate `NOCOUNT` for these patterns. It does
 not solve arbitrary session-state changes. Pool rollback is not a complete reset of SET
 options or committed temp tables. Prefer batch-scoped table variables; isolate exceptional
-session-state changes and restore them explicitly. A pool reset is a fallback on return,
-not cleanup before the next statement on the same checked-out connection. It can also clear
-intentional connection initialization, which then needs restoration.
+session-state changes and restore them explicitly. The installed error-only reset calls
+`sp_reset_connection` when a marked live connection returns to the pool; clean returns retain
+the ordinary rollback-on-return behavior. This is a fallback, not cleanup before the next
+statement on the same checked-out connection. It can also clear intentional connection
+initialization, which then needs restoration.
 
 ## Transactions and retries
 
@@ -676,11 +718,15 @@ logic, but make the extra locked round trips deliberate and bounded.
 
 `orm_upsert()` is the standard ORM primary-key upsert when that pattern is appropriate:
 supply the complete mapped primary key, mutable fields, and optional `insert_only` fields.
-It takes SQL Server update/range locks, reads the row, then flushes, leaving commit to the
-caller. That readable multi-call pattern is a tradeoff, not a reason to use it for every
-UPDATE or to call it repeatedly over a large collection. Prefer direct conditional DML when
-no ORM read is needed. It is not an arbitrary unique-key merge, not an optimistic edit, and
-not an idempotency policy; do not default to a generic MERGE string either.
+It flushes pending session changes, takes SQL Server update/range locks, refreshes the row
+even if it is already loaded, then flushes the upsert, leaving commit to the caller. The
+initial flush preserves pending edits before the refresh replaces stale identity-map state.
+Finish and validate those edits before calling the helper: their constraints and triggers
+can run at that initial flush, even with `autoflush=False`. That readable multi-call pattern
+is a tradeoff, not a reason to use it for every UPDATE or repeatedly over a large collection.
+Prefer direct conditional DML when no ORM read is needed. It is not an arbitrary unique-key
+merge, not an optimistic edit, and not an idempotency policy; do not default to a generic
+MERGE string either.
 
 When a narrow locking read really is required, SQLAlchemy `with_for_update()` does not
 provide the needed SQL Server locking clause. Use an explicit SQL Server hint:
@@ -762,8 +808,8 @@ committed rows just to appear to meet the locking target.
 If partial success is needed, explicitly define which records can fail independently, the
 per-record outcome shape, and replay behavior. One transaction may commit its accepted
 subset, but infrastructure/constraint failures must not silently become "updated zero,
-no conflicts." Do not introduce commits in a loop or infer partial-success policy from the
-current hooding bulk implementation.
+no conflicts." Do not introduce commits in a loop or infer partial-success policy from
+another endpoint.
 
 For monotonic watermarks, compute the new value under the write's concurrency protection
 using max-wins semantics where the domain requires them. A read-then-assign in Python can
@@ -890,12 +936,14 @@ Do not teach an agent to modify an already-applied filename just because a view 
 Regenerate models using the project's `make generate-models` or `make rebuild-models`
 workflow and retain model-parity coverage. Keep model-generation configuration responsible
 for reflection quirks; keep feature behavior in services rather than generated classes.
-Administrative `CREATE/ALTER DATABASE` and autocommit operations are separate tooling paths,
-not ordinary retryable request transactions.
 
-Schema scripts and provisioning code must also surface errors from every batch result.
-Do not apply the request hook blindly to tools that use other drivers or autocommit; give
-their executor an explicit full-result-draining contract.
+`run_migrations()` uses `execute_script_batch(connection, batch)` to surface errors from every
+batch result, and records migration history only after all batches in a file complete.
+For custom migration loops, pass one already GO-split batch at a time. The helper supports
+`mssql+pyodbc` and `mssql+pymssql`, drains/discards rowsets in bounded chunks, and stays on the
+supplied physical connection and transaction. It begins a transaction if needed but never
+commits or rolls back; SQL is sent as-is without parameters or SQLAlchemy execution events.
+It is separate from the application navigation option.
 
 ### Required coverage for a chosen pattern
 
@@ -903,8 +951,8 @@ Use real SQL Server integration tests for SQL Server semantics, with the shared 
 migrations, Codebook fixture, and session dependency overrides. Keep fixture runtime settings
 and engine hooks aligned with production. Do not use SQLite as a substitute. Pure mapping
 and query-composition tests may remain database-free; unit doubles are not proof of lock,
-OUTPUT, JSON, or ODBC behavior. The removal of existing SQLite tests is tracked in
-[DB-IMPLEMENTATION.md](DB-IMPLEMENTATION.md).
+OUTPUT, JSON, or ODBC behavior. Cover these behaviors in each service using disposable SQL
+Server databases.
 
 | Pattern | Behaviors to cover |
 |---|---|
@@ -937,7 +985,7 @@ Run the smallest relevant commands with `uv run pytest ...`; use the projects' e
 tooling for models/migrations. Never run migrations or backfills against an arbitrary
 configured database merely to validate a code change.
 
-## Implementation checklist for an agent
+## Usage checklist
 
 - Identify the pattern and confirm unresolved domain choices before coding.
 - Use configured dependencies and explicit transaction ownership; keep helpers composable.
@@ -954,9 +1002,9 @@ configured database merely to validate a code change.
 
 ## Pattern inventory
 
-The Python services in these repositories were examined to identify the needed patterns.
-These paths are examples of use cases, **not instructions to copy their current mechanics**.
-The legacy .NET code in grad-codebook is not the target application architecture.
+Use these service areas as examples of where to apply the patterns above, **not as templates
+for database mechanics**. For grad-codebook, use Python service patterns rather than legacy
+.NET database code.
 
 | Repository and representative paths | Pattern represented |
 |---|---|

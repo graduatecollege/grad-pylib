@@ -11,11 +11,13 @@ from fastapi.testclient import TestClient
 import pyodbc
 import pytest
 from sqlalchemy import create_engine, event, text
-from sqlalchemy.engine import URL, Engine, make_url
+from sqlalchemy.engine import URL, Connection, Engine, make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
+from structlog.testing import capture_logs
 
 from grad_pylib.core import db as db_module
+from grad_pylib.testing import fixtures as fixtures_module
 from grad_pylib.testing.fixtures import (
     CODEBOOK_DATABASE_NAME,
     E2eServerConfig,
@@ -216,6 +218,7 @@ def test_provision_sql_server_database_from_file_only_runs_missing_database_batc
     recorded_sql: list[str] = []
     fake_engine = _make_master_engine(recorded_sql, database_exists=database_exists)
     monkeypatch.setattr("grad_pylib.testing.fixtures.create_engine", lambda *_args, **_kwargs: fake_engine)
+    monkeypatch.setattr(fixtures_module, "install_terminated_session_detection", lambda _engine: None)
     monkeypatch.setattr(pyodbc, "pooling", True)
 
     def record_script_batch(connection: _RecordingMasterConnection, batch: str) -> None:
@@ -253,6 +256,7 @@ def test_provision_sql_server_database_from_file_releases_the_lock_unless_the_se
     recorded_sql: list[str] = []
     fake_engine = _make_master_engine(recorded_sql, database_exists=False)
     monkeypatch.setattr("grad_pylib.testing.fixtures.create_engine", lambda *_args, **_kwargs: fake_engine)
+    monkeypatch.setattr(fixtures_module, "install_terminated_session_detection", lambda _engine: None)
     batch_error = RuntimeError("batch failed")
 
     def fail_script_batch(connection: _RecordingMasterConnection, _batch: str) -> None:
@@ -272,6 +276,90 @@ def test_provision_sql_server_database_from_file_releases_the_lock_unless_the_se
     assert raised.value is batch_error
     assert (recorded_sql[-1] == _RELEASE_CODEBOOK_LOCK) is not invalidated
     assert fake_engine.disposed is True
+
+
+@pytest.mark.parametrize(
+    "primary_error",
+    [None, ValueError("batch failed"), DBAPIError("batch", None, pyodbc.Error("HY000", "batch failed")),
+     KeyboardInterrupt()],
+    ids=["cleanup-only", "non-driver-error", "driver-error", "interrupted"],
+)
+def test_provision_sql_server_database_from_file_handles_lock_release_failures(
+    primary_error: BaseException | None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    sql_file = tmp_path / "seed.sql"
+    sql_file.write_text("SELECT 1", encoding="utf-8")
+    recorded_sql: list[str] = []
+    fake_engine = _make_master_engine(recorded_sql, database_exists=False)
+    monkeypatch.setattr(fixtures_module, "create_engine", lambda *_args, **_kwargs: fake_engine)
+    monkeypatch.setattr(fixtures_module, "install_terminated_session_detection", lambda _engine: None)
+    release_error = DBAPIError(_RELEASE_CODEBOOK_LOCK, None, pyodbc.Error("HY000", "release failed"))
+    execute = fake_engine.connection.exec_driver_sql
+
+    def fail_release(sql: str) -> _ScalarResult:
+        result = execute(sql)
+        if sql == _RELEASE_CODEBOOK_LOCK:
+            raise release_error
+        return result
+
+    def execute_batch(_connection: _RecordingMasterConnection, _batch: str) -> None:
+        if primary_error is not None:
+            raise primary_error
+
+    monkeypatch.setattr(fake_engine.connection, "exec_driver_sql", fail_release)
+    monkeypatch.setattr(fixtures_module, "execute_script_batch", execute_batch)
+    expected = release_error if primary_error is None else primary_error
+
+    with capture_logs() as logs, pytest.raises(type(expected)) as raised:
+        provision_sql_server_database_from_file(
+            "mssql+pyodbc://localhost/master?driver=ODBC+Driver+18+for+SQL+Server",
+            database_name="Codebook",
+            sql_file=sql_file,
+            lock_name="codebook-lock",
+        )
+
+    assert raised.value is expected
+    assert recorded_sql[-1] == _RELEASE_CODEBOOK_LOCK
+    assert fake_engine.disposed
+    assert logs == ([] if primary_error is None else [{
+        "event": "db.provision.lock_release_failed",
+        "exc_info": release_error,
+        "log_level": "warning",
+    }])
+
+
+@pytest.mark.parametrize("prefix", ["", "SELECT 1 AS a; "], ids=["execute", "after-rowset"])
+def test_provision_sql_server_database_from_file_preserves_terminated_session_errors(
+    mssql_admin_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefix: str,
+) -> None:
+    batch = f"{prefix}RAISERROR('provisioning-fatal', 20, 1) WITH LOG;"
+    sql_file = tmp_path / "fatal.sql"
+    sql_file.write_text(batch, encoding="utf-8")
+    errors: list[DBAPIError] = []
+    execute = fixtures_module.execute_script_batch
+
+    def capture_batch_error(connection: Connection, statement: str) -> None:
+        try:
+            execute(connection, statement)
+        except DBAPIError as error:
+            errors.append(error)
+            raise
+
+    monkeypatch.setattr(fixtures_module, "execute_script_batch", capture_batch_error)
+    with pytest.raises(DBAPIError) as raised:
+        provision_sql_server_database_from_file(
+            mssql_admin_url,
+            database_name="GradPyLib_terminated_provisioning",
+            sql_file=sql_file,
+            lock_name="GradPyLib_terminated_provisioning",
+        )
+
+    assert errors == [raised.value]
+    assert isinstance(raised.value.orig, pyodbc.Error)
+    assert raised.value.orig.args[0] == "HY000"
+    assert raised.value.__cause__ is raised.value.orig
+    assert raised.value.statement == batch
+    assert raised.value.connection_invalidated
 
 
 _LARGE_ROWSET = "SELECT TOP (100000) a.object_id FROM sys.all_objects AS a CROSS JOIN sys.all_objects AS b"

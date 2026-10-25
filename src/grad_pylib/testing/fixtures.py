@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, field
 from fastapi import FastAPI
+import structlog
 import uvicorn
 from uvicorn.server import HANDLED_SIGNALS, Server
 from sqlalchemy import create_engine, text, Engine
@@ -25,6 +26,8 @@ from grad_pylib.core.db import (
 )
 from grad_pylib.core.multiquery import execute_script_batch
 from grad_pylib.sqlserver_container import DEFAULT_SQL_SERVER_IMAGE, build_sql_server_container_kwargs
+
+_logger = structlog.get_logger(__name__)
 
 CODEBOOK_DATABASE_NAME = "Codebook"
 DbSessionHook = Callable[[], None]
@@ -382,6 +385,12 @@ def provision_sql_server_database_from_file(
         sql_file: Path,
         lock_name: str,
 ) -> None:
+    """Provision a missing database under a session-owned setup lock using AUTOCOMMIT.
+
+    Earlier administrative work survives a script failure. Lost sessions are invalidated and
+    need no lock release. Other failures retain their identity if releasing the lock also fails;
+    the cleanup failure is logged, or raised when it is the only failure.
+    """
     script = sql_file.read_text(encoding="utf-8")
     escaped_database_name = database_name.replace("'", "''")
     escaped_lock_name = lock_name.replace("'", "''")
@@ -394,6 +403,7 @@ def provision_sql_server_database_from_file(
         isolation_level="AUTOCOMMIT",
     )
     try:
+        install_terminated_session_detection(master_engine)
         with master_engine.connect() as conn:
             # Qualified with `master` so script `USE` statements cannot move the lock or its release.
             lock_result = conn.exec_driver_sql(
@@ -410,18 +420,27 @@ def provision_sql_server_database_from_file(
             if lock_result is None or int(lock_result) < 0:
                 raise RuntimeError(f"Failed to acquire setup lock for database '{database_name}'.")
 
+            failed = False
             try:
                 exists = conn.exec_driver_sql(f"SELECT DB_ID(N'{escaped_database_name}')").scalar()
                 if exists is None:
                     # AUTOCOMMIT: a failing batch is reported, but work already applied is not rolled back.
                     for batch in split_go_batches(script):
                         execute_script_batch(conn, batch)
+            except BaseException:
+                failed = True
+                raise
             finally:
                 # A disconnect already ended the session and its lock.
                 if not conn.invalidated:
-                    conn.exec_driver_sql(
-                        f"EXEC master.sys.sp_releaseapplock @Resource = '{escaped_lock_name}', @LockOwner = 'Session'"
-                    )
+                    try:
+                        conn.exec_driver_sql(
+                            f"EXEC master.sys.sp_releaseapplock @Resource = '{escaped_lock_name}', @LockOwner = 'Session'"
+                        )
+                    except Exception as release_error:
+                        if not failed:
+                            raise
+                        _logger.warning("db.provision.lock_release_failed", exc_info=release_error)
     finally:
         master_engine.dispose()
 

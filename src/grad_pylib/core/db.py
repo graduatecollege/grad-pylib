@@ -910,7 +910,9 @@ def orm_upsert[ModelT: DeclarativeBase](
 
     The lookup uses update and hold locks to serialize competing upserts. Payloads may be dicts,
     Pydantic models, or generated ORM objects; `insert_only` values are applied exclusively to
-    new rows and never overwrite an existing record. This flushes but does not commit.
+    new rows and never overwrite an existing record. Pending session changes are flushed before
+    the locked lookup refreshes any already-loaded row; the upsert is then flushed as well.
+    This never commits.
     Payload keys must use mapped ORM attribute names, not physical database column names.
     """
     mapper = inspect(model_cls)
@@ -941,10 +943,12 @@ def orm_upsert[ModelT: DeclarativeBase](
     if len(filter_criteria) != len(pk_names):
         raise ValueError(f"Provided data missing primary key values for {model_cls.__name__}")
 
-    # Roundtrip 1: Query with hints to secure the lock and bypass snapshots
+    # Preserve pending edits before refreshing identity-map state from the locked row.
+    db.flush()
     record = (
         db.query(model_cls)
         .with_hint(model_cls, "WITH (UPDLOCK, HOLDLOCK)")
+        .populate_existing()
         .filter_by(**filter_criteria)
         .first()
     )
