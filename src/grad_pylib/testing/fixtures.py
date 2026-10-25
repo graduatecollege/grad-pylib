@@ -18,6 +18,7 @@ from _pytest.config import Config
 from xdist.workermanage import WorkerController
 
 from grad_pylib.core.db import (
+    disable_pyodbc_pooling,
     install_connection_reset,
     install_mssql_batch_support,
     install_terminated_session_detection,
@@ -158,6 +159,7 @@ class SqlServerTestBootstrap:
 
 def _create_app_engine(url: Any) -> Engine:
     """Create an application engine with the error handling and batch support of `DatabaseRuntime` engines."""
+    disable_pyodbc_pooling()
     engine = create_engine(url, future=True, pool_pre_ping=True)
     install_terminated_session_detection(engine)
     install_connection_reset(engine)
@@ -354,6 +356,7 @@ def create_db_session_fixture(
 
 def create_database(admin_url: str, db_name: str) -> str:
     """Helper to provision a dedicated child database on the shared instance with RCSI enabled."""
+    disable_pyodbc_pooling()
     master_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
     with master_engine.connect() as conn:
         # Drop if it exists from a dead previous session run, then recreate clean
@@ -383,6 +386,7 @@ def provision_sql_server_database_from_file(
     escaped_database_name = database_name.replace("'", "''")
     escaped_lock_name = lock_name.replace("'", "''")
 
+    disable_pyodbc_pooling()
     master_engine = create_engine(
         admin_url,
         future=True,
@@ -391,10 +395,11 @@ def provision_sql_server_database_from_file(
     )
     try:
         with master_engine.connect() as conn:
+            # Qualified with `master` so script `USE` statements cannot move the lock or its release.
             lock_result = conn.exec_driver_sql(
                 f"""
                 DECLARE @result int;
-                EXEC @result = sp_getapplock
+                EXEC @result = master.sys.sp_getapplock
                     @Resource = '{escaped_lock_name}',
                     @LockMode = 'Exclusive',
                     @LockOwner = 'Session',
@@ -405,11 +410,18 @@ def provision_sql_server_database_from_file(
             if lock_result is None or int(lock_result) < 0:
                 raise RuntimeError(f"Failed to acquire setup lock for database '{database_name}'.")
 
-            exists = conn.exec_driver_sql(f"SELECT DB_ID(N'{escaped_database_name}')").scalar()
-            if exists is None:
-                # AUTOCOMMIT: a failing batch is reported, but work already applied is not rolled back.
-                for batch in split_go_batches(script):
-                    execute_script_batch(conn, batch)
+            try:
+                exists = conn.exec_driver_sql(f"SELECT DB_ID(N'{escaped_database_name}')").scalar()
+                if exists is None:
+                    # AUTOCOMMIT: a failing batch is reported, but work already applied is not rolled back.
+                    for batch in split_go_batches(script):
+                        execute_script_batch(conn, batch)
+            finally:
+                # A disconnect already ended the session and its lock.
+                if not conn.invalidated:
+                    conn.exec_driver_sql(
+                        f"EXEC master.sys.sp_releaseapplock @Resource = '{escaped_lock_name}', @LockOwner = 'Session'"
+                    )
     finally:
         master_engine.dispose()
 

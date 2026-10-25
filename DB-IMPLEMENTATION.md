@@ -250,27 +250,25 @@ history semantics, the setup lock, and the existence check are unchanged.
 - **Setup review:** model rebuild changes nothing directly; its migrations now drain through pymssql.
   `create_database` helpers and the conftest drop run single statements without rowsets, whose errors
   are raised on execution, and the lock and existence reads stay explicit scalar queries.
-- **Environment finding (not changed):** with unixODBC, pyodbc's default driver-level pooling keeps the
-  physical connection after `Engine.dispose()` and hands it back to the next engine with the same
-  connection string, without resetting its database context or releasing session-owned app locks.
-  Provisioning never releases its session lock explicitly, so the lock lasts until that physical
-  connection closes; a different connection string (such as pymssql) waits for the lock timeout.
+- **Environment finding (fixed after step 5):** with unixODBC, pyodbc's default driver-level pooling
+  kept the physical connection after `Engine.dispose()` or invalidation and handed it to the next
+  connect with the same connection string, without resetting its database context, SET options, or
+  session-owned app locks. `DatabaseRuntime` and the test fixtures now call `disable_pyodbc_pooling()`
+  before creating engines ([SQLAlchemy recommendation](https://docs.sqlalchemy.org/en/21/dialects/mssql.html#pyodbc-pooling-connection-close-behavior)).
+  pyodbc reads the setting only at its first connection. Provisioning takes and releases its setup
+  lock through `master.sys`, so script `USE` statements cannot move the release to another database.
 - Tests: doubles in `core/test_multiquery.py` pin bounded fetching, traversal, error adaptation,
   and close counts. Tests there and in `tools/test_migrate.py` and `testing/test_fixtures.py` run
   real batches on pyodbc and pymssql, covering transaction ownership, failures after a valid result
   (no history row), large discarded rowsets followed by required writes, and AUTOCOMMIT provisioning.
   `core/test_db_integration.py` covers disconnects.
 
-### 6. Verify and publish
+### 6. Verify
 
 Use the acceptance matrix below, then update docstrings, this document's status, and DB.md's
 availability notice only when the contracts are implemented. Document installation for
 custom engines and the intentional change from raw driver exceptions to SQLAlchemy errors.
 Add the relevant compatibility note to MIGRATE.md without changing its existing retry advice.
-
-Application adoption is a later, separate change: upgrade grad-pylib first, then opt in
-specific batches and remove only scaffolding made unnecessary by complete result handling.
-Do not mass-enable the option or rewrite the adjacent server projects as part of this work.
 
 ## Acceptance and validation
 

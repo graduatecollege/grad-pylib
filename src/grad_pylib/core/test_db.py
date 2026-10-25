@@ -190,6 +190,25 @@ def test_database_runtime_reuses_engine_and_session_factory(runtime_spy: Runtime
     ]
 
 
+def test_database_runtime_disables_pyodbc_pooling_before_creating_the_engine(
+        runtime_spy: RuntimeSpy,
+        monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pyodbc, "pooling", True)
+    pooling_at_create: list[bool] = []
+    spy_create_engine = db_module.create_engine
+
+    def record_pooling(url: str, **kwargs: object) -> object:
+        pooling_at_create.append(pyodbc.pooling)
+        return spy_create_engine(url, **kwargs)
+
+    monkeypatch.setattr(db_module, "create_engine", record_pooling)
+
+    DatabaseRuntime(lambda: "mssql+pyodbc://example").get_engine()
+
+    assert pooling_at_create == [False]
+
+
 def test_database_runtime_session_closes_session(runtime_spy: RuntimeSpy) -> None:
     runtime = DatabaseRuntime(lambda: "mssql+pyodbc://example")
     generator = runtime.session()

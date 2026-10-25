@@ -1051,3 +1051,23 @@ def test_retry_on_disconnect_reruns_the_whole_reader_operation(
 
     assert len(attempts) == 2
     assert listened_engine.log_events == ["db.disconnect", "db.retry", "db.retry.succeeded"]
+
+
+def test_connections_replaced_after_invalidation_or_dispose_start_fresh_sessions(
+        mssql_databases: ManagedE2eDatabases,
+) -> None:
+    """pyodbc driver pooling would hand the discarded session back with its SET options intact."""
+    assert pyodbc.pooling is False
+    engine = create_engine(mssql_databases.app_engine.url, pool_size=1, max_overflow=0)
+    try:
+        with engine.connect() as connection:
+            connection.exec_driver_sql("SET LOCK_TIMEOUT 1234")
+            connection.invalidate()
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("SELECT @@LOCK_TIMEOUT").scalar() == -1
+            connection.exec_driver_sql("SET LOCK_TIMEOUT 1234")
+        engine.dispose()
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("SELECT @@LOCK_TIMEOUT").scalar() == -1
+    finally:
+        engine.dispose()

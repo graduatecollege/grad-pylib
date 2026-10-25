@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from inspect import iscoroutinefunction
 
+import pyodbc
 import structlog
 from fastapi import Depends
 from grad_pylib.core.config import BaseAppSettings, get_settings
@@ -52,6 +53,21 @@ def resolve_database_url(settings: BaseAppSettings | None = None) -> str:
 # pre-ping on such a connection blocks until the OS TCP timeout and can surface as ODBC 08S01
 # (TCP error 10060), so connections are replaced before checkout once they reach this age.
 DEFAULT_POOL_RECYCLE_SECONDS = 300
+
+
+def disable_pyodbc_pooling() -> None:
+    """Turn off pyodbc's ODBC driver-manager pooling so only SQLAlchemy's pool reuses connections.
+
+    With driver pooling on, physical connections outlive `Engine.dispose()` and invalidation and
+    are handed to the next connect without a session reset, defeating `pool_recycle`, the discarding
+    of failed connections, and the release of session state such as app locks. SQLAlchemy
+    recommends disabling it. The setting is process-wide and pyodbc reads it only when the first
+    connection is made, so a call after any pyodbc connection has no effect. `DatabaseRuntime` and
+    the grad-pylib test fixtures call this before creating engines; an application that opens a
+    pyodbc connection first must call it at startup.
+    """
+    pyodbc.pooling = False
+
 
 # pyodbc ends each driver message with the failing ODBC function; SQLEndTran is the commit call.
 _COMMIT_DRIVER_FUNCTION = "(SQLEndTran"
@@ -327,6 +343,7 @@ class DatabaseRuntime:
     to expose as an application-level singleton; sessions remain request or task scoped.
     `pool_recycle` replaces pooled connections older than the given number of seconds without
     contacting the server, so long-idle connections are never pinged or reused; pass -1 to disable.
+    Creating the engine calls `disable_pyodbc_pooling()` so SQLAlchemy's pool alone reuses connections.
     """
     def __init__(
             self,
@@ -352,6 +369,7 @@ class DatabaseRuntime:
         if self._engine is None:
             with self._engine_lock:
                 if self._engine is None:
+                    disable_pyodbc_pooling()
                     engine = create_engine(
                         self._database_url_resolver(),
                         pool_pre_ping=self._pool_pre_ping,

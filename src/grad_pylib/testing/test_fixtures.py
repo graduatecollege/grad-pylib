@@ -8,6 +8,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
+import pyodbc
 import pytest
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import URL, Engine, make_url
@@ -70,6 +71,7 @@ class _RecordingMasterConnection:
     def __init__(self, recorded_sql: list[str], *, database_exists: bool) -> None:
         self.recorded_sql = recorded_sql
         self.database_exists = database_exists
+        self.invalidated = False
 
     def __enter__(self) -> _RecordingMasterConnection:
         return self
@@ -214,6 +216,7 @@ def test_provision_sql_server_database_from_file_only_runs_missing_database_batc
     recorded_sql: list[str] = []
     fake_engine = _make_master_engine(recorded_sql, database_exists=database_exists)
     monkeypatch.setattr("grad_pylib.testing.fixtures.create_engine", lambda *_args, **_kwargs: fake_engine)
+    monkeypatch.setattr(pyodbc, "pooling", True)
 
     def record_script_batch(connection: _RecordingMasterConnection, batch: str) -> None:
         assert connection is fake_engine.connection
@@ -228,9 +231,46 @@ def test_provision_sql_server_database_from_file_only_runs_missing_database_batc
         lock_name="codebook-lock",
     )
 
-    assert "sp_getapplock" in recorded_sql[0]
+    assert "master.sys.sp_getapplock" in recorded_sql[0]
     assert recorded_sql[1] == "SELECT DB_ID(N'Codebook')"
-    assert recorded_sql[2:] == expected_batches
+    assert recorded_sql[2:-1] == expected_batches
+    assert recorded_sql[-1] == _RELEASE_CODEBOOK_LOCK
+    assert fake_engine.disposed is True
+    assert pyodbc.pooling is False
+
+
+_RELEASE_CODEBOOK_LOCK = "EXEC master.sys.sp_releaseapplock @Resource = 'codebook-lock', @LockOwner = 'Session'"
+
+
+@pytest.mark.parametrize("invalidated", [False, True], ids=["batch-error", "disconnect"])
+def test_provision_sql_server_database_from_file_releases_the_lock_unless_the_session_is_gone(
+    invalidated: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sql_file = tmp_path / "seed.sql"
+    sql_file.write_text("CREATE DATABASE [Codebook]\n", encoding="utf-8")
+    recorded_sql: list[str] = []
+    fake_engine = _make_master_engine(recorded_sql, database_exists=False)
+    monkeypatch.setattr("grad_pylib.testing.fixtures.create_engine", lambda *_args, **_kwargs: fake_engine)
+    batch_error = RuntimeError("batch failed")
+
+    def fail_script_batch(connection: _RecordingMasterConnection, _batch: str) -> None:
+        connection.invalidated = invalidated
+        raise batch_error
+
+    monkeypatch.setattr("grad_pylib.testing.fixtures.execute_script_batch", fail_script_batch)
+
+    with pytest.raises(RuntimeError) as raised:
+        provision_sql_server_database_from_file(
+            "mssql+pyodbc://localhost/master?driver=ODBC+Driver+18+for+SQL+Server",
+            database_name="Codebook",
+            sql_file=sql_file,
+            lock_name="codebook-lock",
+        )
+
+    assert raised.value is batch_error
+    assert (recorded_sql[-1] == _RELEASE_CODEBOOK_LOCK) is not invalidated
     assert fake_engine.disposed is True
 
 
@@ -252,8 +292,6 @@ def provisioned_database(provisioning_admin_url: str, mssql_admin_url: str) -> G
     admin_engine = create_engine(mssql_admin_url, isolation_level="AUTOCOMMIT")
     try:
         with admin_engine.connect() as connection:
-            # pyodbc's driver-level pooling can hand back the provisioning connection with its `USE` context.
-            connection.exec_driver_sql("USE master")
             connection.exec_driver_sql(
                 f"IF DB_ID(N'{database_name}') IS NOT NULL "
                 f"ALTER DATABASE [{database_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"

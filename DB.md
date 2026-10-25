@@ -139,6 +139,12 @@ Neither prevents a mid-operation disconnect or retries an operation. Size pools 
 the number of application processes and the server's connection budget; do not create a
 new engine per request or dispose the shared engine after each operation.
 
+Creating a `DatabaseRuntime` engine also calls `disable_pyodbc_pooling()`, as SQLAlchemy
+recommends: pyodbc's driver-level pool otherwise keeps sessions alive after the engine discards
+them and reuses them without a reset. The setting is process-wide and is read only at the first
+pyodbc connection, so code that connects through pyodbc before any runtime engine exists, such
+as a startup check, must call `disable_pyodbc_pooling()` first.
+
 ### Multiple databases
 
 Use an app session for app data and a Codebook session for independent reference lookups.
@@ -979,3 +985,5 @@ The legacy .NET code in grad-codebook is not the target application architecture
   documents advancing over row counts and the possibility of errors during traversal.
 - [SQLAlchemy: SQL Server pool resets](https://docs.sqlalchemy.org/en/21/dialects/mssql.html#temporary-table-resource-reset-for-connection-pooling)
   distinguishes transaction rollback from wider session-state cleanup.
+- [SQLAlchemy: pyodbc pooling](https://docs.sqlalchemy.org/en/21/dialects/mssql.html#pyodbc-pooling-connection-close-behavior)
+  recommends disabling pyodbc's module-level pooling before any connection is made.
