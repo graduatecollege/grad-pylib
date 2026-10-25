@@ -41,7 +41,7 @@ jobs:
         shell: bash
         run: |-
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg unixodbc
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg unixodbc unixodbc-dev
           curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /usr/share/keyrings/microsoft-prod.gpg > /dev/null
           . /etc/os-release
           curl -fsSL "https://packages.microsoft.com/config/ubuntu/${VERSION_ID}/prod.list" | sudo tee /etc/apt/sources.list.d/microsoft-prod.list > /dev/null
@@ -71,6 +71,8 @@ jobs:
     permissions:
       contents: read
       id-token: write # IMPORTANT: this permission is mandatory for trusted publishing
+    env:
+      UV_PYTHON: '3.14'
     steps:
       - name: Check out the repository
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # ratchet:actions/checkout@v6
