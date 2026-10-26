@@ -1,17 +1,18 @@
 # To v8
 
-Use the [database access standard](DB.md) when migrating services. Opt into batch navigation
-per statement, and review connection cleanup, reader exception handling, and upsert calls as
-described below. The v7 transaction-owning retry and role-loader contracts are unchanged;
-apply the v7 guidance below as well when upgrading from an older release.
+Use the [database access skill](.github/skills/database-access-patterns/SKILL.md) when migrating
+services. Opt into batch navigation per statement, and review connection cleanup, reader
+exception handling, and upsert calls as described below. The v7 transaction-owning retry and
+role-loader contracts are unchanged; apply the v7 guidance below as well when upgrading from
+an older release.
 
 ## Engine and connection setup
 
 Use `NamedDatabases`/`DatabaseRuntime` for application engines and the shared SQL Server
 fixtures for tests. These engines install the batch and error hooks.
 For engines created directly with `create_engine()`, use the
-[custom-engine setup](DB.md#custom-engines); passing `mssql_skip_rowcounts` alone to an
-unconfigured engine is silently ignored by SQLAlchemy.
+[custom-engine setup](.github/skills/database-access-patterns/references/bootstrap.md#custom-engines);
+passing `mssql_skip_rowcounts` alone to an unconfigured engine is silently ignored by SQLAlchemy.
 
 Ensure `disable_pyodbc_pooling()` runs **before the process's first pyodbc connection**.
 The runtime and fixtures call it, but earlier startup checks or direct connections must do
@@ -107,21 +108,23 @@ the primary error, or raised if cleanup alone fails.
 
 ## Service rollout
 
-Migrate services operation by operation using [Choosing a pattern](DB.md#choosing-a-pattern).
+Migrate services operation by operation using [Choosing a pattern](.github/skills/database-access-patterns/SKILL.md#choosing-a-pattern).
 Keep simple ORM/Core operations, preserve authorization and HTTP/domain contracts, and prefer
 conditional DML/OUTPUT over redundant successful-path existence checks. Choose atomicity,
 idempotency, consistency, and lock scope explicitly rather than inheriting them from a helper.
 
-Use real SQL Server fixtures, not SQLite substitutes. Cover empty/extra rowsets, delayed
-failures and rollback, stale upserts, and actual concurrent-session behavior; retain ordinary
-identity/OUTPUT/executemany coverage. See [required coverage](DB.md#required-coverage-for-a-chosen-pattern).
-Rerun the cursor-error compatibility tests whenever upgrading SQLAlchemy or its drivers.
+For disposable SQL Server environments, see the
+[fixture setup guide](.github/skills/database-access-patterns/references/schema-testing.md#using-the-sql-server-fixtures).
+Test selection and coverage policy belong to the consuming project.
 
 # To v7
 
 ## `retry_on_transient_conflict` owns the write transaction
 
-The decorator now begins the transaction on the decorated function's session, commits when the function returns, and rolls back when it raises. See [Retrying writes](DB.md#retrying-writes) for the full pattern.
+The decorator now begins the transaction on the decorated function's session, commits when
+the function returns, and rolls back when it raises. See
+[Retrying writes](.github/skills/database-access-patterns/references/transactions.md#retrying-writes)
+for the full pattern.
 
 1. **Remove `commit()` calls from decorated functions.** A statement after an inner commit now raises `InvalidRequestError`.
 2. **Pass exactly one `Session`.** Decorated functions that take no session or more than one now raise `TypeError`. A function that reaches its session through a closure must take it as an argument instead.

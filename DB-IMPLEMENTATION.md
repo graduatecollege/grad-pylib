@@ -4,8 +4,9 @@
 `conftest.py`), 2 (batch regressions and the cursor-error adapter), 3 (option validation,
 navigation, and engine installation), 4 (multi-result reader integration), and 5 (script
 draining for migrations and provisioning) implemented; step 6 planned.** This document tracks the grad-pylib work needed to
-support [DB.md](DB.md). DB.md remains the application-facing standard and source for an
-agent skill; implementation tasks and compatibility decisions belong here.
+support the [database access skill](.github/skills/database-access-patterns/SKILL.md).
+The skill folder is the canonical application-facing guide; `DB.md` links to it.
+Implementation tasks and library compatibility decisions belong here.
 
 The plan is based on the current working tree, including its in-progress error-only
 connection-reset changes. Preserve and integrate those changes rather than replacing them.
@@ -23,7 +24,7 @@ No changes to gcp-server, hooding-server, or grad-codebook are part of this impl
 | Migration and provisioning script loops | Execute each batch without explicitly traversing all results | Drain every result before declaring success or recording a migration |
 
 The fewer-calls, conditional-write, failure-only-diagnosis, and narrow-locking recommendations
-in DB.md primarily concern application SQL and service design. They do not require a generic
+in the skill primarily concern application SQL and service design. They do not require a generic
 repository layer, automatic diagnostic queries, a universal bulk-write framework, new locking
 defaults, or a global retry policy. Domain validation, authorization, audit payloads, and
 conflict/replay policy remain visible in application services.
@@ -269,8 +270,8 @@ history semantics, the setup lock, and the existence check are unchanged.
 
 ### 6. Verify
 
-Use the acceptance matrix below, then update docstrings, this document's status, and DB.md's
-availability notice only when the contracts are implemented. Document installation for
+Use the acceptance matrix below, then update docstrings, this document's status, and the skill's
+compatibility guidance only when the contracts are implemented. Document installation for
 custom engines and the intentional change from raw driver exceptions to SQLAlchemy errors.
 Add the relevant compatibility note to MIGRATE.md without changing its existing retry advice.
 

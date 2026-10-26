@@ -2,10 +2,10 @@
 
 Graduate College Python common library for web application APIs and other related projects.
 
-Additional docs in the repository root:
+Additional documentation:
 
 * [AUTH.md](AUTH.md)
-* [DB.md](DB.md)
+* [Database access patterns](.github/skills/database-access-patterns/SKILL.md) - portable agent skill and canonical database guide
 * [DB-IMPLEMENTATION.md](DB-IMPLEMENTATION.md) - planned library support for the database patterns
 * [E2E.md](E2E.md)
 * [PARAMS.md](PARAMS.md)
