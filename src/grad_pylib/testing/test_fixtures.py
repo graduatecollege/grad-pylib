@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated
+from unittest.mock import MagicMock
 
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
@@ -137,6 +138,75 @@ def _make_master_engine(
     return _RecordingMasterEngine(
         _RecordingMasterConnection(recorded_sql, database_exists=database_exists),
     )
+
+
+@pytest.mark.parametrize("mode", ["controller", "sequential", "e2e"])
+def test_container_startup_configures_memory_before_provisioning(
+    mode: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container = MagicMock()
+    container.__enter__.return_value = container
+    container.get_connection_url.return_value = "mssql+pymssql://localhost/master"
+    container_factory = MagicMock(return_value=container)
+    monkeypatch.setattr("testcontainers.mssql.SqlServerContainer", container_factory)
+    monkeypatch.setattr("testcontainers.community.mssql.SqlServerContainer", container_factory)
+    configure_memory = MagicMock()
+    monkeypatch.setattr(fixtures_module, "configure_sql_server_memory", configure_memory)
+    engine = MagicMock(spec=Engine)
+    monkeypatch.setattr(fixtures_module, "_create_app_engine", lambda _url: engine)
+    admin_url = fixtures_module._build_pyodbc_url(container.get_connection_url())
+
+    def create_database(url: str, _name: str) -> str:
+        configure_memory.assert_called_once_with(url)
+        return "app-url"
+
+    monkeypatch.setattr(fixtures_module, "create_database", create_database)
+    if mode == "controller":
+        state = fixtures_module.SharedSqlServerState()
+        try:
+            assert fixtures_module.start_controller_container(state, _fixture_config()) == admin_url
+            assert fixtures_module.start_controller_container(state, _fixture_config()) == admin_url
+            assert state.container is container
+            container.start.assert_called_once_with()
+        finally:
+            fixtures_module.stop_controller_container(state)
+        container.stop.assert_called_once_with()
+    elif mode == "sequential":
+        request = MagicMock(spec=pytest.FixtureRequest)
+        request.config = SimpleNamespace()
+        generator = fixtures_module.create_mssql_engine(request, _fixture_config())
+        try:
+            assert next(generator) is engine
+        finally:
+            generator.close()
+        engine.dispose.assert_called_once_with()
+        container.__exit__.assert_called_once()
+    else:
+        with fixtures_module.create_e2e_database_bundle(_fixture_config()) as databases:
+            assert databases.app_engine is engine
+        engine.dispose.assert_called_once_with()
+        container.__exit__.assert_called_once()
+
+    configure_memory.assert_called_once_with(admin_url)
+    assert container_factory.call_args.kwargs["mem_limit"] == "2g"
+    assert "env" not in container_factory.call_args.kwargs
+
+
+def test_controller_stops_container_when_memory_configuration_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    container = MagicMock()
+    container.get_connection_url.return_value = "mssql+pymssql://localhost/master"
+    monkeypatch.setattr("testcontainers.mssql.SqlServerContainer", MagicMock(return_value=container))
+    error = RuntimeError("configuration failed")
+    monkeypatch.setattr(fixtures_module, "configure_sql_server_memory", MagicMock(side_effect=error))
+    state = fixtures_module.SharedSqlServerState()
+
+    with pytest.raises(RuntimeError) as raised:
+        fixtures_module.start_controller_container(state, _fixture_config())
+
+    assert raised.value is error
+    assert state.container is None
+    assert state.admin_url is None
+    container.stop.assert_called_once_with()
 
 
 def test_build_test_app_disables_env_file_overrides_sessions_and_skips_lifespan() -> None:

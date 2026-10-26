@@ -7,7 +7,11 @@ from unicodedata import bidirectional
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine, make_url
 
-from grad_pylib.sqlserver_container import DEFAULT_SQL_SERVER_IMAGE, build_sql_server_container_kwargs
+from grad_pylib.sqlserver_container import (
+    DEFAULT_SQL_SERVER_IMAGE,
+    build_sql_server_container_kwargs,
+    configure_sql_server_memory,
+)
 from grad_pylib.tools.generate_models import (
     default_generated_models_path,
     generate_models,
@@ -61,6 +65,7 @@ def rebuild_models(
             )
     ) as container:
         admin_database_url = container.get_connection_url()
+        configure_sql_server_memory(admin_database_url)
         database_url = create_database(admin_database_url, database_name)
         engine: Engine = create_engine(database_url, future=True, pool_pre_ping=True)
         try:

@@ -25,7 +25,11 @@ from grad_pylib.core.db import (
     install_terminated_session_detection,
 )
 from grad_pylib.core.multiquery import execute_script_batch
-from grad_pylib.sqlserver_container import DEFAULT_SQL_SERVER_IMAGE, build_sql_server_container_kwargs
+from grad_pylib.sqlserver_container import (
+    DEFAULT_SQL_SERVER_IMAGE,
+    build_sql_server_container_kwargs,
+    configure_sql_server_memory,
+)
 
 _logger = structlog.get_logger(__name__)
 
@@ -255,8 +259,13 @@ def start_controller_container(state: SharedSqlServerState, fixture_config: SqlS
     # Start the container FIRST before requesting network/port strings
     container.start()
 
-    # Generate the safe pyodbc production-ready connection string
-    connection_url = _build_pyodbc_url(container.get_connection_url())
+    try:
+        # Generate the safe pyodbc production-ready connection string
+        connection_url = _build_pyodbc_url(container.get_connection_url())
+        configure_sql_server_memory(connection_url)
+    except BaseException:
+        container.stop()
+        raise
 
     state.container = container
     state.admin_url = connection_url
@@ -310,6 +319,7 @@ def create_mssql_engine(request: pytest.FixtureRequest, fixture_config: SqlServe
     )) as container:
         # Enforce pyodbc connection engine mapping here as well
         admin_url = _build_pyodbc_url(container.get_connection_url())
+        configure_sql_server_memory(admin_url)
         database_name = f"{fixture_config.database_prefix}_{worker_id}"
         database_url = create_database(admin_url, database_name)
 
@@ -503,6 +513,7 @@ def create_e2e_database_bundle(
             dbname="master",
     )) as container:
         admin_url = _build_pyodbc_url(container.get_connection_url())
+        configure_sql_server_memory(admin_url)
         app_database_url = create_database(admin_url, database_name)
         app_engine = _create_app_engine(app_database_url)
         databases = ManagedE2eDatabases(admin_url=admin_url, app_engine=app_engine)
