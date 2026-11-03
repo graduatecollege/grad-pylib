@@ -570,6 +570,10 @@ def test_pyodbc_reports_a_session_killed_mid_batch_as_exhaustion_and_a_successfu
     After SQL Server kills a session that is still sending results, `nextset()` reports
     exhaustion and `commit()` succeeds although SQL Server rolled the transaction back. Only the
     connection's next statement fails, as a disconnect.
+
+    The hazard is timing-dependent: occasionally (mostly under load) the driver notices the lost
+    connection first, and `nextset()` or `commit()` raises `08S01` instead. Those safe outcomes
+    skip the test.
     """
     with batch_engine.connect() as connection:
         spid = connection.execute(text("SELECT @@SPID")).scalar_one()
@@ -581,15 +585,32 @@ def test_pyodbc_reports_a_session_killed_mid_batch_as_exhaustion_and_a_successfu
         assert cursor.fetchone() is not None
         kill_spid(spid, mssql_databases.app_engine)
 
-        assert not cursor.nextset()
-        result.close()
-        connection.commit()
-        with pytest.raises(DBAPIError) as raised:
-            connection.execute(text("SELECT 1"))
+        try:
+            more_results = cursor.nextset()
+        except pyodbc.OperationalError as error:
+            if error.args[0] != "08S01":
+                raise
+            # The raw cursor error bypasses SQLAlchemy, so the dead connection must be discarded here.
+            connection.invalidate()
+            safe_outcome = "nextset() raised the connection loss"
+        else:
+            assert not more_results
+            result.close()
+            try:
+                connection.commit()
+            except DBAPIError as error:
+                assert is_disconnect_error(error)
+                safe_outcome = "commit() raised the connection loss"
+            else:
+                safe_outcome = None
+                with pytest.raises(DBAPIError) as raised:
+                    connection.execute(text("SELECT 1"))
+                assert is_disconnect_error(raised.value)
 
-    assert is_disconnect_error(raised.value)
     with batch_engine.connect() as connection:
         assert connection.execute(text("SELECT COUNT(*) FROM dbo.batch_writes")).scalar_one() == 0
+    if safe_outcome:
+        pytest.skip(f"Hazard not exercised: {safe_outcome}.")
 
 
 # `_sqlalchemy_cursor_errors` compatibility (DB-IMPLEMENTATION.md, R3). It calls a private SQLAlchemy method, so

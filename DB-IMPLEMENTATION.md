@@ -177,8 +177,9 @@ by steps 3 and 4 is pinned with strict xfails that must be flipped by those step
   (installed by `DatabaseRuntime` and the test fixtures) now marks exactly that message as a
   disconnect, so the connection is invalidated and the usual retry rules apply. Other `HY000`
   errors, such as "Connection is busy with results for another command", are not disconnects.
-  If a partly fetched rowset is skipped instead, `nextset()` reports exhaustion and a later
-  `commit()` silently does nothing (the same was reported for mssql-jdbc#1505). Readers that
+  If a partly fetched rowset is skipped instead, `nextset()` usually reports exhaustion and a
+  later `commit()` silently does nothing (the same was reported for mssql-jdbc#1505). This is
+  timing-dependent: under load, `nextset()` or `commit()` sometimes raises `08S01` instead. Readers that
   fully fetch each rowset see the error; given how rare application-query kills are, no extra
   completion statements are planned.
 - `install_connection_reset` uses pyodbc-only `Connection.execute`; do not install it on pymssql
