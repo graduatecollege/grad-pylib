@@ -133,7 +133,11 @@ class SqlServerTestBootstrap:
             yield engine
 
     def mssql_engine_fixture(self) -> object:
-        return pytest.fixture(scope="session", name="mssql_engine")(self.mssql_engine)
+        @pytest.fixture(scope="session", name="mssql_engine")
+        def fixture(request: pytest.FixtureRequest) -> Generator[Engine]:
+            yield from self.mssql_engine(request)
+
+        return fixture
 
     def codebook_engine(self, mssql_engine: Engine) -> Generator[Engine]:
         if not self.config.include_codebook_engine:
@@ -141,7 +145,11 @@ class SqlServerTestBootstrap:
         yield from create_codebook_engine(mssql_engine)
 
     def codebook_engine_fixture(self) -> object:
-        return pytest.fixture(scope="session", name="codebook_engine")(self.codebook_engine)
+        @pytest.fixture(scope="session", name="codebook_engine")
+        def fixture(mssql_engine: Engine) -> Generator[Engine]:
+            yield from self.codebook_engine(mssql_engine)
+
+        return fixture
 
     def db(self, mssql_engine: Engine) -> Generator[Session]:
         yield from create_db_session_fixture(
@@ -152,7 +160,11 @@ class SqlServerTestBootstrap:
         )
 
     def db_fixture(self) -> object:
-        return pytest.fixture(name="db")(self.db)
+        @pytest.fixture(name="db")
+        def fixture(mssql_engine: Engine) -> Generator[Session]:
+            yield from self.db(mssql_engine)
+
+        return fixture
 
     def _provision_codebook_database(self, admin_url: str) -> None:
         if self.config.codebook_sql_path is None:

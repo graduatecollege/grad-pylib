@@ -10,6 +10,9 @@ integration-test wiring that application `conftest.py` files were hand-rolling a
 * optional session-scoped `codebook_engine`
 * per-test `db` fixture cleanup, with optional before/after hooks
 
+The fixture factories return plain pytest fixture functions that retain the bootstrap
+instance, so the same module-level bindings support both function-based and class-based tests.
+
 SQL Server containers use a `2g` Docker memory limit. Before provisioning databases, startup
 sets `max server memory (MB)` to `1024` through `sp_configure` and `RECONFIGURE`, leaving
 headroom for SQL Server allocations outside that setting. This applies to shared xdist,
