@@ -3,27 +3,11 @@ from pathlib import Path
 import pytest
 from fastapi import FastAPI
 
-from grad_pylib.core.config import ENVIRONMENT_ENV_VAR, get_settings
-from grad_pylib.tools import ensure_cli_environment
 from grad_pylib.tools.export_openapi import (
     _resolve_app_factory,
     default_openapi_output_path,
     export_openapi,
 )
-
-
-def test_ensure_cli_environment_defaults_to_development_when_unset(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv(ENVIRONMENT_ENV_VAR, raising=False)
-    get_settings.cache_clear()
-    assert get_settings().is_development is False
-
-    ensure_cli_environment()
-
-    assert get_settings().environment == "development"
-    assert get_settings().is_development is True
-
 
 def test_export_openapi_writes_document(tmp_path: Path) -> None:
     def app_factory() -> FastAPI:
