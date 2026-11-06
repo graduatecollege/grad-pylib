@@ -9,6 +9,7 @@ from sqlalchemy.engine import Engine
 from grad_pylib.core.config import get_settings
 from grad_pylib.core.db import NamedDatabases
 from grad_pylib.core.multiquery import execute_script_batch
+from grad_pylib.tools import ensure_cli_environment
 
 _GO_SPLIT = re.compile(r"^\s*go\s*$", re.IGNORECASE | re.MULTILINE)
 _MIGRATION_HISTORY = Table(
@@ -87,5 +88,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    ensure_cli_environment()
     args = build_argument_parser().parse_args()
     run_migrations(schema_dir=args.schema_dir)

@@ -20,10 +20,10 @@ knowing before deploying a service that uses it.
 
 ### Set `ENVIRONMENT`
 
-`ENVIRONMENT` must be set explicitly for every deployment (`production` for production). Only
-`development`, `local` and `test` are treated as development environments. Outside those, the
-`.env` file is not loaded at all, so a stray dotenv file in the working directory cannot override
-production configuration.
+`ENVIRONMENT` defaults to `production` (fail-closed). Set it explicitly to `development`, `local`,
+or `test` for local development and automated tests; only those values are treated as development
+environments. Outside those, the `.env` file is not loaded at all, so a stray dotenv file in the
+working directory cannot override production configuration.
 
 ### The development API key is a full bypass
 

@@ -60,6 +60,23 @@ def test_dotenv_is_ignored_outside_development(tmp_path: Path, monkeypatch: pyte
     assert settings.dev_api_key is None
 
 
+def test_default_environment_is_production_and_ignores_dotenv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".env").write_text("APP_NAME=From Dotenv\nDEV_API_KEY=from-dotenv\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    for name in ("ENVIRONMENT", "APP_NAME", "DEV_API_KEY", "ENABLE_DEV_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = BaseAppSettings()
+
+    assert settings.environment == "production"
+    assert settings.is_development is False
+    assert settings.app_name != "From Dotenv"
+    assert settings.dev_api_key is None
+
+
 def test_dev_api_key_bypass_settings_are_rejected_outside_development() -> None:
     with pytest.raises(ValidationError, match="enable_dev_api_key must not be enabled outside a development"):
         BaseAppSettings(

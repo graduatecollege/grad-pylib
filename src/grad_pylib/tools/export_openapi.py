@@ -14,6 +14,8 @@ from pathlib import Path
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from grad_pylib.tools import ensure_cli_environment
+
 DEFAULT_APP_FACTORY = "app:create_app"
 
 
@@ -164,6 +166,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    ensure_cli_environment()
     args = build_argument_parser().parse_args()
     output_path = Path(args.output_path)
     module_prefixes = tuple(args.module_prefixes) if args.module_prefixes else ("features",)

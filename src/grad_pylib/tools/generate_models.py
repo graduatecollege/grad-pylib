@@ -12,6 +12,7 @@ from sqlalchemy.schema import MetaData, PrimaryKeyConstraint
 from sqlacodegen.models import ModelClass, RelationshipAttribute, RelationshipType
 
 from grad_pylib.core.db import resolve_database_url
+from grad_pylib.tools import ensure_cli_environment
 
 _GENERATOR_OPTIONS = {"use_inflect", "nojoined"}
 _DEFAULT_IGNORED_TABLES = {"schema_migrations"}
@@ -196,6 +197,7 @@ def generate_models(
 
 
 def main() -> None:
+    ensure_cli_environment()
     parser = argparse.ArgumentParser(description="Generate SQLAlchemy models from a database.")
     parser.add_argument("--output-path", help="Path for generated models output.")
     parser.add_argument("--database-url", help="Database URL override.")

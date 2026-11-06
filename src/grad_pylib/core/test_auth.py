@@ -282,6 +282,66 @@ def test_dev_api_key_stores_only_the_application_user_on_request_state() -> None
     assert request.state.user is user
 
 
+@pytest.mark.parametrize("failure_stage", ["api_key", "claims_to_user", "override_loader"])
+def test_failed_authentication_or_override_clears_upstream_request_state_user(
+    failure_stage: str,
+) -> None:
+    upstream_user = SimpleNamespace(
+        claims={"upn": "someone@example.com" if failure_stage == "claims_to_user" else "abc123@illinois.edu"},
+        access_token="live-bearer-token",
+    )
+    request = _request(api_key="wrong" if failure_stage == "api_key" else None, api_role=None)
+    request.state.user = upstream_user
+
+    def failing_override(_user: auth_module.AuthUser, _session: Session) -> auth_module.AuthUser:
+        raise RuntimeError("override failed")
+
+    dependency = require_policy(
+        "Auditor",
+        config=_CONFIG,
+        azure_scheme=_azure_scheme(),
+        get_settings=_settings,
+        get_session=lambda: None,
+        forbidden_error_factory=PermissionError,
+        claims_to_user=lambda claims: default_claims_to_user(claims, _CONFIG.valid_roles),
+        override_loader=failing_override if failure_stage == "override_loader" else None,
+        dev_api_key_enabled=lambda _settings: True,
+        api_key_user_builder=_department_api_key_user,
+    )
+
+    with pytest.raises((HTTPException, RuntimeError)):
+        dependency(request=request, session=object(), azure_user=upstream_user)
+
+    assert not hasattr(request.state, "user")
+
+
+def test_audited_azure_scheme_clears_upstream_request_state_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upstream_user = SimpleNamespace(claims={"upn": "abc123@illinois.edu"}, access_token="live-bearer-token")
+
+    async def fake_super_call(
+        _self: SingleTenantAzureAuthorizationCodeBearer,
+        request: Request,
+        _scopes: SecurityScopes,
+    ) -> object:
+        request.state.user = upstream_user
+        return upstream_user
+
+    monkeypatch.setattr(SingleTenantAzureAuthorizationCodeBearer, "__call__", fake_super_call)
+    scheme = auth_module.build_azure_scheme(BaseAppSettings(
+        environment="production",
+        azure_ad_client_id="client-id",
+        azure_ad_tenant_id="tenant-id",
+    ))
+    request = _request(api_key=None)
+
+    returned = asyncio.run(scheme(request, SecurityScopes(scopes=["Hooding.Access"])))
+
+    assert returned is upstream_user
+    assert not hasattr(request.state, "user")
+
+
 def test_override_loader_session_is_rolled_back_after_loading(mssql_engine: Engine) -> None:
     in_transaction_during_load: list[bool] = []
 
@@ -452,6 +512,45 @@ def test_override_loader_can_replace_identity_and_audits_the_override(
             "subject": "abc123",
             "effective_subject": "override",
             "original_roles": ["Department"],
+            "effective_roles": ["Auditor"],
+            "client_host": "127.0.0.1",
+            "http_method": "GET",
+            "http_path": "/things",
+        },
+    )
+
+
+def test_override_loader_audits_same_role_identity_override(
+    audit_recorder: _AuditRecorder,
+) -> None:
+    dependency = require_policy(
+        "Auditor",
+        config=_CONFIG,
+        azure_scheme=_azure_scheme(),
+        get_settings=_settings,
+        get_session=lambda: None,
+        forbidden_error_factory=PermissionError,
+        claims_to_user=lambda claims: default_claims_to_user(claims, _CONFIG.valid_roles),
+        override_loader=_replacement_override,
+    )
+    request = _request(api_key=None, api_role=None)
+
+    user = dependency(
+        request=request,
+        session=object(),
+        azure_user=SimpleNamespace(claims={"upn": "abc123@illinois.edu", "roles": ["Auditor"]}),
+    )
+
+    assert user.email == "override@illinois.edu"
+    assert audit_recorder.events[0] == (
+        "warning",
+        "auth.roles.overridden",
+        {
+            "policy": "Auditor",
+            "mechanism": "azure_ad",
+            "subject": "abc123",
+            "effective_subject": "override",
+            "original_roles": ["Auditor"],
             "effective_roles": ["Auditor"],
             "client_host": "127.0.0.1",
             "http_method": "GET",

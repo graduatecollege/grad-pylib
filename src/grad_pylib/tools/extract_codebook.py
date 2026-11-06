@@ -32,6 +32,7 @@ from sqlalchemy import bindparam, create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
 from grad_pylib.core.db import resolve_database_url
+from grad_pylib.tools import ensure_cli_environment
 
 _GO_SPLIT = re.compile(r"^\s*go\s*$", re.IGNORECASE | re.MULTILINE)
 
@@ -415,6 +416,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    ensure_cli_environment()
     args = build_argument_parser().parse_args()
     output_path = export_codebook(
         output_path=args.output_path,

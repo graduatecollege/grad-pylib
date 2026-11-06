@@ -33,7 +33,7 @@ class BaseAppSettings(BaseSettings):
 
     app_name: str = "FastAPI Service"
     version: str = "1.0.0"
-    environment: str = "development"
+    environment: str = "production"
     debug: bool = False
     allowed_origins: list[str] = []
 

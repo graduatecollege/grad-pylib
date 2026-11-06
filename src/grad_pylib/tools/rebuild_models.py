@@ -12,6 +12,7 @@ from grad_pylib.sqlserver_container import (
     build_sql_server_container_kwargs,
     configure_sql_server_memory,
 )
+from grad_pylib.tools import ensure_cli_environment
 from grad_pylib.tools.generate_models import (
     default_generated_models_path,
     generate_models,
@@ -95,6 +96,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    ensure_cli_environment()
     args = build_argument_parser().parse_args()
     output_path = rebuild_models(
         output_path=args.output_path,

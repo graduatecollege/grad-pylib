@@ -339,8 +339,9 @@ class _AuditedAzureAuthorizationCodeBearer(SingleTenantAzureAuthorizationCodeBea
     # The upstream bearer validator is async; application policy dependencies stay synchronous.
     async def __call__(self, request: HTTPConnection, security_scopes: SecurityScopes) -> AzureUser | None:
         try:
-            return await super().__call__(request, security_scopes)
+            user = await super().__call__(request, security_scopes)
         except HTTPException as error:
+            _clear_request_user(request)
             _audit_logger.warning(
                 "auth.failed",
                 mechanism=MECHANISM_AZURE_AD,
@@ -350,6 +351,8 @@ class _AuditedAzureAuthorizationCodeBearer(SingleTenantAzureAuthorizationCodeBea
                 **_request_fields(request),
             )
             raise
+        _clear_request_user(request)
+        return user
 
 
 def build_azure_scheme(settings: BaseAppSettings) -> SingleTenantAzureAuthorizationCodeBearer:
@@ -545,6 +548,12 @@ def constant_time_equals(presented: str, expected: str | None) -> bool:
         return False
 
 
+def _clear_request_user(request: HTTPConnection) -> None:
+    """Remove any user attached to request state, such as upstream token-bearing Azure data."""
+    if hasattr(request.state, "user"):
+        delattr(request.state, "user")
+
+
 def store_request_user(request: Request, user: AuthUser) -> None:
     """Store the application user in request state instead of token-bearing Azure data.
 
@@ -597,14 +606,15 @@ def _apply_override(
         # pool and lets the endpoint's `retry_on_transient_conflict` writes own their transaction.
         if isinstance(session, Session):
             session.rollback()
+    effective_subject = subject_of(user)
     effective_roles = tuple(getattr(user, "effective_roles", ()))
-    if effective_roles != original_roles:
+    if effective_roles != original_roles or effective_subject != original_subject:
         _audit_logger.warning(
             "auth.roles.overridden",
             policy=policy,
             mechanism=mechanism,
             subject=original_subject,
-            effective_subject=subject_of(user),
+            effective_subject=effective_subject,
             original_roles=list(original_roles),
             effective_roles=list(effective_roles),
             client_host=client_host(request),
@@ -698,6 +708,7 @@ def require_policy(
             session: Annotated[Session, Depends(get_session)],
             azure_user: Annotated[AzureUser | None, Security(azure_scheme, scopes=[required_scope])],
     ) -> AuthUser:
+        _clear_request_user(request)
         api_key = request.headers.get(config.api_key_header)
 
         # The dev Api-Key is a full bypass. It never falls through to Azure AD:
