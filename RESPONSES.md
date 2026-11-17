@@ -1,7 +1,6 @@
+# API response conventions
 
-## API response conventions
-
-`grad_pylib.core.schemas` now provides a small set of response helpers with one recommended shape:
+`grad_pylib.core.schemas` provides response helpers with one recommended shape:
 
 * Use `data` for the primary payload.
 * Add a sibling `meta` object only when the response genuinely has metadata.
@@ -23,7 +22,7 @@ Type aliases such as `UserResponse = ItemResponse[UserDto]` work for static
 typing, but FastAPI/OpenAPI derive awkward schema names from them. Prefer a
 named subclass even when it has no additional fields.
 
-### Single-item response
+## Single-item response
 
 ```python
 from grad_pylib.core.schemas import BaseDto, ItemResponse
@@ -38,7 +37,7 @@ class UserResponse(ItemResponse[UserDto]):
     pass
 ```
 
-### List response
+## List response
 
 Use `ListResponse[T]` when the payload is only a list:
 
@@ -65,7 +64,7 @@ class UsersResponse(MetaResponse[list[UserDto], UsersMeta]):
     pass
 ```
 
-### Status endpoint response
+## Status endpoint response
 
 ```python
 from fastapi import FastAPI
@@ -80,7 +79,7 @@ def status() -> StatusResponse:
     return build_status_response(app_name="grad-service", version="1.2.3")
 ```
 
-### Migration guidance
+## Migration guidance
 
 Prefer migrating existing app responses toward these conventions:
 

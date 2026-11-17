@@ -310,7 +310,7 @@ def test_connection_reset_skips_clean_returns(single_connection_engine: Engine) 
     assert _session_state(single_connection_engine) == (spid, 512)
 
 
-# Textual batch regressions for the `mssql_skip_rowcounts` option (DB-IMPLEMENTATION.md, R1). Without it, SQLAlchemy
+# Textual batch regressions for the `mssql_skip_rowcounts` option. Without it, SQLAlchemy
 # builds a result from the batch's first result and closes the cursor, discarding the remaining results unread.
 _SKIP_ROWCOUNTS = {"mssql_skip_rowcounts": True}
 # Large enough that SQL Server is still sending it when the session is killed.
@@ -613,7 +613,7 @@ def test_pyodbc_reports_a_session_killed_mid_batch_as_exhaustion_and_a_successfu
         pytest.skip(f"Hazard not exercised: {safe_outcome}.")
 
 
-# `_sqlalchemy_cursor_errors` compatibility (DB-IMPLEMENTATION.md, R3). It calls a private SQLAlchemy method, so
+# `_sqlalchemy_cursor_errors` compatibility. It calls a private SQLAlchemy method, so
 # rerun these after every SQLAlchemy or driver upgrade.
 _FAILS_ON_EXECUTE = "SET NOCOUNT ON; SELECT CAST('x' AS int) AS b; SET NOCOUNT OFF"
 _FAILS_AFTER_A_ROWSET = "SET NOCOUNT ON; SELECT 1 AS a; SELECT CAST('x' AS int) AS b; SET NOCOUNT OFF"
@@ -922,7 +922,7 @@ def test_other_general_driver_errors_keep_the_connection(listened_engine: Listen
     assert listened_engine.log_events == []
 
 
-# `read_all_result_sets` integration (DB-IMPLEMENTATION.md, R2/R3): reader failures take SQLAlchemy's error path, and
+# `read_all_result_sets` integration: reader failures take SQLAlchemy's error path, and
 # whole operations around the reader are what retries replay.
 def assert_cursor_closed_once(caplog: pytest.LogCaptureFixture) -> None:
     """A second close of a pyodbc cursor fails, and SQLAlchemy logs that as "Error closing cursor"."""

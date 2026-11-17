@@ -11,7 +11,7 @@ FastAPI endpoints and dependencies are synchronous. Priorities, in order:
 **correctness, ease of understanding, performance, maintainability**.
 
 This folder is the canonical database-patterns guide, designed to be copied in full to
-consuming projects without `DB.md`. Maintain shared guidance in the
+consuming projects with all its reference files. Maintain shared guidance in the
 [upstream skill](https://github.com/graduatecollege/grad-pylib/tree/main/.github/skills/database-access-patterns).
 For older library versions, consult the
 [migration guide](https://github.com/graduatecollege/grad-pylib/blob/main/MIGRATE.md)

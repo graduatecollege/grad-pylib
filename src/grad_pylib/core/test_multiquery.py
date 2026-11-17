@@ -690,7 +690,7 @@ def test_map_row_to_pydantic_uses_physical_names_for_nested_validation_aliases(
     assert mapped.model_dump() == {"record": {"python_id": 1, "python_name": "Name"}}
 
 
-# Script batches (DB-IMPLEMENTATION.md, R5).
+# Script batches.
 _LARGE_ROWSET = "SELECT TOP (100000) a.object_id FROM sys.all_objects AS a CROSS JOIN sys.all_objects AS b"
 
 

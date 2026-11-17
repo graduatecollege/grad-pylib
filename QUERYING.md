@@ -181,9 +181,8 @@ Statements with the same structure but different values share a statement-cache
 entry. Interpolating `{Award.__table__}` renders the table name, keeping the SQL
 tied to the model.
 
-Do not use `:name` parameters inside a template string. SQLAlchemy 2.1.0 and
-2.1.1 still treat `:name` in template text as a bind parameter, but later
-releases render it literally.
+Do not use `:name` parameters inside a template string; they are rendered
+literally. Use `{value}` interpolation instead.
 
 ### Choosing spec columns
 
