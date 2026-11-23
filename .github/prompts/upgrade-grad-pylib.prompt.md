@@ -1,0 +1,9 @@
+---
+agent: 'agent'
+---
+Upgrade and test `grad-pylib` in this repository only. Do not inspect, modify, or run checks in the server repositories. Stop at a release handoff: the maintainer will review the changes, finalize the changelog, and publish the library.
+
+1. Read the repository instructions, `pyproject.toml`, `uv.lock`, and Makefile. Record existing local changes so you preserve them and can distinguish them from this upgrade.
+2. Find the newest compatible stable releases for runtime, optional, dev, and test dependencies. Set one UTC cutoff 72 hours before the run and use `uv lock --upgrade --exclude-newer <cutoff>` after updating the manifest. Keep exact `==` pins, extras, and markers intact; update duplicate pins in dependency groups and optional dependencies together. The cutoff applies to direct and transitive upgrades. If an upload's age cannot be verified or packages conflict, report the deferral rather than weakening a pin or bypassing the cutoff.
+3. Review upstream release notes for changes relevant to APIs the library uses or exposes. Make required compatibility fixes and add regression tests for affected behavior. Run `make lint` and `make test` against the updated lockfile. Report failures or missing prerequisites; a successful resolution is not a passing test.
+4. Hand the maintainer a list of old and new pins, check results, and suggested changelog bullets. Separate confirmed breaking changes from potential ones: for each, name the affected public API, CLI, generated output, or behavior, the evidence, and what a consumer may need to change. Document confirmed migrations that require substantial consumer code changes in `MIGRATE.md`. If no breaking changes were identified, say so without claiming downstream compatibility. Do not tag, publish, or start the server upgrade.
