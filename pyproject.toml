@@ -13,9 +13,9 @@ dynamic = [
 requires-python = ">=3.14,<3.16"
 readme = "README.md"
 dependencies = [
-    "fastapi==0.162.7",
+    "fastapi==0.165.0",
     "uvicorn[standard]==0.54.0",
-    "sqlalchemy==2.1.8",
+    "sqlalchemy==2.1.9",
     "fastapi-azure-auth==5.3.0",
     "pydantic-settings==2.16.3",
     "pyodbc==5.5.0",
@@ -28,7 +28,7 @@ dependencies = [
 test = [
     "pytest==9.2.0",
     "pytest-xdist==3.8.0",
-    "httpx2==2.16.0",
+    "httpx2==2.16.2",
     "testcontainers[mssql]==4.15.0",
     "pymssql==2.4.6",
     "pytest-cov==7.1.0",
@@ -36,15 +36,15 @@ test = [
 dev = [
     "sqlacodegen==4.0.4",
     "pymssql==2.4.6",
-    "ty==0.0.104",
-    "ruff==0.17.5",
+    "ty==0.0.107",
+    "ruff==0.17.6",
 ]
 
 [project.optional-dependencies]
 test = [
     "pytest==9.2.0",
     "pytest-xdist==3.8.0",
-    "httpx2==2.16.0",
+    "httpx2==2.16.2",
     "testcontainers[mssql]==4.15.0",
     "pymssql==2.4.6",
     "pytest-cov==7.1.0",
@@ -52,8 +52,8 @@ test = [
 dev = [
     "sqlacodegen==4.0.4",
     "pymssql==2.4.6",
-    "ty==0.0.104",
-    "ruff==0.17.5",
+    "ty==0.0.107",
+    "ruff==0.17.6",
 ]
 
 [tool.uv]
